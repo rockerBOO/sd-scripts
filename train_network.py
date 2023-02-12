@@ -246,7 +246,7 @@ def train(args):
   #     num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
   # override lr_scheduler.
   lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer,
-                                        lr_lambda=[lambda epoch: 1, lambda epoch: 1],
+                                        lr_lambda=[lambda epoch: 0.5, lambda epoch: 1.0],
                                         last_epoch=-1,
                                         verbose=False)
 
