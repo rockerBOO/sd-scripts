@@ -240,10 +240,15 @@ def train(args):
 
   # lr schedulerを用意する
   # lr_scheduler = diffusers.optimization.get_scheduler(
-  lr_scheduler = get_scheduler_fix(
-      args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
-      num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-      num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
+  # lr_scheduler = get_scheduler_fix(
+  #     args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps,
+  #     num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+  #     num_cycles=args.lr_scheduler_num_cycles, power=args.lr_scheduler_power)
+  # override lr_scheduler.
+  lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer=optimizer,
+                                        lr_lambda=[lambda epoch: 1, lambda epoch: 1],
+                                        last_epoch=-1,
+                                        verbose=False)
 
   # 実験的機能：勾配も含めたfp16学習を行う　モデル全体をfp16にする
   if args.full_fp16:
