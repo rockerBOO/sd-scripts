@@ -21,7 +21,7 @@ from diffusers import DDPMScheduler
 import library.train_util as train_util
 from library.train_util import DreamBoothDataset, FineTuningDataset
 
-from torch.optim import Optimizer
+import torch.optim as optim
 import dadaptation
 
 def collate_fn(examples):
