@@ -173,6 +173,10 @@ def train(args):
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
+    # noise_offset takes precedence over multires noise
+    if args.noise_offset and args.multires_noise_iterations:
+        print("using noise_offset.")
+
     if args.stop_text_encoder_training is None:
         args.stop_text_encoder_training = args.max_train_steps + 1  # do not stop until end
 

@@ -208,6 +208,10 @@ def train(args):
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
+    # noise_offset takes precedence over multires noise
+    if args.noise_offset and args.multires_noise_iterations:
+        print("using noise_offset.")
+
     # lr schedulerを用意する
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
