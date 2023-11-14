@@ -4433,10 +4433,10 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
 
 
 @contextmanager
-def daam_trace(active=True, *args, **kwds):
+def daam_trace(pipeline, active=True, *args, **kwds):
     if active:
         import daam
-        with daam.trace() as tc:
+        with daam.trace(pipeline, **kwds) as tc:
             yield tc
     else:
         yield None
@@ -4661,7 +4661,7 @@ def sample_images_common(
             print(f"width: {width}")
             print(f"sample_steps: {sample_steps}")
             print(f"scale: {scale}")
-            with accelerator.autocast(), daam_trace(active=True) as traced_attention_map:
+            with accelerator.autocast(), daam_trace(pipeline, active=True) as traced_attention_map:
                 latents = pipeline(
                     prompt=prompt,
                     height=height,
