@@ -1727,7 +1727,7 @@ class UNet2DConditionModel(nn.Module):
         self.out_channels = OUT_CHANNELS
 
         self.sample_size = sample_size
-        self.prepare_config(sample_size=self.sample_size)
+        self.prepare_config(sample_size=sample_size)
 
         # state_dictの書式が変わるのでmoduleの持ち方は変えられない
 
