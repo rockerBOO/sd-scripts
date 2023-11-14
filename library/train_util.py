@@ -4433,10 +4433,10 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
 
 
 @contextmanager
-def daam_trace(pipeline, active=True, *args, **kwds):
+def daam_trace(pipeline, width, height, active=True, *args, **kwds):
     if active:
         import daam
-        with daam.trace(pipeline, **kwds) as tc:
+        with daam.trace(pipeline, width, height, **kwds) as tc:
             yield tc
     else:
         yield None
@@ -4597,6 +4597,7 @@ def sample_images_common(
                 scale = 7.5
                 seed = None
                 controlnet_image = None
+                daam_words = None
                 for parg in prompt_args:
                     try:
                         m = re.match(r"w (\d+)", parg, re.IGNORECASE)
@@ -4634,6 +4635,11 @@ def sample_images_common(
                             controlnet_image = m.group(1)
                             continue
 
+                        m = re.match(r"da (.+)", parg, re.IGNORECASE)
+                        if m:  # negative prompt
+                            daam_words = m.group(1)
+                            continue
+
                     except ValueError as ex:
                         print(f"Exception in parsing / 解析エラー: {parg}")
                         print(ex)
@@ -4651,6 +4657,9 @@ def sample_images_common(
                 controlnet_image = Image.open(controlnet_image).convert("RGB")
                 controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
 
+            if daam_words is not None:
+                daam_words = [word.strip() for word in daam_words.split(',')]
+
             traced_attention_map = None
 
             height = max(64, height - height % 8)  # round to divisible by 8
@@ -4661,7 +4670,7 @@ def sample_images_common(
             print(f"width: {width}")
             print(f"sample_steps: {sample_steps}")
             print(f"scale: {scale}")
-            with accelerator.autocast(), daam_trace(pipeline, active=True) as traced_attention_map:
+            with accelerator.autocast(), daam_trace(pipeline, width, height, active=daam_words is not None) as traced_attention_map:
                 latents = pipeline(
                     prompt=prompt,
                     height=height,
@@ -4685,15 +4694,16 @@ def sample_images_common(
             image.save(os.path.join(save_dir, img_filename))
 
             if traced_attention_map is not None:
-                attn_word = 'woman'
                 attention_filename = Path(os.path.join(save_dir, img_filename))
-                image_attention_filename = attention_filename.with_name(
-                    f"{attention_filename.stem}-attn-{attn_word}.{attention_filename.suffix}"
-                )
-                heat_map = traced_attention_map.compute_global_heat_map()
-                heat_map = heat_map.compute_word_heat_map(attn_word)
-                heat_map.plot_overlay(image, out_file=image_attention_filename)
-                print(f"Save attention heatmap to {image_attention_filename}")
+                computed_heat_map = traced_attention_map.compute_global_heat_map()
+
+                for attn_word in daam_words:
+                    image_attention_filename = attention_filename.with_name(
+                        f"{attention_filename.stem}-attn-{attn_word}.{attention_filename.suffix}"
+                    )
+                    heat_map = computed_heat_map.compute_word_heat_map(attn_word)
+                    heat_map.plot_overlay(image, out_file=image_attention_filename)
+                    print(f"Saved attention heatmap to {image_attention_filename}")
 
             # wandb有効時のみログを送信
             try:
