@@ -29,6 +29,8 @@ import hashlib
 import subprocess
 from io import BytesIO
 import toml
+from pathlib import Path
+from contextlib import contextmanager
 
 from tqdm import tqdm
 import torch
@@ -4430,6 +4432,16 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
             )
 
 
+@contextmanager
+def daam_trace(active=True, *args, **kwds):
+    if active:
+        import daam
+        with daam.trace() as tc:
+            yield tc
+    else:
+        yield None
+
+
 # scheduler:
 SCHEDULER_LINEAR_START = 0.00085
 SCHEDULER_LINEAR_END = 0.0120
@@ -4639,6 +4651,8 @@ def sample_images_common(
                 controlnet_image = Image.open(controlnet_image).convert("RGB")
                 controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
 
+            traced_attention_map = None
+
             height = max(64, height - height % 8)  # round to divisible by 8
             width = max(64, width - width % 8)  # round to divisible by 8
             print(f"prompt: {prompt}")
@@ -4647,7 +4661,7 @@ def sample_images_common(
             print(f"width: {width}")
             print(f"sample_steps: {sample_steps}")
             print(f"scale: {scale}")
-            with accelerator.autocast():
+            with accelerator.autocast(), daam_trace(active=True) as traced_attention_map:
                 latents = pipeline(
                     prompt=prompt,
                     height=height,
@@ -4669,6 +4683,17 @@ def sample_images_common(
             )
 
             image.save(os.path.join(save_dir, img_filename))
+
+            if traced_attention_map is not None:
+                attn_word = 'woman'
+                attention_filename = Path(os.path.join(save_dir, img_filename))
+                image_attention_filename = attention_filename.with_name(
+                    f"{attention_filename.stem}-attn-{attn_word}.{attention_filename.suffix}"
+                )
+                heat_map = traced_attention_map.compute_global_heat_map()
+                heat_map = heat_map.compute_word_heat_map(attn_word)
+                heat_map.plot_overlay(image, out_file=image_attention_filename)
+                print(f"Save attention heatmap to {image_attention_filename}")
 
             # wandb有効時のみログを送信
             try:
