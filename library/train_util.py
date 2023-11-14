@@ -60,6 +60,9 @@ import numpy as np
 from PIL import Image
 import cv2
 import safetensors.torch
+from pathlib import Path
+import daam
+
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
@@ -2195,12 +2198,20 @@ def load_image(image_path):
     return img
 
 
-def load_mask(image_path, target_shape):
+def get_mask_path_from_image_path(image_path):
     p = pathlib.Path(image_path)
-    mask_path = os.path.join(p.parent, 'mask', p.stem + '.png')
+    mask_path = p.parent / 'masks' / f"{p.stem}.png"
+
+    return mask_path
+
+
+def load_mask(image_path, target_shape):
+    # p = pathlib.Path(image_path)
+    # mask_path = p.parent / 'mask' / f"{p.stem}.png"
+    mask_path = get_mask_path_from_image_path(image_path)
     result = None
 
-    if os.path.exists(mask_path):
+    if mask_path.exists():
         try:
             mask_img = Image.open(mask_path)
             mask = np.array(mask_img)
@@ -2224,6 +2235,12 @@ def load_mask(image_path, target_shape):
         result = cv2.resize(result, dsize=target_shape, interpolation=cv2.INTER_LINEAR)
 
     return result
+
+
+def has_latent_mask(image_path):
+    mask_path = get_mask_path_from_image_path(image_path)
+
+    return mask_path.exists()
 
 
 # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
@@ -3742,6 +3759,8 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             value = ast.literal_eval(value)
             lr_scheduler_kwargs[key] = value
 
+    print(f"LR scheduler args: {lr_scheduler_kwargs}")
+
     def wrap_check_needless_num_warmup_steps(return_vals):
         if num_warmup_steps is not None and num_warmup_steps != 0:
             raise ValueError(f"{name} does not require `num_warmup_steps`. Set None or 0.")
@@ -4730,16 +4749,17 @@ def sample_images_common(
             print(f"sample_steps: {sample_steps}")
             print(f"scale: {scale}")
             with accelerator.autocast():
-                latents = pipeline(
-                    prompt=prompt,
-                    height=height,
-                    width=width,
-                    num_inference_steps=sample_steps,
-                    guidance_scale=scale,
-                    negative_prompt=negative_prompt,
-                    controlnet=controlnet,
-                    controlnet_image=controlnet_image,
-                )
+                with daam.trace(pipeline) as tc:
+                    latents = pipeline(
+                        prompt=prompt,
+                        height=height,
+                        width=width,
+                        num_inference_steps=sample_steps,
+                        guidance_scale=scale,
+                        negative_prompt=negative_prompt,
+                        controlnet=controlnet,
+                        controlnet_image=controlnet_image,
+                    )
 
             image = pipeline.latents_to_image(latents)[0]
 
@@ -4751,6 +4771,16 @@ def sample_images_common(
             )
 
             image.save(os.path.join(save_dir, img_filename))
+
+            attn_word = 'woman'
+            attention_filename = Path(os.path.join(save_dir, img_filename))
+            image_attention_filename = attention_filename.with_name(
+                f"{attention_filename.stem}-attn-{attn_word}.{attention_filename.suffix}"
+            )
+            heat_map = tc.compute_global_heat_map()
+            heat_map = heat_map.compute_word_heat_map(attn_word)
+            heat_map.plot_overlay(image, out_file=image_attention_filename)
+            print(f"Save attention heatmap to {image_attention_filename}")
 
             # wandb有効時のみログを送信
             try:

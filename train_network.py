@@ -181,7 +181,47 @@ class NetworkTrainer:
             target = noise
 
         if args.masked_loss and batch['masks'] is not None:
+            def x(mask, tag):
+                import torchvision.transforms as T
+                # from PIL import Image
+                # decoded = (
+                #     ((mask / 2 + 0.5).clamp(0, 1) * 255)
+                #     .cpu()
+                #     .permute(0, 2, 3, 1)
+                #     .numpy()
+                #     .astype("uint8")
+                # )
+                # print(decoded)
+                image = T.ToPILImage()(mask)
+                image.save(f'{tag}.mask.png')
+
+                # Image.fromarray(decoded).save(f'before-{i}.mask.png')
+
             mask = get_latent_masks(batch['masks'], noise_pred.shape, noise_pred.device)
+            # pre_mask = mask.clone()
+            # print(mask)
+            # for i, v in enumerate(pre_mask):
+            #     x(v, 'before')
+            if args.masked_min and torch.count_nonzero(mask) != torch.numel(noise_pred):
+                minimum = torch.tensor([args.masked_min]).to(mask.device)
+                minimum_mask = torch.gt(minimum, mask)
+                mask = mask + (minimum * minimum_mask)
+                # for v in mask:
+                #     # x(v, 'after')
+
+                # for i, v in enumerate(mask):
+                #     x(v, f'after-{i}')
+                # print(mask)
+                # print(torch.cosine_similarity(pre_mask, mask).mean().detach().item())
+
+                # import sys
+                # sys.exit(1)
+
+            loss_div = mask.mean()
+
+            if loss_div == 0:
+                loss_div = 1.0
+
             noise_pred = noise_pred * mask
             target = target * mask
 
@@ -189,7 +229,7 @@ class NetworkTrainer:
         loss = loss.mean([1, 2, 3])
 
         loss_weights = batch["loss_weights"].to(accelerator.device)  # 各sampleごとのweight
-        loss = loss * loss_weights
+        loss = loss * loss_weights / loss_div
 
         if args.min_snr_gamma:
             loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
@@ -361,10 +401,13 @@ class NetworkTrainer:
 
         # prepare network
         net_kwargs = {}
+        print(f"network args: {args.network_args}")
         if args.network_args is not None:
             for net_arg in args.network_args:
                 key, value = net_arg.split("=")
                 net_kwargs[key] = value
+
+        print(f"net_kwargs {net_kwargs}")
 
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
@@ -445,6 +488,21 @@ class NetworkTrainer:
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
         )
+        
+        if args.masked_loss:
+            masked = 0
+            for b in train_dataloader:
+                if torch.count_nonzero(b['masks']) != torch.numel(b['masks']):
+                    masked += 1
+
+            val_masked = 0
+            for b in val_dataloader:
+                if torch.count_nonzero(b['masks']) != torch.numel(b['masks']):
+                    val_masked += 1
+
+            accelerator.print("Using masked loss")
+            accelerator.print(f"Masked: {masked}/{len(train_dataloader)}")
+            accelerator.print(f"Validation masked: {val_masked}/{len(val_dataloader)}")
 
         # 学習ステップ数を計算する
         if args.max_train_epochs is not None:
@@ -595,7 +653,10 @@ class NetworkTrainer:
             "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
             "ss_max_train_steps": args.max_train_steps,
             "ss_lr_warmup_steps": args.lr_warmup_steps,
-            "ss_lr_scheduler": args.lr_scheduler,
+            "ss_lr_scheduler": (args.lr_scheduler_type or args.lr_scheduler)
+                + (f"{args.lr_scheduler_args}" if len(args.lr_scheduler_args) > 0 else ""),
+            # "ss_lr_scheduler_type": args.lr_scheduler_type,
+            # "ss_lr_scheduler_args": args.lr_scheduler_args,
             "ss_network_module": args.network_module,
             "ss_network_dim": args.network_dim,  # None means default because another network than LoRA may have another default dim
             "ss_network_alpha": args.network_alpha,  # some networks may not have alpha
@@ -627,6 +688,7 @@ class NetworkTrainer:
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
             "ss_debiased_estimation": bool(args.debiased_estimation_loss),
+            "ss_masked_loss": bool(args.masked_loss)
         }
 
         if use_user_config:
@@ -899,7 +961,8 @@ class NetworkTrainer:
 
                 if args.logging_dir is not None:
                     logs = self.generate_step_logs(args, current_loss, avr_loss, lr_scheduler, keys_scaled, mean_norm, maximum_norm)
-                    accelerator.log(logs, step=global_step)
+                    accelerator.log(logs)
+                    # accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
                     break
@@ -920,18 +983,20 @@ class NetworkTrainer:
                     if args.logging_dir is not None:
                         avr_loss: float = val_loss_recorder.moving_average
                         logs = {"loss/validation_current": current_loss}
-                        accelerator.log(logs, step=(len(val_dataloader) * epoch) + 1 + val_step)
+                        # accelerator.log(logs, step=(len(val_dataloader) * epoch) + 1 + val_step)
 
                 if len(val_dataloader) > 0:
                     if args.logging_dir is not None:
                         avr_loss: float = val_loss_recorder.moving_average
                         logs = {"loss/validation_average": avr_loss}
-                        accelerator.log(logs, step=epoch + 1)
+                        accelerator.log(logs)
+                        # accelerator.log(logs, step=epoch + 1)
 
 
             if args.logging_dir is not None:
                 logs = {"loss/epoch_average": loss_recorder.moving_average}
-                accelerator.log(logs, step=epoch + 1)
+                accelerator.log(logs)
+                # accelerator.log(logs, step=epoch + 1)
 
             accelerator.wait_for_everyone()
 
@@ -1062,6 +1127,18 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Split for validation images out of the training dataset"
+    )
+    parser.add_argument(
+        "--masked_min",
+        type=float,
+        default=None,
+        help="Split for validation images out of the training dataset"
+    )
+    parser.add_argument(
+        "--drop_keys",
+        nargs="+",
+        default=None,
+        help="Drop these keys from the LoRA network."
     )
 
     return parser
