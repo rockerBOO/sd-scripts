@@ -4433,10 +4433,10 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
 
 
 @contextmanager
-def daam_trace(pipeline, width, height, active=True, *args, **kwds):
+def daam_trace(active=True, *args, **kwds):
     if active:
         import daam
-        with daam.trace(pipeline, width, height, **kwds) as tc:
+        with daam.trace(**kwds) as tc:
             yield tc
     else:
         yield None
@@ -4670,7 +4670,17 @@ def sample_images_common(
             print(f"width: {width}")
             print(f"sample_steps: {sample_steps}")
             print(f"scale: {scale}")
-            with accelerator.autocast(), daam_trace(pipeline, width, height, active=daam_words is not None) as traced_attention_map:
+            with accelerator.autocast(), daam_trace(
+                width=width, 
+                height=height, 
+                vae=vae,
+                unet=unet,
+                vae_scale_factor=0.18215,  # TODO work with different version sdxl_model_util.VAE_SCALE_FACTOR,
+                sample_size=unet.config.sample_size,
+                image_processor=transformers.image_transforms.to_pil_image,
+                tokenizer=tokenizer,
+                active=daam_words is not None
+            ) as traced_attention_map:
                 latents = pipeline(
                     prompt=prompt,
                     height=height,
@@ -4695,14 +4705,16 @@ def sample_images_common(
 
             if traced_attention_map is not None:
                 attention_filename = Path(os.path.join(save_dir, img_filename))
-                computed_heat_map = traced_attention_map.compute_global_heat_map()
+                computed_heat_map = traced_attention_map.compute_global_heat_map(
+                    prompt=prompt,
+                )
 
                 for attn_word in daam_words:
                     image_attention_filename = attention_filename.with_name(
-                        f"{attention_filename.stem}-attn-{attn_word}.{attention_filename.suffix}"
+                        f"{attention_filename.stem}-attn-{attn_word}{attention_filename.suffix}"
                     )
-                    heat_map = computed_heat_map.compute_word_heat_map(attn_word)
-                    heat_map.plot_overlay(image, out_file=image_attention_filename)
+                    word_heatmap = computed_heat_map.compute_word_heat_map(attn_word)
+                    word_heatmap.plot_overlay(image, out_file=image_attention_filename)
                     print(f"Saved attention heatmap to {image_attention_filename}")
 
             # wandb有効時のみログを送信
