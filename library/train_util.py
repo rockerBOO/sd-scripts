@@ -5021,6 +5021,6 @@ def generate_momentum_logs(lr_scheduler, logs, args):
             idx = 1
 
         for i in range(idx, len(lrs)):
-            logs[f"momentum/betas1-group{i}"] = optimizer.param_groups[i]["betas"][0]
+            logs[f"momentum/betas1-group{i:02d}"] = optimizer.param_groups[i]["betas"][0]
 
     return logs
