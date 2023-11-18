@@ -916,9 +916,7 @@ class NetworkTrainer:
 
                 if args.logging_dir is not None:
                     logs = train_util.generate_step_logs(args, current_loss, avr_loss, lr_scheduler, keys_scaled, mean_norm, maximum_norm)
-                    # accelerator.log(logs, step=global_step)
-                    accelerator.log(logs)
-                    # accelerator.log(logs, step=global_step)
+                    accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
                     break
@@ -945,14 +943,11 @@ class NetworkTrainer:
                     if args.logging_dir is not None:
                         avr_loss: float = val_loss_recorder.moving_average
                         logs = {"loss/validation_average": avr_loss}
-                        accelerator.log(logs)
-                        # accelerator.log(logs, step=epoch + 1)
-
+                        accelerator.log(logs, step=global_step)
 
             if args.logging_dir is not None:
                 logs = {"loss/epoch_average": loss_recorder.moving_average}
-                accelerator.log(logs)
-                # accelerator.log(logs, step=epoch + 1)
+                accelerator.log(logs, step=global_step)
 
             accelerator.wait_for_everyone()
 
