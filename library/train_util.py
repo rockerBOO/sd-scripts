@@ -4435,9 +4435,13 @@ def append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names):
 @contextmanager
 def daam_trace(active=True, *args, **kwds):
     if active:
-        import daam
-        with daam.trace(**kwds) as tc:
-            yield tc
+        try:
+            import daam
+            with daam.trace(**kwds) as tc:
+                yield tc
+        except ModuleNotFoundError:
+            print("Could not find the `daam` library")
+            yield None
     else:
         yield None
 
