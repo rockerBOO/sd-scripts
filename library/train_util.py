@@ -63,7 +63,6 @@ from PIL import Image
 import cv2
 import safetensors.torch
 from pathlib import Path
-
 from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
@@ -5035,8 +5034,6 @@ def generate_momentum_logs(lr_scheduler, logs, args):
             idx = 1
 
         for i in range(idx, len(lrs)):
-            logs[f"momentum/{m_key}-group{i:02d}"] = optimizer.param_groups[i]["betas"][
-                0
-            ]
+            logs[f"momentum/{m_key}-group{i:02d}"] = optimizer.param_groups[i]["betas"][0]
 
     return logs
