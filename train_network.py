@@ -936,17 +936,27 @@ class NetworkTrainer:
 
                     if args.logging_dir is not None:
                         avr_loss: float = val_loss_recorder.moving_average
-                        logs = {"loss/validation_current": current_loss}
-                        # accelerator.log(logs, step=(len(val_dataloader) * epoch) + 1 + val_step)
+                        logs = {
+                            "validation_step": (len(val_dataloader) * epoch) + 1 + val_step, 
+                            "loss/validation_current": current_loss
+                        }
+                        accelerator.log(logs)
 
                 if len(val_dataloader) > 0:
                     if args.logging_dir is not None:
                         avr_loss: float = val_loss_recorder.moving_average
-                        logs = {"loss/validation_average": avr_loss}
+                        logs = {
+                            "epoch_step": epoch + 1, 
+                            "loss/validation_average": avr_loss
+                        }
                         accelerator.log(logs, step=global_step)
 
+
             if args.logging_dir is not None:
-                logs = {"loss/epoch_average": loss_recorder.moving_average}
+                logs = {
+                    "epoch_step": epoch + 1, 
+                    "loss/epoch_average": loss_recorder.moving_average
+                }
                 accelerator.log(logs, step=global_step)
 
             accelerator.wait_for_everyone()
