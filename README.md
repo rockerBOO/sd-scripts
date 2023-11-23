@@ -1,3 +1,16 @@
+# NOTE
+
+This is a working branch/fork of sd-scripts which includes all my PRs and other PRs i find interesting. This branch is not stable and the history in GIT *may be overwritten*. I want to have a clean history, but I am working with a lot of changes and my skills are not up to a good maintainer level yet.
+
+- [Masked loss](https://github.com/kohya-ss/sd-scripts/pull/589)
+- [Validation loss](https://github.com/kohya-ss/sd-scripts/pull/914)
+- [Momentum logging](https://github.com/kohya-ss/sd-scripts/pull/956)
+- Wandb config
+- [Drop keys](https://github.com/kohya-ss/sd-scripts/pull/964)
+- [Attention processor](https://github.com/kohya-ss/sd-scripts/pull/949) (DAAM attention mapping of samples)
+
+---
+
 __SDXL is now supported. The sdxl branch has been merged into the main branch. If you update the repository, please follow the upgrade instructions. Also, the version of accelerate has been updated, so please run accelerate config again.__ The documentation for SDXL training is [here](./README.md#sdxl-training).
 
 This repository contains training, generation and utility scripts for Stable Diffusion.
