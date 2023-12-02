@@ -46,7 +46,6 @@ from library.custom_train_functions import (
     apply_debiased_estimation,
 )
 
-
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -130,6 +129,22 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
+    def save_weights(self, file, updated_embs, save_dtype, metadata):
+        state_dict = {"emb_params": updated_embs[0]}
+
+        if save_dtype is not None:
+            for key in list(state_dict.keys()):
+                v = state_dict[key]
+                v = v.detach().clone().to("cpu").to(save_dtype)
+                state_dict[key] = v
+
+        if os.path.splitext(file)[1] == ".safetensors":
+            from safetensors.torch import save_file
+
+            save_file(state_dict, file, metadata)
+        else:
+            torch.save(state_dict, file)  # can be loaded in Web UI
+
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
@@ -147,6 +162,61 @@ class NetworkTrainer:
         # tokenizerは単体またはリスト、tokenizersは必ずリスト：既存のコードとの互換性のため
         tokenizer = self.load_tokenizer(args)
         tokenizers = tokenizer if isinstance(tokenizer, list) else [tokenizer]
+        
+        # acceleratorを準備する
+        print("preparing accelerator")
+        accelerator = train_util.prepare_accelerator(args)
+        is_main_process = accelerator.is_main_process
+
+        # mixed precisionに対応した型を用意しておき適宜castする
+        weight_dtype, save_dtype = train_util.prepare_dtype(args)
+        vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+
+        # モデルを読み込む
+        model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+
+        # text_encoder is List[CLIPTextModel] or CLIPTextModel
+        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+
+        # モデルに xformers とか memory efficient attention を組み込む
+        train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
+        if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
+            vae.set_use_memory_efficient_attention_xformers(args.xformers)
+
+        # prepare embeddings (for pivotal tuning)
+        pivotal_tuning = len(args.embeddings) > 0
+        if pivotal_tuning:
+            assert (
+                args.embeddings_lr is not None
+            ), "Embeddings LR needs to be defined when doing pivotal tuning"
+            
+            # TODO: assert network_module is classical LoRA (not sure if it works for lycoris)
+
+            token_strings = args.embeddings
+            token_ids_list = []
+            token_embeds_list = []
+            for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                num_added_tokens = tokenizer.add_tokens(token_strings)
+                assert (
+                    num_added_tokens == len(args.embeddings) # TODO: args.num_vectors_per_token?
+                ), f"tokenizer has same word to token string. please use another one / 指定したargs.token_stringは既に存在します。別の単語を使ってください: tokenizer {i+1}, {len(token_strings)}"
+
+                token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
+                assert (
+                    min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                assert (
+                    len(tokenizer) - 1 == token_ids[-1]
+                ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+                token_ids_list.append(token_ids)
+
+                # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                text_encoder.resize_token_embeddings(len(tokenizer))
+
+                # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
+                token_embeds = text_encoder.get_input_embeddings().weight.data
+                token_embeds_list.append(token_embeds)
 
         # データセットを準備する
         if args.dataset_class is None:
@@ -214,26 +284,6 @@ class NetworkTrainer:
             ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
         self.assert_extra_args(args, train_dataset_group)
-
-        # acceleratorを準備する
-        print("preparing accelerator")
-        accelerator = train_util.prepare_accelerator(args)
-        is_main_process = accelerator.is_main_process
-
-        # mixed precisionに対応した型を用意しておき適宜castする
-        weight_dtype, save_dtype = train_util.prepare_dtype(args)
-        vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
-
-        # モデルを読み込む
-        model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
-
-        # text_encoder is List[CLIPTextModel] or CLIPTextModel
-        text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
-
-        # モデルに xformers とか memory efficient attention を組み込む
-        train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
-        if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
-            vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -313,7 +363,7 @@ class NetworkTrainer:
             args.scale_weight_norms = False
 
         train_unet = not args.network_train_text_encoder_only
-        train_text_encoder = self.is_train_text_encoder(args)
+        train_text_encoder = self.is_train_text_encoder(args) and not pivotal_tuning
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
         if args.network_weights is not None:
@@ -331,8 +381,13 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         # 後方互換性を確保するよ
+        pt_trainable_params = []
         try:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+
+            if pivotal_tuning:
+                for text_encoder in text_encoders:
+                    pt_trainable_params += text_encoder.get_input_embeddings().parameters()
         except TypeError:
             accelerator.print(
                 "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
@@ -340,6 +395,9 @@ class NetworkTrainer:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
+
+        if pivotal_tuning:
+            pt_optimizer_name, pt_optimizer_args, pt_optimizer = train_util.get_optimizer(args, pt_trainable_params, True)
 
         # dataloaderを準備する
         # DataLoaderのプロセス数：0はメインプロセスになる
@@ -369,6 +427,9 @@ class NetworkTrainer:
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
+        if pivotal_tuning:
+            lr_scheduler_pt = train_util.get_scheduler_fix(args, pt_optimizer, accelerator.num_processes)
+
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
             assert (
@@ -389,47 +450,64 @@ class NetworkTrainer:
             t_enc.requires_grad_(False)
 
         # acceleratorがなんかよろしくやってくれるらしい
-        # TODO めちゃくちゃ冗長なのでコードを整理する
-        if train_unet and train_text_encoder:
-            if len(text_encoders) > 1:
-                unet, t_enc1, t_enc2, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    unet, text_encoders[0], text_encoders[1], network, optimizer, train_dataloader, lr_scheduler
-                )
-                text_encoder = text_encoders = [t_enc1, t_enc2]
-                del t_enc1, t_enc2
-            else:
-                unet, text_encoder, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    unet, text_encoder, network, optimizer, train_dataloader, lr_scheduler
-                )
-                text_encoders = [text_encoder]
-        elif train_unet:
-            unet, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                unet, network, optimizer, train_dataloader, lr_scheduler
-            )
-            for t_enc in text_encoders:
-                t_enc.to(accelerator.device, dtype=weight_dtype)
-        elif train_text_encoder:
-            if len(text_encoders) > 1:
-                t_enc1, t_enc2, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    text_encoders[0], text_encoders[1], network, optimizer, train_dataloader, lr_scheduler
-                )
-                text_encoder = text_encoders = [t_enc1, t_enc2]
-                del t_enc1, t_enc2
-            else:
-                text_encoder, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    text_encoder, network, optimizer, train_dataloader, lr_scheduler
-                )
-                text_encoders = [text_encoder]
+        accelerator_components = [network, optimizer, train_dataloader, lr_scheduler]
+        accelerator_components += [unet] if train_unet else []
+        accelerator_components += text_encoders if train_text_encoder else []
+        accelerator_components += [pt_optimizer, lr_scheduler_pt] if pivotal_tuning else []
+        
+        # accelerator prepare
+        prepared_components = accelerator.prepare(*accelerator_components)
 
-            unet.to(accelerator.device, dtype=weight_dtype)  # move to device because unet is not prepared by accelerator
-        else:
-            network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                network, optimizer, train_dataloader, lr_scheduler
-            )
+        # Index to keep track of the position in prepared_components (yeah this is ugly)
+        index = 0
+
+        # Update network, optimizer, train_dataloader, lr_scheduler
+        network, optimizer, train_dataloader, lr_scheduler = prepared_components[:4]
+        index += 4
+
+        # Update unet if train_unet is True
+        if train_unet:
+            unet = prepared_components[index]
+            index += 1
+
+        # Update text_encoders if train_text_encoder is True
+        if train_text_encoder:
+            text_encoders = prepared_components[index:index+len(text_encoders)]
+            index += len(text_encoders)
+
+            # Handle single and multiple text encoders scenario
+            if len(text_encoders) > 1:
+                text_encoder = text_encoders
+            else:
+                text_encoder = text_encoders[0]
+        
+        # Update pt_optimizer and lr_scheduler_pt if pivotal_tuning is True
+        if pivotal_tuning:
+            pt_optimizer, lr_scheduler_pt = prepared_components[index:index+2]
+            index += 2
 
         # transform DDP after prepare (train_network here only)
         text_encoders = train_util.transform_models_if_DDP(text_encoders)
         unet, network = train_util.transform_models_if_DDP([unet, network])
+
+        if pivotal_tuning:
+            index_no_updates_list = []
+            orig_embeds_params_list = []
+            for tokenizer, token_ids, text_encoder in zip(tokenizers, token_ids_list, text_encoders):
+                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
+                index_no_updates_list.append(index_no_updates)
+
+                # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
+                orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
+                orig_embeds_params_list.append(orig_embeds_params)
+
+                # Freeze all parameters except for the token embeddings in text encoder
+                text_encoder.requires_grad_(True)
+                text_encoder.text_model.encoder.requires_grad_(False)
+                text_encoder.text_model.final_layer_norm.requires_grad_(False)
+                text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+                # t_enc.text_model.embeddings.requires_grad_(True)
+                # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -720,7 +798,7 @@ class NetworkTrainer:
             on_step_start = lambda *args, **kwargs: None
 
         # function for saving/removing
-        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, embs_list, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -734,6 +812,11 @@ class NetworkTrainer:
             metadata_to_save.update(sai_metadata)
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            if len(embs_list) > 0:
+                embeds_file = os.path.join(args.output_dir, "embeds-" + ckpt_name)
+                self.save_weights(embeds_file, embs_list, save_dtype, sai_metadata)
+
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -748,13 +831,19 @@ class NetworkTrainer:
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
+            for text_encoder in text_encoders:
+                text_encoder.train()
+
             metadata["ss_epoch"] = str(epoch + 1)
 
             network.on_epoch_start(text_encoder, unet)
 
             for step, batch in enumerate(train_dataloader):
                 current_step.value = global_step
-                with accelerator.accumulate(network):
+
+                to_accumulate = [network]
+                to_accumulate += [text_encoder] if pivotal_tuning else []
+                with accelerator.accumulate(*to_accumulate):
                     on_step_start(text_encoder, unet)
 
                     with torch.no_grad():
@@ -771,7 +860,7 @@ class NetworkTrainer:
                         latents = latents * self.vae_scale_factor
                     b_size = latents.shape[0]
 
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
+                    with torch.set_grad_enabled(train_text_encoder or pivotal_tuning), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
                             text_encoder_conds = get_weighted_text_embeddings(
@@ -827,9 +916,28 @@ class NetworkTrainer:
                         params_to_clip = network.get_trainable_params()
                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        if pivotal_tuning:
+                            pt_params_to_clip = text_encoder.get_input_embeddings().parameters()
+                            accelerator.clip_grad_norm_(pt_params_to_clip, args.max_grad_norm)
+
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    if pivotal_tuning:
+                        pt_optimizer.step()
+                        lr_scheduler_pt.step()
+                        pt_optimizer.zero_grad(set_to_none=True)
+
+                    # Let's make sure we don't update any embedding weights besides the newly added token
+                    if pivotal_tuning:
+                        with torch.no_grad():
+                            for text_encoder, orig_embeds_params, index_no_updates in zip(
+                                text_encoders, orig_embeds_params_list, index_no_updates_list
+                            ):
+                                accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                                    index_no_updates
+                                ] = orig_embeds_params[index_no_updates]
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = network.apply_max_norm_regularization(
@@ -850,8 +958,20 @@ class NetworkTrainer:
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
+                            updated_embs_list = []
+                            if pivotal_tuning:
+                                for text_encoder, token_ids in zip(text_encoders, token_ids_list):
+                                    updated_embs = (
+                                        accelerator.unwrap_model(text_encoder)
+                                        .get_input_embeddings()
+                                        .weight[token_ids]
+                                        .data.detach()
+                                        .clone()
+                                    )
+                                    updated_embs_list.append(updated_embs)
+
                             ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch, updated_embs_list)
 
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -883,12 +1003,18 @@ class NetworkTrainer:
 
             accelerator.wait_for_everyone()
 
+            updated_embs_list = []
+            if pivotal_tuning:
+                for text_encoder, token_ids in zip(text_encoders, token_ids_list):
+                    updated_embs = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[token_ids].data.detach().clone()
+                    updated_embs_list.append(updated_embs)
+
             # 指定エポックごとにモデルを保存
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1, updated_embs_list)
 
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
@@ -898,7 +1024,17 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+            self.sample_images(
+                accelerator,
+                args,
+                epoch + 1,
+                global_step,
+                accelerator.device,
+                vae,
+                tokenizer,
+                text_encoder,
+                unet
+            )
 
             # end of epoch
 
@@ -908,14 +1044,21 @@ class NetworkTrainer:
         if is_main_process:
             network = accelerator.unwrap_model(network)
 
+            if pivotal_tuning:
+                text_encoder = accelerator.unwrap_model(text_encoder)
+
         accelerator.end_training()
 
         if is_main_process and args.save_state:
             train_util.save_state_on_train_end(args, accelerator)
 
+        updated_embs = []
+        if pivotal_tuning:
+            updated_embs = text_encoder.get_input_embeddings().weight[token_ids].data.detach().clone()
+
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            save_model(ckpt_name, network, global_step, num_train_epochs, updated_embs_list, force_sync_upload=True)
 
             print("model saved.")
 
@@ -999,6 +1142,17 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
+
+    # Pivotal tuning
+    parser.add_argument(
+        "--embeddings",
+        default=[],
+        type=str,
+        nargs="+",
+        help="Embeddings to train for Pivotal Tuning (default is empty array) / 日本語訳なし"
+    )
+    parser.add_argument("--embeddings_lr", type=float, default=None, help="learning rate for Pivotal Tuning / embeddingsの学習率")
+
     return parser
 
 
