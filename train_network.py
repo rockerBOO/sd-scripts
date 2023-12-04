@@ -271,6 +271,56 @@ class NetworkTrainer:
 
             accelerator.wait_for_everyone()
 
+        train_embedding = args.train_embedding
+
+        if train_embedding:
+            self.assert_token_string(args.token_string, tokenizers)
+
+            token_strings = [args.token_string] + [f"{args.token_string}{i+1}" for i in range(args.num_vectors_per_token - 1)]
+            token_ids_list = []
+            token_embeds_list = []
+            for i, (tokenizer, text_encoder, init_token_ids) in enumerate(zip(tokenizers, text_encoders, init_token_ids_list)):
+                num_added_tokens = tokenizer.add_tokens(token_strings)
+                assert (
+                    num_added_tokens == args.num_vectors_per_token
+                ), f"tokenizer has same word to token string. please use another one / 指定したargs.token_stringは既に存在します。別の単語を使ってください: tokenizer {i+1}, {args.token_string}"
+
+                token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
+                assert (
+                    min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                assert (
+                    len(tokenizer) - 1 == token_ids[-1]
+                ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+                token_ids_list.append(token_ids)
+
+                # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                text_encoder.resize_token_embeddings(len(tokenizer))
+
+                # Initialise the newly added placeholder token with the embeddings of the initializer token
+                token_embeds = text_encoder.get_input_embeddings().weight.data
+                if init_token_ids is not None:
+                    for i, token_id in enumerate(token_ids):
+                        token_embeds[token_id] = token_embeds[init_token_ids[i % len(init_token_ids)]]
+                        # accelerator.print(token_id, token_embeds[token_id].mean(), token_embeds[token_id].min())
+                token_embeds_list.append(token_embeds)
+
+            # load weights
+            if args.weights is not None:
+                embeddings_list = self.load_weights(args.weights)
+                assert len(token_ids) == len(
+                    embeddings_list[0]
+                ), f"num_vectors_per_token is mismatch for weights / 指定した重みとnum_vectors_per_tokenの値が異なります: {len(embeddings)}"
+                # accelerator.print(token_ids, embeddings.size())
+                for token_ids, embeddings, token_embeds in zip(token_ids_list, embeddings_list, token_embeds_list):
+                    for token_id, embedding in zip(token_ids, embeddings):
+                        token_embeds[token_id] = embedding
+                        # accelerator.print(token_id, token_embeds[token_id].mean(), token_embeds[token_id].min())
+                accelerator.print("weighs loaded")
+
+            accelerator.print(f"create embeddings for {args.num_vectors_per_token} tokens, for {args.token_string}")
+
         # 必要ならテキストエンコーダーの出力をキャッシュする: Text Encoderはcpuまたはgpuへ移される
         self.cache_text_encoder_outputs_if_needed(
             args, accelerator, unet, vae, tokenizers, text_encoders, train_dataset_group, weight_dtype
@@ -319,6 +369,23 @@ class NetworkTrainer:
         if args.network_weights is not None:
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
+
+        index_no_updates_list = []
+        orig_embeds_params_list = []
+        for tokenizer, token_ids, text_encoder in zip(tokenizers, token_ids_list, text_encoders):
+            index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
+            index_no_updates_list.append(index_no_updates)
+
+            # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
+            orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
+            orig_embeds_params_list.append(orig_embeds_params)
+
+            # Freeze all parameters except for the token embeddings in text encoder
+            text_encoder.requires_grad_(True)
+            text_encoder.text_model.encoder.requires_grad_(False)
+            text_encoder.text_model.final_layer_norm.requires_grad_(False)
+            text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+            # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
 
         if args.gradient_checkpointing:
             unet.enable_gradient_checkpointing()
@@ -771,7 +838,7 @@ class NetworkTrainer:
                         latents = latents * self.vae_scale_factor
                     b_size = latents.shape[0]
 
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
+                    with torch.set_grad_enabled(train_text_encoder or train_embedding), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
                             text_encoder_conds = get_weighted_text_embeddings(
@@ -830,6 +897,16 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # Let's make sure we don't update any embedding weights besides the newly added token
+                    with torch.no_grad():
+                        for text_encoder, orig_embeds_params, index_no_updates in zip(
+                            text_encoders, orig_embeds_params_list, index_no_updates_list
+                        ):
+                            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                                index_no_updates
+                            ] = orig_embeds_params[index_no_updates]
+
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = network.apply_max_norm_regularization(
