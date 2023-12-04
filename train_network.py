@@ -274,37 +274,54 @@ class NetworkTrainer:
         train_embedding = args.train_embedding
 
         if train_embedding:
-            self.assert_token_string(args.token_string, tokenizers)
-
-            token_strings = [args.token_string] + [f"{args.token_string}{i+1}" for i in range(args.num_vectors_per_token - 1)]
-            token_ids_list = []
             token_embeds_list = []
-            for i, (tokenizer, text_encoder, init_token_ids) in enumerate(zip(tokenizers, text_encoders, init_token_ids_list)):
-                num_added_tokens = tokenizer.add_tokens(token_strings)
-                assert (
-                    num_added_tokens == args.num_vectors_per_token
-                ), f"tokenizer has same word to token string. please use another one / 指定したargs.token_stringは既に存在します。別の単語を使ってください: tokenizer {i+1}, {args.token_string}"
+            token_ids_embeds = []
 
-                token_ids = tokenizer.convert_tokens_to_ids(token_strings)
-                accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
-                assert (
-                    min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
-                ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
-                assert (
-                    len(tokenizer) - 1 == token_ids[-1]
-                ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
-                token_ids_list.append(token_ids)
+            for embeds_file in args.textual_inversion_embeddings:
+                if model_util.is_safetensors(embeds_file):
+                    from safetensors.torch import load_file
 
-                # Resize the token embeddings as we are adding new special tokens to the tokenizer
-                text_encoder.resize_token_embeddings(len(tokenizer))
+                    data = load_file(embeds_file)
+                else:
+                    data = torch.load(embeds_file, map_location="cpu")
 
-                # Initialise the newly added placeholder token with the embeddings of the initializer token
-                token_embeds = text_encoder.get_input_embeddings().weight.data
-                if init_token_ids is not None:
-                    for i, token_id in enumerate(token_ids):
-                        token_embeds[token_id] = token_embeds[init_token_ids[i % len(init_token_ids)]]
-                        # accelerator.print(token_id, token_embeds[token_id].mean(), token_embeds[token_id].min())
-                token_embeds_list.append(token_embeds)
+                if "string_to_param" in data:
+                    data = data["string_to_param"]
+                embeds = next(iter(data.values()))
+
+                if type(embeds) != torch.Tensor:
+                    raise ValueError(f"weight file does not contains Tensor / 重みファイルのデータがTensorではありません: {embeds_file}")
+
+                num_vectors_per_token = embeds.size()[0]
+                token_string = os.path.splitext(os.path.basename(embeds_file))[0]
+                token_strings = [token_string] + [f"{token_string}{i+1}" for i in range(num_vectors_per_token - 1)]
+
+                for i, (tokenizer, text_encoder, init_token_ids) in enumerate(zip(tokenizers, text_encoders, init_token_ids_list)):
+                    num_added_tokens = tokenizer.add_tokens(token_strings)
+                    assert (
+                        num_added_tokens == args.num_vectors_per_token
+                    ), f"tokenizer has same word to token string. please use another one / 指定したargs.token_stringは既に存在します。別の単語を使ってください: tokenizer {i+1}, {args.token_string}"
+
+                    token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                    accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
+                    assert (
+                        min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                    ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    assert (
+                        len(tokenizer) - 1 == token_ids[-1]
+                    ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+                    token_ids_list.append(token_ids)
+
+                    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                    text_encoder.resize_token_embeddings(len(tokenizer))
+
+                    # Initialise the newly added placeholder token with the embeddings of the initializer token
+                    token_embeds = text_encoder.get_input_embeddings().weight.data
+                    if init_token_ids is not None:
+                        for i, token_id in enumerate(token_ids):
+                            token_embeds[token_id] = token_embeds[init_token_ids[i % len(init_token_ids)]]
+                            # accelerator.print(token_id, token_embeds[token_id].mean(), token_embeds[token_id].min())
+                    token_embeds_list.append(token_embeds)
 
             # load weights
             if args.weights is not None:
@@ -400,6 +417,9 @@ class NetworkTrainer:
         # 後方互換性を確保するよ
         try:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+            if train_embedding:
+                for text_encoder in text_encoders:
+                    trainable_params += text_encoder.get_input_embeddings().parameters()
         except TypeError:
             accelerator.print(
                 "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
