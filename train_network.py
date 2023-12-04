@@ -918,14 +918,15 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                    # Let's make sure we don't update any embedding weights besides the newly added token
-                    with torch.no_grad():
-                        for text_encoder, orig_embeds_params, index_no_updates in zip(
-                            text_encoders, orig_embeds_params_list, index_no_updates_list
-                        ):
-                            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                                index_no_updates
-                            ] = orig_embeds_params[index_no_updates]
+                    if train_embedding:
+                        # Let's make sure we don't update any embedding weights besides the newly added token
+                        with torch.no_grad():
+                            for text_encoder, orig_embeds_params, index_no_updates in zip(
+                                text_encoders, orig_embeds_params_list, index_no_updates_list
+                            ):
+                                accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                                    index_no_updates
+                                ] = orig_embeds_params[index_no_updates]
 
 
                 if args.scale_weight_norms:
