@@ -338,6 +338,18 @@ class NetworkTrainer:
                             token_embeds[token_id] = embed
                     # token_embeds_list.append(token_embeds)
 
+        index_no_updates_list = []
+        orig_embeds_params_list = []
+
+        if train_embeddings:
+            for tokenizer, (token_ids, _embeds), text_encoder in zip(tokenizers, token_ids_embeds, text_encoders):
+                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
+                index_no_updates_list.append(index_no_updates)
+
+                accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
+                orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
+                orig_embeds_params_list.append(orig_embeds_params)
+
         # 学習を準備する
         if cache_latents:
             vae.to(accelerator.device, dtype=vae_dtype)
@@ -356,6 +368,7 @@ class NetworkTrainer:
         self.cache_text_encoder_outputs_if_needed(
             args, accelerator, unet, vae, tokenizers, text_encoders, train_dataset_group, weight_dtype
         )
+
 
         # prepare network
         net_kwargs = {}
@@ -410,6 +423,14 @@ class NetworkTrainer:
 
         # 学習に必要なクラスを準備する
         accelerator.print("prepare optimizer, data loader etc.")
+
+        if train_embeddings and self.is_train_text_encoder(args) is False:
+            # Freeze all parameters except for the token embeddings in text encoder
+            text_encoder.requires_grad_(True)
+            text_encoder.text_model.encoder.requires_grad_(False)
+            text_encoder.text_model.final_layer_norm.requires_grad_(False)
+            text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+            # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
 
         # 後方互換性を確保するよ
         try:
@@ -493,8 +514,9 @@ class NetworkTrainer:
             unet, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 unet, network, optimizer, train_dataloader, lr_scheduler
             )
-            for t_enc in text_encoders:
+            for t_enc, orig_embeds_params in zip(text_encoders, orig_embeds_params_list):
                 t_enc.to(accelerator.device, dtype=weight_dtype)
+                orig_embeds_params.to(accelerator.device, dtype=weight_dtype)
         elif train_text_encoder:
             if len(text_encoders) > 1:
                 t_enc1, t_enc2, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -518,6 +540,17 @@ class NetworkTrainer:
         text_encoders = train_util.transform_models_if_DDP(text_encoders)
         unet, network = train_util.transform_models_if_DDP([unet, network])
 
+        # low_precision_error_string = (
+        #     "Please make sure to always have all model weights in full float32 precision when starting training - even if"
+        #     " doing mixed precision training. copy of the weights should still be float32."
+        # )
+        # if unet.dtype != torch.float32:
+        #     raise ValueError(f"Unet loaded as datatype {unet.dtype}. {low_precision_error_string}")
+        #
+        # for text_encoder in text_encoders:
+        #     if train_text_encoder and text_encoder.dtype != torch.float32:
+        #         raise ValueError(f"Text encoder loaded as datatype {text_encoder.dtype}. {low_precision_error_string}")
+
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
             unet.train()
@@ -540,26 +573,6 @@ class NetworkTrainer:
 
         network.prepare_grad_etc(text_encoder, unet)
 
-        if train_embeddings:
-            index_no_updates_list = []
-            orig_embeds_params_list = []
-            for tokenizer, (token_ids, _embeds), text_encoder in zip(tokenizers, token_ids_embeds, text_encoders):
-                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
-                index_no_updates_list.append(index_no_updates)
-
-                # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
-                orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
-                orig_embeds_params_list.append(orig_embeds_params)
-
-                if train_text_encoder is False:
-                    # Freeze all parameters except for the token embeddings in text encoder
-                    text_encoder.requires_grad_(True)
-                    text_encoder.text_model.encoder.requires_grad_(False)
-                    text_encoder.text_model.final_layer_norm.requires_grad_(False)
-                    text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
-                    # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
-
-
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
             vae.eval()
@@ -568,6 +581,9 @@ class NetworkTrainer:
         # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
+
+
+        breakpoint()
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
@@ -939,15 +955,16 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                    if train_embeddings and train_text_encoder is False:
-                        # Let's make sure we don't update any embedding weights besides the newly added token
-                        with torch.no_grad():
-                            for text_encoder, orig_embeds_params, index_no_updates in zip(
-                                text_encoders, orig_embeds_params_list, index_no_updates_list
-                            ):
-                                accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                                    index_no_updates
-                                ] = orig_embeds_params[index_no_updates]
+                    # if train_embeddings and train_text_encoder is False:
+                    #     # Let's make sure we don't update any embedding weights besides the newly added token
+                    #     with accelerator.autocast(), torch.no_grad():
+                    #         for text_encoder, orig_embeds_params, index_no_updates in zip(
+                    #             text_encoders, orig_embeds_params_list, index_no_updates_list
+                    #         ):
+                    #             # breakpoint()
+                    #             accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                    #                 index_no_updates
+                    #             ] = orig_embeds_params[index_no_updates]
 
 
                 if args.scale_weight_norms:
