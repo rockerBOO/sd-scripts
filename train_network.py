@@ -47,6 +47,26 @@ from library.custom_train_functions import (
 )
 
 
+def save_embedding(file, updated_embs, save_dtype, metadata, accelerator):
+    assert len(updated_embs) > 0, "Updated embeddings list cannot be empty"
+
+    state_dict = {"emb_params": updated_embs[0]}
+
+    if save_dtype is not None:
+        for key in list(state_dict.keys()):
+            v = state_dict[key]
+            v = v.detach().clone().to("cpu").to(save_dtype)
+            state_dict[key] = v
+
+    accelerator.print(f"\nsaving embeddings: {file}")
+    if os.path.splitext(file)[1] == ".safetensors":
+        from safetensors.torch import save_file
+
+        save_file(state_dict, file, metadata)
+    else:
+        torch.save(state_dict, file)  # can be loaded in Web UI
+
+
 class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
@@ -257,6 +277,79 @@ class NetworkTrainer:
 
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
 
+        train_embeddings = args.train_embeddings
+
+        if train_embeddings:
+            accelerator.print("Training textual inversion embeddings...")
+
+        if args.textual_inversion_embeddings:
+            token_embeds_list = []
+            token_ids_embeds = []
+            for embeds_file in args.textual_inversion_embeddings:
+                if model_util.is_safetensors(embeds_file):
+                    from safetensors.torch import load_file
+
+                    data = load_file(embeds_file)
+                else:
+                    data = torch.load(embeds_file, map_location="cpu")
+
+                if "string_to_param" in data:
+                    data = data["string_to_param"]
+                embeds = next(iter(data.values()))
+
+                if type(embeds) != torch.Tensor:
+                    raise ValueError(f"weight file does not contains Tensor / 重みファイルのデータがTensorではありません: {embeds_file}")
+
+                num_vectors_per_token = embeds.size()[0]
+                token_string = os.path.splitext(os.path.basename(embeds_file))[0]
+                token_strings = [token_string] + [f"{token_string}{i+1}" for i in range(num_vectors_per_token - 1)]
+
+                print("Token strings", token_strings)
+
+                for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                    num_added_tokens = tokenizer.add_tokens(token_strings)
+
+                    assert (
+                        num_added_tokens == num_vectors_per_token
+                    ), f"tokenizer has same word to token string (filename). please rename the file / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
+                    # assert (
+                    #     num_added_tokens == len(args.embeddings) # TODO: args.num_vectors_per_token?
+                    # ), f"tokenizer has same word to token string. please use another one / 指定したargs.token_stringは既に存在します。別の単語を使ってください: tokenizer {i+1}, {len(token_strings)}"
+
+                    token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                    accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
+                    print(f"Textual Inversion embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
+                    assert (
+                        min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                    ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    assert (
+                        len(tokenizer) - 1 == token_ids[-1]
+                    ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+                    # token_ids_embeds.append(token_ids)
+                    token_ids_embeds.append((token_ids, embeds))
+
+                    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                    text_encoder.resize_token_embeddings(len(tokenizer))
+
+                    # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
+                    token_embeds = text_encoder.get_input_embeddings().weight.data
+                    for token_ids, embeds in token_ids_embeds:
+                        for token_id, embed in zip(token_ids, embeds):
+                            token_embeds[token_id] = embed
+                    # token_embeds_list.append(token_embeds)
+
+        index_no_updates_list = []
+        orig_embeds_params_list = []
+
+        if train_embeddings:
+            for tokenizer, (token_ids, _embeds), text_encoder in zip(tokenizers, token_ids_embeds, text_encoders):
+                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
+                index_no_updates_list.append(index_no_updates)
+
+                accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
+                orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
+                orig_embeds_params_list.append(orig_embeds_params)
+
         # 学習を準備する
         if cache_latents:
             vae.to(accelerator.device, dtype=vae_dtype)
@@ -275,6 +368,7 @@ class NetworkTrainer:
         self.cache_text_encoder_outputs_if_needed(
             args, accelerator, unet, vae, tokenizers, text_encoders, train_dataset_group, weight_dtype
         )
+
 
         # prepare network
         net_kwargs = {}
@@ -330,9 +424,23 @@ class NetworkTrainer:
         # 学習に必要なクラスを準備する
         accelerator.print("prepare optimizer, data loader etc.")
 
+        if train_embeddings and self.is_train_text_encoder(args) is False:
+            # Freeze all parameters except for the token embeddings in text encoder
+            text_encoder.requires_grad_(True)
+            text_encoder.text_model.encoder.requires_grad_(False)
+            text_encoder.text_model.final_layer_norm.requires_grad_(False)
+            text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+            # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
+
         # 後方互換性を確保するよ
         try:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+            if train_embeddings:
+                for text_encoder in text_encoders:
+                    trainable_params.append({
+                        "params": text_encoder.get_input_embeddings().parameters(),
+                        "lr": args.embedding_lr or args.text_encoder_lr or args.learning_rate
+                    })
         except TypeError:
             accelerator.print(
                 "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
@@ -406,8 +514,9 @@ class NetworkTrainer:
             unet, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 unet, network, optimizer, train_dataloader, lr_scheduler
             )
-            for t_enc in text_encoders:
+            for t_enc, orig_embeds_params in zip(text_encoders, orig_embeds_params_list):
                 t_enc.to(accelerator.device, dtype=weight_dtype)
+                orig_embeds_params.to(accelerator.device, dtype=weight_dtype)
         elif train_text_encoder:
             if len(text_encoders) > 1:
                 t_enc1, t_enc2, network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -430,6 +539,17 @@ class NetworkTrainer:
         # transform DDP after prepare (train_network here only)
         text_encoders = train_util.transform_models_if_DDP(text_encoders)
         unet, network = train_util.transform_models_if_DDP([unet, network])
+
+        # low_precision_error_string = (
+        #     "Please make sure to always have all model weights in full float32 precision when starting training - even if"
+        #     " doing mixed precision training. copy of the weights should still be float32."
+        # )
+        # if unet.dtype != torch.float32:
+        #     raise ValueError(f"Unet loaded as datatype {unet.dtype}. {low_precision_error_string}")
+        #
+        # for text_encoder in text_encoders:
+        #     if train_text_encoder and text_encoder.dtype != torch.float32:
+        #         raise ValueError(f"Text encoder loaded as datatype {text_encoder.dtype}. {low_precision_error_string}")
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
@@ -461,6 +581,9 @@ class NetworkTrainer:
         # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
+
+
+        breakpoint()
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
@@ -535,6 +658,7 @@ class NetworkTrainer:
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
             "ss_debiased_estimation": bool(args.debiased_estimation_loss),
+            "ss_train_embeddings": bool(args.train_embeddings),
         }
 
         if use_user_config:
@@ -771,7 +895,7 @@ class NetworkTrainer:
                         latents = latents * self.vae_scale_factor
                     b_size = latents.shape[0]
 
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
+                    with torch.set_grad_enabled(train_text_encoder or train_embeddings), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
                             text_encoder_conds = get_weighted_text_embeddings(
@@ -831,6 +955,18 @@ class NetworkTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                    # if train_embeddings and train_text_encoder is False:
+                    #     # Let's make sure we don't update any embedding weights besides the newly added token
+                    #     with accelerator.autocast(), torch.no_grad():
+                    #         for text_encoder, orig_embeds_params, index_no_updates in zip(
+                    #             text_encoders, orig_embeds_params_list, index_no_updates_list
+                    #         ):
+                    #             # breakpoint()
+                    #             accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                    #                 index_no_updates
+                    #             ] = orig_embeds_params[index_no_updates]
+
+
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = network.apply_max_norm_regularization(
                         args.scale_weight_norms, accelerator.device
@@ -852,6 +988,21 @@ class NetworkTrainer:
                         if accelerator.is_main_process:
                             ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
                             save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+
+                            if train_embeddings:
+                                updated_embs_list = []
+                                for text_encoder, (token_ids, _embeds) in zip(text_encoders, token_ids_embeds):
+                                    updated_embs = (
+                                        accelerator.unwrap_model(text_encoder)
+                                        .get_input_embeddings()
+                                        .weight[token_ids]
+                                        .data.detach()
+                                        .clone()
+                                    )
+                                    updated_embs_list.append(updated_embs)
+
+                                embeds_file = os.path.join(args.output_dir, "embed-"+ckpt_name)
+                                save_embedding(embeds_file, updated_embs_list, save_dtype, metadata, accelerator)
 
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -890,6 +1041,21 @@ class NetworkTrainer:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
                     save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
+                    if train_embeddings:
+                        updated_embs_list = []
+                        for text_encoder, (token_ids, _embeds) in zip(text_encoders, token_ids_embeds):
+                            updated_embs = (
+                                accelerator.unwrap_model(text_encoder)
+                                .get_input_embeddings()
+                                .weight[token_ids]
+                                .data.detach()
+                                .clone()
+                            )
+                            updated_embs_list.append(updated_embs)
+
+                        embeds_file = os.path.join(args.output_dir, "embed-"+ckpt_name)
+                        save_embedding(embeds_file, updated_embs_list, save_dtype, metadata, accelerator)
+
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
                         remove_ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, remove_epoch_no)
@@ -916,6 +1082,21 @@ class NetworkTrainer:
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+
+            if train_embeddings:
+                updated_embs_list = []
+                for text_encoder, (token_ids, _embeds) in zip(text_encoders, token_ids_embeds):
+                    updated_embs = (
+                        accelerator.unwrap_model(text_encoder)
+                        .get_input_embeddings()
+                        .weight[token_ids]
+                        .data.detach()
+                        .clone()
+                    )
+                    updated_embs_list.append(updated_embs)
+
+                embeds_file = os.path.join(args.output_dir, "embed-"+ckpt_name)
+                save_embedding(embeds_file, updated_embs_list, save_dtype, metadata, accelerator)
 
             print("model saved.")
 
@@ -993,6 +1174,24 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         nargs="*",
         help="multiplier for network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みの倍率",
+    )
+    parser.add_argument(
+        "--train_embeddings",
+        action="store_true",
+        help="Train the textual inversion embeddings",
+    )
+
+    parser.add_argument(
+        "--embedding_lr",
+        type=float,
+        help="Train the textual inversion embeddings",
+    )
+    parser.add_argument(
+        "--textual_inversion_embeddings",
+        type=str,
+        default=None,
+        nargs="*",
+        help="Embeddings files of Textual Inversion / Textual Inversionのembeddings",
     )
     parser.add_argument(
         "--no_half_vae",
