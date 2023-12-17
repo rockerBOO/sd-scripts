@@ -9,6 +9,42 @@ This is a working branch/fork of sd-scripts which includes all my PRs and other 
 - [Drop keys](https://github.com/kohya-ss/sd-scripts/pull/964)
 - [Attention processor](https://github.com/kohya-ss/sd-scripts/pull/949) (DAAM attention mapping of samples)
 
+## Masked loss
+
+Masks in this fork go into `masks/` of the training image directory.
+
+I'm using rembg to make the masks
+
+```
+rembg p -om 1_filtered/ 1_filtered/masks
+```
+
+Masked loss options:
+
+```
+--masked_loss 
+--masked_min 0.25
+```
+
+## Validation loss
+
+Will automatically split your datasets/subsets into validation/training.
+
+Validation loss options:
+
+```
+--validation_seed=1234
+--validation_ratio=0.15
+```
+
+## Drop keys
+
+Drop some keys from the network from being trained. You will see a list of keys that were dropped in the training output.
+
+```
+--network_args drop_keys=to_v,proj
+```
+
 ---
 
 __SDXL is now supported. The sdxl branch has been merged into the main branch. If you update the repository, please follow the upgrade instructions. Also, the version of accelerate has been updated, so please run accelerate config again.__ The documentation for SDXL training is [here](./README.md#sdxl-training).
