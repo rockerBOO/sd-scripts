@@ -811,8 +811,10 @@ class SdxlUNet2DConditionModel(nn.Module):
         self.time_embed_dim = TIME_EMBED_DIM
         self.adm_in_channels = ADM_IN_CHANNELS
 
+        self.sample_size = 128
+        self.prepare_config(sample_size=self.sample_size)
+
         self.gradient_checkpointing = False
-        # self.sample_size = sample_size
 
         # time embedding
         self.time_embed = nn.Sequential(
@@ -997,8 +999,8 @@ class SdxlUNet2DConditionModel(nn.Module):
         )
 
     # region diffusers compatibility
-    def prepare_config(self):
-        self.config = SimpleNamespace()
+    def prepare_config(self, *args, **kwargs):
+        self.config = SimpleNamespace(**kwargs)
 
     @property
     def dtype(self) -> torch.dtype:
