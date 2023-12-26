@@ -11,10 +11,13 @@ import toml
 
 from tqdm import tqdm
 import torch
+
 try:
     import intel_extension_for_pytorch as ipex
+
     if torch.xpu.is_available():
         from library.ipex import ipex_init
+
         ipex_init()
 except Exception:
     pass
@@ -317,8 +320,8 @@ def train(args):
         num_train_timesteps=1000,
         clip_sample=False,
     )
-
-    train_util.init_trackers(accelerator, "controlnet_train", args)
+    if accelerator.is_main_process:
+        train_util.init_trackers(accelerator, "controlnet_train", args)
 
     loss_recorder = train_util.LossRecorder()
     del train_dataset_group
@@ -353,6 +356,11 @@ def train(args):
         if os.path.exists(old_ckpt_file):
             accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
             os.remove(old_ckpt_file)
+
+    # For --sample_at_first
+    train_util.sample_images(
+        accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet, controlnet=controlnet
+    )
 
     # training loop
     for epoch in range(num_train_epochs):
@@ -432,7 +440,7 @@ def train(args):
                 loss = loss * loss_weights
 
                 if args.min_snr_gamma:
-                    loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                    loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
 
                 loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
