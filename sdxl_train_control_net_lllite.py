@@ -14,13 +14,11 @@ import toml
 
 from tqdm import tqdm
 import torch
-try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-        ipex_init()
-except Exception:
-    pass
+
+from library.ipex_interop import init_ipex
+
+init_ipex()
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from accelerate.utils import set_seed
 import accelerate
@@ -340,7 +338,7 @@ def train(args):
     if args.zero_terminal_snr:
         custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
 
-    train_util.init_trackers(accelerator, "network_train", args)
+    train_util.init_trackers(accelerator, "lllite_control_net_train", args)
 
     loss_recorder = train_util.LossRecorder()
     del train_dataset_group

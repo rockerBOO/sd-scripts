@@ -4,13 +4,10 @@
 import math
 import os
 import torch
-try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-        ipex_init()
-except Exception:
-    pass
+
+from library.ipex_interop import init_ipex
+
+init_ipex()
 import diffusers
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextConfig, logging
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline  # , UNet2DConditionModel
@@ -571,9 +568,9 @@ def convert_ldm_clip_checkpoint_v1(checkpoint):
         if key.startswith("cond_stage_model.transformer"):
             text_model_dict[key[len("cond_stage_model.transformer.") :]] = checkpoint[key]
 
-    # support checkpoint without position_ids (invalid checkpoint)
-    if "text_model.embeddings.position_ids" not in text_model_dict:
-        text_model_dict["text_model.embeddings.position_ids"] = torch.arange(77).unsqueeze(0)  # 77 is the max length of the text
+    # remove position_ids for newer transformer, which causes error :(
+    if "text_model.embeddings.position_ids" in text_model_dict:
+        text_model_dict.pop("text_model.embeddings.position_ids")
 
     return text_model_dict
 
@@ -1242,8 +1239,13 @@ def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_mod
     if vae is None:
         vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae")
 
+    # original U-Net cannot be saved, so we need to convert it to the Diffusers version
+    # TODO this consumes a lot of memory
+    diffusers_unet = diffusers.UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, subfolder="unet")
+    diffusers_unet.load_state_dict(unet.state_dict())
+
     pipeline = StableDiffusionPipeline(
-        unet=unet,
+        unet=diffusers_unet,
         text_encoder=text_encoder,
         vae=vae,
         scheduler=scheduler,
