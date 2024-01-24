@@ -463,23 +463,23 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         dataset = dataset_klass(subsets=subsets, is_train=True, **asdict(dataset_blueprint.params))
         datasets.append(dataset)
 
-        val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
-        for dataset_blueprint in dataset_group_blueprint.datasets:
-            if dataset_blueprint.params.validation_split <= 0.0:
-                continue
-            if dataset_blueprint.is_controlnet:
-                subset_klass = ControlNetSubset
-                dataset_klass = ControlNetDataset
-            elif dataset_blueprint.is_dreambooth:
-                subset_klass = DreamBoothSubset
-                dataset_klass = DreamBoothDataset
-            else:
-                subset_klass = FineTuningSubset
-                dataset_klass = FineTuningDataset
+    val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
+    for dataset_blueprint in dataset_group_blueprint.datasets:
+        if dataset_blueprint.params.validation_split <= 0.0:
+            continue
+        if dataset_blueprint.is_controlnet:
+            subset_klass = ControlNetSubset
+            dataset_klass = ControlNetDataset
+        elif dataset_blueprint.is_dreambooth:
+            subset_klass = DreamBoothSubset
+            dataset_klass = DreamBoothDataset
+        else:
+            subset_klass = FineTuningSubset
+            dataset_klass = FineTuningDataset
 
-            subsets = [subset_klass(**asdict(subset_blueprint.params)) for subset_blueprint in dataset_blueprint.subsets]
-            dataset = dataset_klass(subsets=subsets, is_train=False, **asdict(dataset_blueprint.params))
-            val_datasets.append(dataset)
+        subsets = [subset_klass(**asdict(subset_blueprint.params)) for subset_blueprint in dataset_blueprint.subsets]
+        dataset = dataset_klass(subsets=subsets, is_train=False, **asdict(dataset_blueprint.params))
+        val_datasets.append(dataset)
 
     # print info
     def print_info(_datasets):
@@ -556,7 +556,6 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         dataset.set_seed(seed)
 
     if len(val_datasets) > 0:
-        print("Validation dataset")
         print_info(val_datasets)
 
     for i, dataset in enumerate(val_datasets):
