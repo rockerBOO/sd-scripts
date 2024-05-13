@@ -458,6 +458,7 @@ def train(args):
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
+    use_schedule_free_optimizer = args.optimizer_type.lower().endswith("schedulefree")
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
@@ -466,14 +467,9 @@ def train(args):
             text_encoder2=text_encoder2 if train_text_encoder2 else None,
         )
         # most of ZeRO stage uses optimizer partitioning, so we have to prepare optimizer and ds_model at the same time. # pull/1139#issuecomment-1986790007
-        if args.optimizer_type.lower().endswith("schedulefree"):
-            ds_model, optimizer, train_dataloader = accelerator.prepare(
-                ds_model, optimizer, train_dataloader
-            )
-        else:
-            ds_model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                ds_model, optimizer, train_dataloader, lr_scheduler
-            )
+        ds_model, optimizer, train_dataloader = accelerator.prepare(ds_model, optimizer, train_dataloader)
+        if not use_schedule_free_optimizer:
+            lr_scheduler = accelerator.prepare(lr_scheduler)
         training_models = [ds_model]
 
     else:
@@ -484,10 +480,17 @@ def train(args):
             text_encoder1 = accelerator.prepare(text_encoder1)
         if train_text_encoder2:
             text_encoder2 = accelerator.prepare(text_encoder2)
-        if args.optimizer_type.lower().endswith("schedulefree"):
-            optimizer, train_dataloader = accelerator.prepare(optimizer, train_dataloader)
-        else:
-            optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        if not use_schedule_free_optimizer:
+            lr_scheduler = accelerator.prepare(lr_scheduler)
+        optimizer, train_dataloader = accelerator.prepare(optimizer, train_dataloader)
+
+    # make lambda function for calling optimizer.train() and optimizer.eval() if schedule-free optimizer is used
+    if use_schedule_free_optimizer:
+        optimizer_train_if_needed = lambda: optimizer.train()
+        optimizer_eval_if_needed = lambda: optimizer.eval()
+    else:
+        optimizer_train_if_needed = lambda: None
+        optimizer_eval_if_needed = lambda: None
 
     if args.fused_backward_pass:
         # use fused optimizer for backward pass: other optimizers will be supported in the future
@@ -613,8 +616,7 @@ def train(args):
             m.train()
 
         for step, batch in enumerate(train_dataloader):
-            if (args.optimizer_type.lower().endswith("schedulefree")):
-                optimizer.train()
+            optimizer_train_if_needed()
             current_step.value = global_step
 
             if args.fused_optimizer_groups:
@@ -750,8 +752,7 @@ def train(args):
                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
-                    if not args.optimizer_type.lower().endswith("schedulefree"):
-                        lr_scheduler.step()
+                    lr_scheduler.step() # if schedule-free optimizer is used, this is a no-op
                     optimizer.zero_grad(set_to_none=True)
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
@@ -760,8 +761,7 @@ def train(args):
                         for i in range(1, len(optimizers)):
                             lr_schedulers[i].step()
 
-            if (args.optimizer_type.lower().endswith("schedulefree")):
-                optimizer.eval()
+            optimizer_eval_if_needed()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

@@ -287,19 +287,22 @@ def train(args):
     unet.to(weight_dtype)
 
     # acceleratorがなんかよろしくやってくれるらしい
-    if args.optimizer_type.lower().endswith("schedulefree"):
-        unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
+    use_schedule_free_optimizer = args.optimizer_type.lower().endswith("schedulefree")
+    unet, optimizer, train_dataloader = accelerator.prepare(unet, optimizer, train_dataloader)
+    if not use_schedule_free_optimizer:
+        lr_scheduler = accelerator.prepare(lr_scheduler)
+
+    # make lambda function for calling optimizer.train() and optimizer.eval() if schedule-free optimizer is used
+    if use_schedule_free_optimizer:
+        optimizer_train_if_needed = lambda: optimizer.train()
+        optimizer_eval_if_needed = lambda: optimizer.eval()
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
+        optimizer_train_if_needed = lambda: None
+        optimizer_eval_if_needed = lambda: None
 
     if args.gradient_checkpointing:
-        if (args.optimizer_type.lower().endswith("schedulefree")):
-            optimizer.train()
         unet.train()  # according to TI example in Diffusers, train is required -> これオリジナルのU-Netしたので本当は外せる
-
     else:
-        if (args.optimizer_type.lower().endswith("schedulefree")):
-            optimizer.eval()
         unet.eval()
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
@@ -399,8 +402,7 @@ def train(args):
         current_epoch.value = epoch + 1
 
         for step, batch in enumerate(train_dataloader):
-            if (args.optimizer_type.lower().endswith("schedulefree")):
-                optimizer.train()
+            optimizer_train_if_needed()
             current_step.value = global_step
             with accelerator.accumulate(unet):
                 with torch.no_grad():
@@ -496,12 +498,10 @@ def train(args):
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
-                if not args.optimizer_type.lower().endswith("schedulefree"):
-                    lr_scheduler.step()
+                lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if (args.optimizer_type.lower().endswith("schedulefree")):
-                optimizer.eval()
+            optimizer_eval_if_needed()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
