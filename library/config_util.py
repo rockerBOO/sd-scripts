@@ -78,6 +78,11 @@ class BaseSubsetParams:
     caption_tag_dropout_rate: float = 0.0
     token_warmup_min: int = 1
     token_warmup_step: float = 0
+    preference: bool = False
+    preference_caption_prefix: Optional[str] = None
+    preference_caption_suffix: Optional[str] = None
+    non_preference_caption_prefix: Optional[str] = None
+    non_preference_caption_suffix: Optional[str] = None
 
 
 @dataclass
@@ -199,6 +204,11 @@ class ConfigSanitizer:
         "token_warmup_step": Any(float, int),
         "caption_prefix": str,
         "caption_suffix": str,
+        "preference": bool,
+        "preference_caption_prefix": str,
+        "preference_caption_suffix": str,
+        "non_preference_caption_prefix": str,
+        "non_preference_caption_suffix": str
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -540,13 +550,28 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           flip_aug: {subset.flip_aug}
           face_crop_aug_range: {subset.face_crop_aug_range}
           random_crop: {subset.random_crop}
-          token_warmup_min: {subset.token_warmup_min},
-          token_warmup_step: {subset.token_warmup_step},
-          alpha_mask: {subset.alpha_mask},
+          token_warmup_min: {subset.token_warmup_min}
+          token_warmup_step: {subset.token_warmup_step}
+          alpha_mask: {subset.alpha_mask}
+          preference: {subset.preference}
       """
                 ),
                 "  ",
             )
+
+            if subset.preference:
+                info += indent(
+                    dedent(
+
+                        f"""\
+          preference_caption_prefix: {subset.preference_caption_prefix}
+          preference_caption_suffix: {subset.preference_caption_suffix}
+          non_preference_caption_prefix: {subset.non_preference_caption_prefix}
+          non_preference_caption_suffix: {subset.non_preference_caption_suffix}
+        \n"""
+                    ),
+                    "    ",
+                )
 
             if is_dreambooth:
                 info += indent(
