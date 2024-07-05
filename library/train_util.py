@@ -424,8 +424,8 @@ class BaseSubset:
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
         self.preference = preference
-        self.preference_caption_prefix = non_preference_caption_prefix
-        self.preference_caption_suffix = non_preference_caption_suffix
+        self.preference_caption_prefix = preference_caption_prefix
+        self.preference_caption_suffix = preference_caption_suffix
         self.non_preference_caption_prefix = non_preference_caption_prefix
         self.non_preference_caption_suffix = non_preference_caption_suffix
 
