@@ -563,6 +563,22 @@ class NetworkTrainer:
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
         optimizer_train_fn, optimizer_eval_fn = train_util.get_optimizer_train_eval_fn(optimizer, args)
 
+        if args.fused_backward_pass:
+            for param_group, param_name_group in zip(optimizer.param_groups, param_names):
+                for parameter, param_name in zip(param_group["params"], param_name_group):
+                    if parameter.requires_grad:
+
+                        def create_grad_hook(p_name, p_group):
+                            def grad_hook(tensor: torch.Tensor):
+                                if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                                    accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
+                                optimizer.step_param(tensor, p_group)
+                                tensor.grad = None
+
+                            return grad_hook
+
+                        parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
+
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
         # some strategies can be None
