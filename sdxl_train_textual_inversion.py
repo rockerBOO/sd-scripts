@@ -3,6 +3,8 @@ import os
 
 import regex
 
+from typing import Union, Optional
+
 import torch
 from library.device_utils import init_ipex
 
@@ -23,7 +25,8 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
         sdxl_train_util.verify_sdxl_training_args(args, supportTextEncoderCaching=False)
 
         train_dataset_group.verify_bucket_reso_steps(32)
-        val_dataset_group.verify_bucket_reso_steps(32)
+        if val_dataset_group is not None:
+            val_dataset_group.verify_bucket_reso_steps(32)
 
     def load_target_model(self, args, weight_dtype, accelerator):
         (
