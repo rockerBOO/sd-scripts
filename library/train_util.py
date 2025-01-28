@@ -447,11 +447,11 @@ class BaseSubset:
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
-        preference: bool,
-        preference_caption_prefix: Optional[str],
-        preference_caption_suffix: Optional[str],
-        non_preference_caption_prefix: Optional[str],
-        non_preference_caption_suffix: Optional[str],
+        preference: bool = False,
+        preference_caption_prefix: Optional[str] = None,
+        preference_caption_suffix: Optional[str] = None,
+        non_preference_caption_prefix: Optional[str] = None,
+        non_preference_caption_suffix: Optional[str] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -521,11 +521,11 @@ class DreamBoothSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
-        preference: bool,
-        preference_caption_prefix,
-        preference_caption_suffix,
-        non_preference_caption_prefix,
-        non_preference_caption_suffix,
+        preference: bool = False,
+        preference_caption_prefix: str | None = None,
+        preference_caption_suffix: str | None = None,
+        non_preference_caption_prefix: str | None = None,
+        non_preference_caption_suffix: str | None = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -554,11 +554,11 @@ class DreamBoothSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
-            preference,
-            preference_caption_prefix,
-            preference_caption_suffix,
-            non_preference_caption_prefix,
-            non_preference_caption_suffix,
+            preference=preference,
+            preference_caption_prefix=preference_caption_prefix,
+            preference_caption_suffix=preference_caption_suffix,
+            non_preference_caption_prefix=non_preference_caption_prefix,
+            non_preference_caption_suffix=non_preference_caption_suffix,
         )
 
         self.is_reg = is_reg
@@ -669,6 +669,11 @@ class ControlNetSubset(BaseSubset):
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
         resize_interpolation: Optional[str] = None,
+        preference: bool = False,
+        preference_caption_prefix: str | None = None,
+        preference_caption_suffix: str | None = None,
+        non_preference_caption_prefix: str | None = None,
+        non_preference_caption_suffix: str | None = None
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -697,6 +702,11 @@ class ControlNetSubset(BaseSubset):
             validation_seed=validation_seed,
             validation_split=validation_split,
             resize_interpolation=resize_interpolation,
+            preference=preference,
+            preference_caption_prefix=preference_caption_prefix,
+            preference_caption_suffix=preference_caption_suffix,
+            non_preference_caption_prefix=non_preference_caption_prefix,
+            non_preference_caption_suffix=non_preference_caption_suffix,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -2571,6 +2581,10 @@ class ControlNetDataset(BaseDataset):
                 subset.token_warmup_step,
                 resize_interpolation=subset.resize_interpolation,
                 preference=subset.preference,
+                preference_caption_prefix=subset.preference_caption_prefix,
+                preference_caption_suffix=subset.preference_caption_suffix,
+                non_preference_caption_prefix=subset.non_preference_caption_prefix,
+                non_preference_caption_suffix=subset.non_preference_caption_suffix,
             )
             db_subsets.append(db_subset)
 
