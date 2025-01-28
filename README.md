@@ -1,3 +1,17 @@
+Fork repo mixing my different PR's together for experimental testing
+
+## PRs
+
+- https://github.com/kohya-ss/sd-scripts/pull/1908 Move scale_weight_norms inside sync_gradients
+- https://github.com/kohya-ss/sd-scripts/pull/1894 Add pin_memory to DataLoader and update ImageInfo to support
+- https://github.com/kohya-ss/sd-scripts/pull/1873 Add scale map to apply_max_norm_regularization
+- https://github.com/kohya-ss/sd-scripts/pull/1870 Add rank_stabilized for networks
+
+## Merged PRs
+
+- https://github.com/kohya-ss/sd-scripts/pull/1864 Validation loss
+
+
 This repository contains training, generation and utility scripts for Stable Diffusion.
 
 ## FLUX.1 and SD3 training (WIP)
