@@ -108,6 +108,11 @@ class NetworkTrainer:
             idx = 0
             if not args.network_train_unet_only:
                 logs["lr/textencoder"] = float(lrs[0])
+
+                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
+                    logs['momentum/betas1-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][0]
+                    logs['momentum/betas2-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][1]
+
                 idx = 1
 
             for i in range(idx, len(lrs)):
@@ -118,6 +123,11 @@ class NetworkTrainer:
                     )
                 if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
                     logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
+
+                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
+                    logs[f'momentum/betas1-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][0]
+                    logs[f'momentum/betas2-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][1]
+
 
         return logs
 
