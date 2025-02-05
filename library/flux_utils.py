@@ -1,5 +1,7 @@
 import json
 import os
+from fnmatch import fnmatch
+from pathlib import Path
 from dataclasses import replace
 from typing import List, Optional, Tuple, Union, Dict
 
@@ -9,7 +11,7 @@ from accelerate import init_empty_weights
 from safetensors import safe_open
 from safetensors.torch import load_file
 from transformers import CLIPConfig, CLIPTextModel, T5Config, T5EncoderModel
-from diffusers import FluxTransformer2DModel
+from huggingface_hub import snapshot_download
 
 from library.utils import setup_logging
 
@@ -40,7 +42,7 @@ def get_shards(json_path):
         print(f"Error: Unable to parse JSON in {json_path}.")
         return []
 
-def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str], Dict[str, torch.Tensor]]:
+def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
     """
     チェックポイントの状態を分析し、DiffusersかBFLか、devかschnellか、ブロック数を計算して返す。
 
@@ -53,38 +55,58 @@ def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int
             - bool: Schnellかどうかを示すフラグ。
             - Tuple[int, int]: ダブルブロックとシングルブロックの数。
             - List[str]: チェックポイントに含まれるキーのリスト。
+
+    Raises:
+        [`RuntimeError`](https://docs.python.org/3/library/exceptions.html#RuntimeError)
+            Could not find a checkpoint to analyze / 分析するチェックポイントが見つかりませんでした
     """
     # check the state dict: Diffusers or BFL, dev or schnell, number of blocks
     logger.info(f"Checking the state dict: Diffusers or BFL, dev or schnell")
 
-    ckpt_paths = []
     keys = []
-    state_dict = {}
-    if os.path.isdir(ckpt_path):  # if ckpt_path is a directory, it is Diffusers
-        # Check for weight_map index file
-        weight_map_file = os.path.join(ckpt_path, "diffusion_pytorch_model.safetensors.index.json")
-        if os.path.isfile(weight_map_file):
-            ckpt_paths = [os.path.join(ckpt_path, file) for file in get_shards(weight_map_file)]
-        else:
-            ckpt_path = os.path.join(ckpt_path, "diffusion_pytorch_model-00001-of-00003.safetensors")
-            ckpt_paths = [ckpt_path.replace("00001-of-00003", f"0000{i}-of-00003") for i in range(1, 4)]
-    else: 
-        try:
-            # Try to load model from huggingface
-            model = FluxTransformer2DModel.from_pretrained(ckpt_path, torch_dtype=torch.float8_e4m3fn)
-            state_dict = model.state_dict()
-            del model
-            keys = list(state_dict.keys())
-        except:
-            # Loading a single file
-            ckpt_paths = [ckpt_path]
 
-    if keys == []:
-        if len(ckpt_paths) == 0:
-            raise RuntimeError("Could not find a checkpoint to analyze / 分析するチェックポイントが見つかりませんでした")
-        for ckpt_path in ckpt_paths:
+    def find_checkpoint_files(path):
+        """
+        Attempt: 
+        - directories
+        - single file 
+        """
+        if os.path.isdir(path):  # if ckpt_path is a directory, it is Diffusers
+            # Check for weight_map index file
+            weight_map_file = os.path.join(path, "diffusion_pytorch_model.safetensors.index.json")
+            if os.path.isfile(weight_map_file):
+                paths = [os.path.join(path, file) for file in get_shards(weight_map_file)]
+            else:
+                path = os.path.join(path, "diffusion_pytorch_model-00001-of-00003.safetensors")
+                paths = [path.replace("00001-of-00003", f"0000{i}-of-00003") for i in range(1, 4)]
+        elif os.path.isfile(path):
+            paths = [path]
+        else:
+            paths = []
+
+        return paths
+
+    ckpt_paths = find_checkpoint_files(ckpt_path)
+    
+    # Have not found any paths
+    if ckpt_paths == []:
+        try:
+            # Try to load transformer model from HF
+            snapshot_path = snapshot_download(ckpt_path, allow_patterns="transformer/*.safetensors")
+            ckpt_paths = [str(path) for path in Path(f"{snapshot_path}/transformer").iterdir() if fnmatch(str(path), "*.safetensors")]
+        except Exception as e:
+            logger.warning(f"Error attempting to load snapshot: {e}")
+
+    if len(ckpt_paths) == 0:
+        raise RuntimeError("Could not find a checkpoint to analyze / 分析するチェックポイントが見つかりませんでした")
+
+    for ckpt_path in ckpt_paths:
+        try:
             with safe_open(ckpt_path, framework="pt") as f:
                 keys.extend(f.keys())
+        except Exception as e:
+            logger.error(f"Error loading checkpoint file: {ckpt_path}")
+            raise e
 
     # if the key has annoying prefix, remove it
     if keys[0].startswith("model.diffusion_model."):
@@ -120,13 +142,13 @@ def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int
     num_double_blocks = max_double_block_index + 1
     num_single_blocks = max_single_block_index + 1
 
-    return is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths, state_dict
+    return is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths
 
 
 def load_flow_model(
     ckpt_path: str, dtype: Optional[torch.dtype], device: Union[str, torch.device], disable_mmap: bool = False
 ) -> Tuple[bool, flux_models.Flux]:
-    is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths, sd = analyze_checkpoint_state(ckpt_path)
+    is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths = analyze_checkpoint_state(ckpt_path)
     name = MODEL_NAME_DEV if not is_schnell else MODEL_NAME_SCHNELL
 
     # build model
@@ -146,12 +168,11 @@ def load_flow_model(
         if dtype is not None:
             model = model.to(dtype)
 
-    # No state dict has been loaded
-    if len(sd.keys()) == 0:
-        # load_sft doesn't support torch.device
-        logger.info(f"Loading state dict from {ckpt_path}")
-        for ckpt_path in ckpt_paths:
-            sd.update(load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype))
+    sd = {}
+    # load_sft doesn't support torch.device
+    logger.info(f"Loading state dict from {ckpt_path}")
+    for ckpt_path in ckpt_paths:
+        sd.update(load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype))
 
     # convert Diffusers to BFL
     if is_diffusers:

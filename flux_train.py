@@ -150,7 +150,7 @@ def train(args):
 
     train_dataset_group.verify_bucket_reso_steps(16)  # TODO これでいいか確認
 
-    _, is_schnell, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+    _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
     if args.debug_dataset:
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(

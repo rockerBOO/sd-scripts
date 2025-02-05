@@ -177,7 +177,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         return strategy_flux.FluxTextEncodingStrategy(apply_t5_attn_mask=args.apply_t5_attn_mask)
 
     def get_image_embeddings_caching_strategy(self, args):
-        return strategy_flux.FluxImageEmbeddingCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
+        return strategy_flux.FluxImageEmbeddingCachingStrategy(args.cache_image_embeddings_to_disk, args.image_embeddings_batch_size, False)
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         # check t5xxl is trained or not

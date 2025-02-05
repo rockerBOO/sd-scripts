@@ -274,7 +274,7 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
             npz = np.load(npz_path)
             if "vis_embed" + key_reso_suffix not in npz:
                 return False
-            if flip_aug and "flipped" + key_reso_suffix not in npz:
+            if flip_aug and "flipped_vis_embed" + key_reso_suffix not in npz:
                 return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
@@ -285,7 +285,7 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
 
     def load_image_embeddings_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]]]:
+    ) -> Tuple[Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]]], Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]]]]:
         # if latents_stride is None:
         #     key_reso_suffix = ""
         # else:
@@ -298,12 +298,17 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
 
         npz = np.load(npz_path)
         if "vis_embed" + key_reso_suffix not in npz:
-            raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+            raise ValueError(f"vis_embed{key_reso_suffix} not found in {npz_path}")
 
         vis_embed = npz["vis_embed" + key_reso_suffix]
         vis_id = npz["vis_id" + key_reso_suffix].tolist()
         vis_attn_mask = npz["vis_attn_mask" + key_reso_suffix].tolist()
-        return vis_embed, vis_id, vis_attn_mask
+
+        flipped_vis_embed = npz["flipped_vis_embed" + key_reso_suffix]
+        flipped_vis_id = npz["flipped_vis_id" + key_reso_suffix].tolist()
+        flipped_vis_attn_mask = npz["flipped_vis_attn_mask" + key_reso_suffix].tolist()
+        flipped = (flipped_vis_embed, flipped_vis_id, flipped_vis_attn_mask)
+        return (vis_embed, vis_id, vis_attn_mask), flipped
 
 
     @torch.no_grad()
@@ -312,6 +317,7 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
         imgs = [train_util.load_image(nfo.absolute_path) for nfo in batch]
         # TODO support flipping (??)
         flipped_image_embeddings = None
+
         processor = AutoProcessor.from_pretrained("google/siglip-so400m-patch14-384")
         siglip_in = processor(images=imgs, padding="max_length", return_tensors="pt").to(siglip_model.device, dtype=siglip_model.dtype)
 
@@ -326,6 +332,27 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
         vis_ids = np.zeros(shape=(bsz, vis_embeds.shape[1], 3))
         vis_attn_masks = np.ones((bsz, vis_embeds.shape[1]))
 
+        if flip_aug:
+            imgs = [np.flip(img, axis=2) for img in imgs]
+            siglip_in = processor(images=imgs, padding="max_length", return_tensors="pt").to(siglip_model.device, dtype=siglip_model.dtype)
+
+            siglip_out = siglip_model(**siglip_in)
+            flipped_vis_embeds = redux_encoder(siglip_out.last_hidden_state).float()
+            (b, t, h) = flipped_vis_embeds.shape
+            s = int(sqrt(t))
+            flipped_vis_embeds = torch.nn.functional.interpolate(flipped_vis_embeds.view(b, s, s, h).transpose(1, -1),
+                                                        size=(grid_size, grid_size),
+                                                        mode="bicubic")
+            flipped_vis_embeds = flipped_vis_embeds.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
+            flipped_vis_ids = np.zeros(shape=(bsz, flipped_vis_embeds.shape[1], 3))
+            flipped_vis_attn_masks = np.ones((bsz, flipped_vis_embeds.shape[1]))
+            flipped_image_embeddings =[(flipped_vis_embeds[i], flipped_vis_ids[i], flipped_vis_attn_masks[i]) for i in range(len(flipped_vis_embeds))]
+        else:
+            flipped_vis_embeds = [None] * vis_embeds.shape[0]
+            flipped_vis_ids = [None] * vis_embeds.shape[0]
+            flipped_vis_attn_masks =  [None] * vis_embeds.shape[0]
+            
+            flipped_image_embeddings =[(flipped_vis_embeds[i], flipped_vis_ids[i], flipped_vis_attn_masks[i]) for i in range(len(flipped_vis_embeds))]
 
         for i, info in enumerate(batch):
             vis_embed = vis_embeds[i]
@@ -334,7 +361,7 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
 
             if self.cache_to_disk:
                 self.save_image_embeddings_to_disk(
-                    info.vision_encoder_npz, vis_embed, vis_id, vis_attn_mask, flipped_image_embeddings, key_reso_suffix=""
+                    info.vision_encoder_npz, vis_embed, vis_id, vis_attn_mask, flipped_image_embeddings[i], key_reso_suffix=""
                 )
                 # TODO Make setting to toggle this
                 # Caching in memory as well
@@ -363,8 +390,10 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
         kwargs["vis_embed" + key_reso_suffix] = vis_embed
         kwargs["vis_id" + key_reso_suffix] = vis_id
         kwargs["vis_attn_mask" + key_reso_suffix] = vis_attn_mask
-        # if flipped_latents_tensor is not None:
-        #     kwargs["flipped" + key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
+        if flipped_image_embeddings is not None:
+            kwargs["flipped_vis_embed" + key_reso_suffix] = flipped_image_embeddings[0]
+            kwargs["flipped_vis_id" + key_reso_suffix] = flipped_image_embeddings[1]
+            kwargs["flipped_vis_attn_mask" + key_reso_suffix] = flipped_image_embeddings[2]
         np.savez(npz_path, **kwargs)
 
 

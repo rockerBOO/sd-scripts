@@ -1178,7 +1178,7 @@ class BaseDataset(torch.utils.data.Dataset):
                         info.bucket_reso, info.vision_encoder_npz, subset.flip_aug
                     )
                     if cache_available:  # do not add to batch
-                        info.vision_encoder_outputs = caching_strategy.load_image_embeddings_from_disk(info.vision_encoder_npz, info.bucket_reso)
+                        # info.vision_encoder_outputs = caching_strategy.load_image_embeddings_from_disk(info.vision_encoder_npz, info.bucket_reso)
                         continue
 
                 # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
@@ -1792,8 +1792,11 @@ class BaseDataset(torch.utils.data.Dataset):
             if image_info.vision_encoder_outputs is not None:
                 vision_encoder_outputs_list.append(image_info.vision_encoder_outputs)
             elif image_info.vision_encoder_npz is not None:
-                vision_encoder_outputs = self.image_embedding_caching_strategy.load_image_embeddings_from_disk(image_info.vision_encoder_npz)
-                vision_encoder_outputs_list.append(vision_encoder_outputs)
+                vision_encoder_outputs, flipped_vision_encoder_outputs = self.image_embedding_caching_strategy.load_image_embeddings_from_disk(image_info.vision_encoder_npz, image_info.bucket_reso)
+                if flipped:
+                    vision_encoder_outputs_list.append(flipped_vision_encoder_outputs)
+                else:
+                    vision_encoder_outputs_list.append(vision_encoder_outputs)
 
             if image_info.text_encoder_outputs is not None:
                 # cached
