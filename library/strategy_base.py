@@ -376,6 +376,9 @@ class TextEncoderOutputsCachingStrategy:
     ):
         raise NotImplementedError
 
+    def cache_image_embeddings(self, batch: List):
+        raise NotImplementedError
+
 
 class LatentsCachingStrategy:
     # TODO commonize utillity functions to this class, such as npz handling etc.
@@ -568,3 +571,35 @@ class LatentsCachingStrategy:
         if alpha_mask is not None:
             kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
         np.savez(npz_path, **kwargs)
+
+class ImageEmbeddingsCachingStrategy:
+    # TODO commonize utillity functions to this class, such as npz handling etc.
+
+    _strategy = None  # strategy instance: actual strategy class
+
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+        self._cache_to_disk = cache_to_disk
+        self._batch_size = batch_size
+        self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
+
+    @classmethod
+    def set_strategy(cls, strategy):
+        if cls._strategy is not None:
+            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
+        cls._strategy = strategy
+
+    @classmethod
+    def get_strategy(cls) -> Optional["ImageEmbeddingsCachingStrategy"]:
+        return cls._strategy
+
+    @property
+    def cache_to_disk(self):
+        return self._cache_to_disk
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    @property
+    def cache_suffix(self):
+        raise NotImplementedError

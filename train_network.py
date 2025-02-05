@@ -59,78 +59,6 @@ class NetworkTrainer:
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
 
-    # TODO 他のスクリプトと共通化する
-    def generate_step_logs(
-        self,
-        args: argparse.Namespace,
-        current_loss,
-        avr_loss,
-        lr_scheduler,
-        lr_descriptions,
-        optimizer=None,
-        keys_scaled=None,
-        mean_norm=None,
-        maximum_norm=None,
-    ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
-
-        if keys_scaled is not None:
-            logs["max_norm/keys_scaled"] = keys_scaled
-            logs["max_norm/average_key_norm"] = mean_norm
-            logs["max_norm/max_key_norm"] = maximum_norm
-
-        lrs = lr_scheduler.get_last_lr()
-        for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
-                lr_desc = lr_descriptions[i]
-            else:
-                idx = i - (0 if args.network_train_unet_only else -1)
-                if idx == -1:
-                    lr_desc = "textencoder"
-                else:
-                    if len(lrs) > 2:
-                        lr_desc = f"group{idx}"
-                    else:
-                        lr_desc = "unet"
-
-            logs[f"lr/{lr_desc}"] = lr
-
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                # tracking d*lr value
-                logs[f"lr/d*lr/{lr_desc}"] = (
-                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                )
-            if (
-                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
-            ):  # tracking d*lr value of unet.
-                logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
-        else:
-            idx = 0
-            if not args.network_train_unet_only:
-                logs["lr/textencoder"] = float(lrs[0])
-
-                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
-                    logs['momentum/betas1-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][0]
-                    logs['momentum/betas2-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][1]
-
-                idx = 1
-
-            for i in range(idx, len(lrs)):
-                logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                    logs[f"lr/d*lr/group{i}"] = (
-                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                    )
-                if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
-                    logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
-
-                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
-                    logs[f'momentum/betas1-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][0]
-                    logs[f'momentum/betas2-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][1]
-
-
-        return logs
-
     def assert_extra_args(
         self,
         args,
@@ -169,6 +97,9 @@ class NetworkTrainer:
     def get_text_encoder_outputs_caching_strategy(self, args):
         return None
 
+    def get_image_embeddings_caching_strategy(self, args):
+        return None
+
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         """
         Returns a list of models that will be used for text encoding. SDXL uses wrapped and unwrapped models.
@@ -186,6 +117,9 @@ class NetworkTrainer:
     def cache_text_encoder_outputs_if_needed(self, args, accelerator, unet, vae, text_encoders, dataset, weight_dtype):
         for t_enc in text_encoders:
             t_enc.to(accelerator.device, dtype=weight_dtype)
+
+    def cache_image_embeddings_if_needed(self, args, accelerator: Accelerator, dataset: train_util.DatasetGroup, weight_dtype: torch.dtype):
+        pass
 
     def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, **kwargs):
         noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
@@ -451,6 +385,9 @@ class NetworkTrainer:
         latents_caching_strategy = self.get_latents_caching_strategy(args)
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
+        image_embeddings_caching_strategy = self.get_image_embeddings_caching_strategy(args)
+        strategy_base.ImageEmbeddingsCachingStrategy.set_strategy(image_embeddings_caching_strategy)
+
         # データセットを準備する
         if args.dataset_class is None:
             blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
@@ -589,8 +526,10 @@ class NetworkTrainer:
         if text_encoder_outputs_caching_strategy is not None:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
+        self.cache_image_embeddings_if_needed(args, accelerator, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+            self.cache_image_embeddings_if_needed(args, accelerator, val_dataset_group, weight_dtype)
 
         # prepare network
         net_kwargs = {}
@@ -990,6 +929,11 @@ class NetworkTrainer:
             "ss_validate_every_n_steps": args.validate_every_n_steps,
         }
 
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            import wandb
+            wandb_tracker = accelerator.get_tracker("wandb")
+            metadata['ss_wandb_name'] = wandb_tracker.run.name
+
         self.update_metadata(metadata, args)  # architecture specific metadata
 
         if use_user_config:
@@ -1276,6 +1220,10 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        progress_bar = tqdm(
+            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+        )
+
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
         )
@@ -1306,6 +1254,8 @@ class NetworkTrainer:
                 initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                optimizer_train_fn()
+                accelerator.unwrap_model(network).train()
                 current_step.value = global_step
                 if initial_step > 0:
                     initial_step -= 1
@@ -1336,9 +1286,13 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
+                        global_step += 1
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
@@ -1346,33 +1300,36 @@ class NetworkTrainer:
 
                         max_mean_logs = {}
                         if args.scale_weight_norms:
-                            keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
+                            modules_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                                 args.scale_weight_norms, accelerator.device
                             )
-                            max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
+                            max_mean_logs = {"scaled": modules_scaled, "avg norm": mean_norm}
                         else:
-                            keys_scaled, mean_norm, maximum_norm = None, None, None
+                            norms = accelerator.unwrap_model(network).get_norms(accelerator.device)
+                            mean_norm = sum(norms) / len(norms)
+                            maximum_norm = max(norms)
+                            modules_scaled = None
+                            max_mean_logs = {"avg norm": mean_norm}
 
                         current_loss = loss.detach().item()
-                        loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                        loss_recorder.add(epoch=epoch, step=global_step // (epoch + 1), loss=current_loss)
                         avr_loss: float = loss_recorder.moving_average
-                        logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                        logs = {"avg_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                         progress_bar.set_postfix(**{**max_mean_logs, **logs})
                         progress_bar.update(1)
-                        global_step += 1
 
                         if is_tracking:
-                            logs = self.generate_step_logs(
+                            logs = train_util.generate_step_logs(
                                 args,
                                 current_loss,
                                 avr_loss,
                                 lr_scheduler,
                                 lr_descriptions,
-                                optimizer,
-                                keys_scaled,
+                                modules_scaled,
                                 mean_norm,
                                 maximum_norm,
                             )
+                            
                             accelerator.log(logs, step=global_step)
 
                         optimizer_eval_fn()
@@ -1394,12 +1351,8 @@ class NetworkTrainer:
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                                     remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
 
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
 
                 # VALIDATION PER STEP
                 should_validate_step = (
@@ -1472,8 +1425,6 @@ class NetworkTrainer:
                     torch.set_rng_state(rng_state)
                     args.min_timestep = original_args_min_timestep
                     args.max_timestep = original_args_max_timestep
-                    optimizer_train_fn()
-                    accelerator.unwrap_model(network).train()
 
                 if global_step >= args.max_train_steps:
                     break
@@ -1555,8 +1506,6 @@ class NetworkTrainer:
                 torch.set_rng_state(rng_state)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
-                optimizer_train_fn()
-                accelerator.unwrap_model(network).train()
 
             # END OF EPOCH
             if is_tracking:
@@ -1566,7 +1515,6 @@ class NetworkTrainer:
             accelerator.wait_for_everyone()
 
             # 指定エポックごとにモデルを保存
-            optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
@@ -1581,8 +1529,8 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
+            optimizer_eval_fn()
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-            optimizer_train_fn()
 
             # end of epoch
 
@@ -1593,7 +1541,6 @@ class NetworkTrainer:
             network = accelerator.unwrap_model(network)
 
         accelerator.end_training()
-        optimizer_eval_fn()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)

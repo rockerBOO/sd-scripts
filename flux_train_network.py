@@ -8,7 +8,9 @@ import torch
 from accelerate import Accelerator
 
 from library.device_utils import clean_memory_on_device, init_ipex
-from library.strategy_flux import move_vision_encoder_to_device
+from library.strategy_flux import FluxImageEmbeddingCachingStrategy, ReduxImageEncoder
+from transformers import SiglipVisionModel
+import safetensors
 
 init_ipex()
 
@@ -114,7 +116,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
             logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            model.enable_block_swap(args.blocks_to_swap, accelerator.device, single_num_blocks=args.single_blocks_to_swap)
 
         clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
         clip_l.eval()
@@ -137,10 +139,21 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
 
+
         return flux_utils.MODEL_VERSION_FLUX_V1, [clip_l, t5xxl], ae, model
 
+    def load_image_embedding_model(self):
+        siglip_model = SiglipVisionModel.from_pretrained("google/siglip-so400m-patch14-384", attn_implementation="sdpa")
+
+        model_data = safetensors.torch.load_file(args.redux_model_path)
+        redux_encoder = ReduxImageEncoder()
+        redux_encoder.load_state_dict(model_data)
+
+        return siglip_model, redux_encoder
+
     def get_tokenize_strategy(self, args):
-        _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+        # _, is_schnell, _, _, _  = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+        is_schnell = False
 
         if args.t5xxl_max_token_length is None:
             if is_schnell:
@@ -162,6 +175,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
     def get_text_encoding_strategy(self, args):
         return strategy_flux.FluxTextEncodingStrategy(apply_t5_attn_mask=args.apply_t5_attn_mask)
+
+    def get_image_embeddings_caching_strategy(self, args):
+        return strategy_flux.FluxImageEmbeddingCachingStrategy(args.cache_latents_to_disk, args.vae_batch_size, False)
 
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         # check t5xxl is trained or not
@@ -193,8 +209,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 args.skip_cache_check,
                 is_partial=self.train_clip_l or self.train_t5xxl,
                 apply_t5_attn_mask=args.apply_t5_attn_mask,
-                vision_cond_size=args.vision_cond_downsample,
-                redux_path=args.redux_model_path
             )
         else:
             return None
@@ -255,8 +269,8 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 text_encoders[0].to("cpu")
             logger.info("move t5XXL back to cpu")
             text_encoders[1].to("cpu")
-            move_vision_encoder_to_device("cpu")
             clean_memory_on_device(accelerator.device)
+
 
             if not args.lowram:
                 logger.info("move vae and unet back to original device")
@@ -266,6 +280,40 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             # Text Encoderから毎回出力を取得するので、GPUに乗せておく
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
             text_encoders[1].to(accelerator.device)
+
+    def cache_image_embeddings_if_needed(self, args, accelerator: Accelerator, dataset: train_util.DatasetGroup, weight_dtype: torch.dtype):
+        if args.vision_cond_dropout is None or args.vision_cond_dropout == 1.0:
+            return
+
+        siglip_model, redux_encoder = self.load_image_embedding_model()
+
+        org_siglip_model_device = siglip_model.device
+        org_redux_encoder = redux_encoder.device
+
+        logger.info("move SigLIP and redux to gpu")
+        redux_encoder = accelerator.prepare(redux_encoder)
+        siglip_model = accelerator.prepare(siglip_model) 
+        # siglip_model.to(accelerator.device, dtype=weight_dtype)
+        # redux_encoder.to(accelerator.device, dtype=weight_dtype)
+        caching_strategy = strategy_base.ImageEmbeddingsCachingStrategy.get_strategy()
+
+        assert caching_strategy is not None
+
+        with accelerator.autocast():
+            dataset.cache_image_embeddings(siglip_model, redux_encoder, caching_strategy, accelerator, args.vision_cond_downsample)
+
+        if not args.lowram:
+            logger.info("move SigLIP and redux to cpu")
+            siglip_model.to(org_siglip_model_device)
+            redux_encoder.to(org_redux_encoder)
+
+        # TODO: Don't delete if we still need them for when not caching
+
+        logger.info("delete SigLIP and redux, not needed after caching")
+        del siglip_model
+        del redux_encoder
+        clean_memory_on_device(accelerator.device)
+
 
     # def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
     #     noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
@@ -475,6 +523,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_sigmoid_scale"] = args.sigmoid_scale
         metadata["ss_model_prediction_type"] = args.model_prediction_type
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
+        metadata["ss_redux_model_path"] = args.redux_model_path
+        metadata["ss_vision_cond_downsample"] = args.vision_cond_dropout
+        metadata["ss_vision_cond_dropout"] = args.vision_cond_dropout
 
     def is_text_encoder_not_needed_for_training(self, args):
         return args.cache_text_encoder_outputs and not self.is_train_text_encoder(args)

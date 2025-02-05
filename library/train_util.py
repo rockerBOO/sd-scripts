@@ -41,14 +41,14 @@ from packaging.version import Version
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
+from library.strategy_base import ImageEmbeddingsCachingStrategy, LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 
 init_ipex()
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
-from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection, SiglipVisionModel, AutoProcessor
 import transformers
 from diffusers.optimization import (
     SchedulerType as DiffusersSchedulerType,
@@ -82,6 +82,7 @@ from library.lpw_stable_diffusion import StableDiffusionLongPromptWeightingPipel
 from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
 import library.model_util as model_util
 import library.huggingface_util as huggingface_util
+from library.flux_models import ReduxImageEncoder
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging, pil_resize
@@ -208,6 +209,7 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.vision_encoder_outputs: Optional[List[torch.Tensor]] = None
+        self.vision_encoder_npz: Optional[str] = None
 
     @staticmethod
     def _pin_tensor(tensor):
@@ -732,11 +734,13 @@ class BaseDataset(torch.utils.data.Dataset):
         self.tokenize_strategy = None
         self.text_encoder_output_caching_strategy = None
         self.latents_caching_strategy = None
+        self.image_embedding_caching_strategy = None
 
     def set_current_strategies(self):
         self.tokenize_strategy = TokenizeStrategy.get_strategy()
         self.text_encoder_output_caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         self.latents_caching_strategy = LatentsCachingStrategy.get_strategy()
+        self.image_embedding_caching_strategy = ImageEmbeddingsCachingStrategy.get_strategy()
 
     def adjust_min_max_bucket_reso_by_steps(
         self, resolution: Tuple[int, int], min_bucket_reso: int, max_bucket_reso: int, bucket_reso_steps: int
@@ -1102,6 +1106,105 @@ class BaseDataset(torch.utils.data.Dataset):
                 for subset in self.subsets
             ]
         )
+
+    def cache_image_embeddings(self, siglip_model: SiglipVisionModel, redux_encoder: ReduxImageEncoder, caching_strategy, accelerator: Accelerator, grid_size: int):
+        r"""
+        a brand new method to cache latents. This method caches latents with caching strategy.
+        normal cache_latents method is used by default, but this method is used when caching strategy is specified.
+        """
+        logger.info("caching image embeddings with caching strategy.")
+        image_infos = list(self.image_data.values())
+
+        # sort by resolution
+        image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
+
+        # split by resolution and some conditions
+        class Condition:
+            def __init__(self, reso, flip_aug):
+                self.reso = reso
+                self.flip_aug = flip_aug
+
+            def __eq__(self, other):
+                return (
+                    self.reso == other.reso
+                    and self.flip_aug == other.flip_aug
+                )
+
+        batch: List[ImageInfo] = []
+        current_condition = None
+
+        # support multiple-gpus
+        num_processes = accelerator.num_processes
+        process_index = accelerator.process_index
+
+        # define a function to submit a batch to cache
+        def submit_batch(batch, cond):
+            for info in batch:
+                if info.image is not None and isinstance(info.image, Future):
+                    info.image = info.image.result()  # future to image
+            caching_strategy.cache_batch_image_embeddings(siglip_model, redux_encoder, batch, grid_size, cond.flip_aug)
+
+            # remove image from memory
+            for info in batch:
+                info.image = None
+
+        # define ThreadPoolExecutor to load images in parallel
+        max_workers = min(os.cpu_count(), len(image_infos))
+        max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
+        max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
+        executor = ThreadPoolExecutor(max_workers)
+
+        try:
+            # iterate images
+            logger.info("caching image embeddings...")
+            for i, info in enumerate(tqdm(image_infos)):
+                subset = self.image_to_subset[info.image_key]
+
+                if info.vision_encoder_npz is not None:  # fine tuning dataset
+                    continue
+
+                # check disk cache exists and size of latents
+                if caching_strategy.cache_to_disk:
+                    info.vision_encoder_npz = caching_strategy.get_image_embeddings_npz_path(info.absolute_path)
+
+                    # if the modulo of num_processes is not equal to process_index, skip caching
+                    # this makes each process cache different latents
+                    if i % num_processes != process_index:
+                        continue
+
+                    # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
+
+                    cache_available = caching_strategy.is_disk_cached_image_embeddings_expected(
+                        info.bucket_reso, info.vision_encoder_npz, subset.flip_aug
+                    )
+                    if cache_available:  # do not add to batch
+                        info.vision_encoder_outputs = caching_strategy.load_image_embeddings_from_disk(info.vision_encoder_npz, info.bucket_reso)
+                        continue
+
+                # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
+                condition = Condition(info.bucket_reso, subset.flip_aug)
+                if len(batch) > 0 and current_condition != condition:
+                    submit_batch(batch, current_condition)
+                    batch = []
+
+                if info.image is None:
+                    # load image in parallel
+                    info.image = executor.submit(load_image, info.absolute_path, False)
+
+                batch.append(info)
+                current_condition = condition
+
+                # if number of data in batch is enough, flush the batch
+                if len(batch) >= caching_strategy.batch_size:
+                    submit_batch(batch, current_condition)
+                    batch = []
+                    current_condition = None
+
+            if len(batch) > 0:
+                submit_batch(batch, current_condition)
+
+        finally:
+            executor.shutdown()
 
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
         r"""
@@ -1594,9 +1697,16 @@ class BaseDataset(torch.utils.data.Dataset):
                     latents = flipped_latents
                     alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
                     del flipped_latents
-                latents = torch.FloatTensor(latents)
+                    image_info.latents_flipped = latents
+                else:
+                    latents = torch.FloatTensor(latents)
+                    image_info.latents = latents
+
+                image_info.latents_original_size = original_size
+                image_info.latents_crop_ltrb = crop_ltrb
                 if alpha_mask is not None:
                     alpha_mask = torch.FloatTensor(alpha_mask)
+                    image_info.alpha_mask = alpha_mask
 
                 image = None
             else:
@@ -1687,6 +1797,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
             if image_info.vision_encoder_outputs is not None:
                 vision_encoder_outputs_list.append(image_info.vision_encoder_outputs)
+            elif image_info.vision_encoder_npz is not None:
+                vision_encoder_outputs = self.image_embedding_caching_strategy.load_image_embeddings_from_disk(image_info.vision_encoder_npz)
+                vision_encoder_outputs_list.append(vision_encoder_outputs)
 
             if image_info.text_encoder_outputs is not None:
                 # cached
@@ -1696,6 +1809,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
                     image_info.text_encoder_outputs_npz
                 )
+                image_info.text_encoder_outputs = text_encoder_outputs 
             else:
                 tokenization_required = True
             text_encoder_outputs_list.append(text_encoder_outputs)
@@ -2634,6 +2748,12 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         for i, dataset in enumerate(self.datasets):
             logger.info(f"[Dataset {i}]")
             dataset.new_cache_text_encoder_outputs(models, accelerator)
+        accelerator.wait_for_everyone()
+
+    def cache_image_embeddings(self, siglip_model: SiglipVisionModel, redux_encoder: ReduxImageEncoder, caching_strategy: ImageEmbeddingsCachingStrategy, accelerator: Accelerator, grid_size: int):
+        for i, dataset in enumerate(self.datasets):
+            logger.info(f"[Dataset {i}]")
+            dataset.cache_image_embeddings(siglip_model, redux_encoder, caching_strategy, accelerator, grid_size)
         accelerator.wait_for_everyone()
 
     def set_caching_mode(self, caching_mode):
@@ -4229,6 +4349,18 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
     )
 
+    parser.add_argument(
+        "--single_blocks_to_swap",
+        type=int,
+        default=None,
+        help="[EXPERIMENTAL] "
+        "Sets the number of single blocks to swap during the forward and backward passes."
+        "Increasing this number lowers the overall VRAM used during training at the expense of training speed (s/it)."
+        " / 順伝播および逆伝播中にスワップするブロックの数を設定します。"
+        "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
+    )
+
+
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
     # if `--log_config` is enabled, return args for logging. if not, return None.
@@ -5162,6 +5294,7 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     class DummyScheduler:
         def __init__(self, optimizer: Optimizer):
             self.optimizer = optimizer
+            self.optimizers = [optimizer]
 
         def step(self):
             pass
@@ -5971,7 +6104,10 @@ def save_sd_model_on_train_end_common(
 
 
 def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device) -> torch.Tensor:
-    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+    if min_timestep == max_timestep:
+        timesteps = torch.ones(b_size, device="cpu") * min_timestep
+    else:
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
     timesteps = timesteps.long().to(device)
     return timesteps
 
@@ -6022,7 +6158,7 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
     elif args.huber_schedule == "snr":
         if not hasattr(noise_scheduler, "alphas_cumprod"):
             raise NotImplementedError("Huber schedule 'snr' is not supported with the current model.")
-        alphas_cumprod = torch.index_select(noise_scheduler.alphas_cumprod, 0, timesteps.cpu())
+        alphas_cumprod = torch.index_select(noise_scheduler.alphas_cumprod, 0, timesteps)
         sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
         result = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
         result = result.to(timesteps.device)
@@ -6119,6 +6255,7 @@ def get_my_scheduler(
     elif sample_sampler == "dpmsolver" or sample_sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
         sched_init_args["algorithm_type"] = sample_sampler
+        sched_init_args["use_lu_lambdas"] = True
     elif sample_sampler == "dpmsolver++_2m":
         scheduler_cls = DPMSolverMultistepScheduler
     elif sample_sampler == "dpmsolver++_2m_lu":
@@ -6594,3 +6731,130 @@ class LossRecorder:
         if losses == 0:
             return 0
         return self.loss_total / losses
+
+
+def generate_step_logs(
+    args: argparse.Namespace,
+    current_loss: float,
+    avr_loss: float,
+    lr_scheduler,
+    lr_descriptions: Optional[list[str]],
+    modules_scaled: Optional[int] = None,
+    mean_norm: Optional[float] = None,
+    maximum_norm: Optional[float] = None,
+) -> Dict[str, Union[float, int]]:
+    """
+    Generate logs for training steps / トレーニング手順のログを生成する
+
+    Parameters:
+    - args - Training arguments namespace.
+    - current_loss - Current loss value.
+    - avr_loss - Average loss value.
+    - lr_scheduler - Learning rate scheduler object.
+    - lr_descriptions - List of descriptions for learning rates.
+    - modules_scaled - Number of modules scaled (default: None).
+    - mean_norm - Mean norm value (default: None).
+    - maximum_norm - Maximum norm value (default: None).
+
+    Returns:
+    - logs - Logs for the training step.
+    """
+    optimizer = lr_scheduler.optimizers[-1]
+    optimizer_name = args.optimizer_type.lower()
+
+    logs: Dict[str, float] = {"loss/current": current_loss, "loss/average": avr_loss}
+
+    lrs = lr_scheduler.get_last_lr()
+    for i, lr in enumerate(lrs):
+        if lr_descriptions is not None:
+            lr_desc = lr_descriptions[i]
+        else:
+            idx = i - (0 if args.network_train_unet_only else -1)
+            if idx == -1:
+                lr_desc = "textencoder"
+            else:
+                if len(lrs) > 2:
+                    lr_desc = f"group{idx}"
+                else:
+                    lr_desc = "unet"
+
+        logs[f"lr/{lr_desc}"] = lr
+
+        group = optimizer.param_groups[i]
+        if optimizer_name.startswith("DAdapt".lower()) or optimizer_name == "Prodigy".lower():
+            # tracking d*lr value
+            logs[f"lr/d*lr/{lr_desc}"] = (
+                group["d"] * group["lr"]
+            )
+            logs["opt/d_max"] = group["d_max"]
+            logs["opt/d_hat"] = group["d_hat"]
+            logs["opt/d_numerator"] = group["d_numerator"]
+            logs["opt/d_denom"] = group["d_denom"]
+        if (
+            optimizer_name.endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
+        ):  # tracking d*lr value of unet.
+            logs["lr/d*lr"] = optimizer.get_dlr(group)
+
+            d_numerator, d_denom = optimizer.get_running_values_for_group(group)
+            logs["opt/d_max"] = optimizer.get_d_max(group)
+            logs["opt/d_numerator"] = d_numerator
+            logs["opt/d_denom"] = d_denom
+            logs["opt/d_mean"] = optimizer.get_d_mean()
+    else:
+        idx = 0
+        # Text encoder only 
+        if not args.network_train_unet_only:
+            logs["lr/textencoder"] = float(lrs[0])
+
+            group = optimizer.param_groups[0]
+            if optimizer_name.endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
+                for beta_i, beta in enumerate(group['betas']):
+                    logs[f'momentum/betas{beta_i+1}-te'] = beta
+
+                logs["lr/d*lr/textencoder"] = optimizer.get_dlr(group)
+                d_numerator, d_denom = optimizer.get_running_values_for_group(group)
+                logs["opt/d_max"] = optimizer.get_d_max(group)
+                logs["opt/d_numerator"] = d_numerator
+                logs["opt/d_denom"] = d_denom
+                logs["opt/d_mean"] = optimizer.get_d_mean()
+
+            if "betas" in group:
+                for beta_i, beta in group['betas']:
+                    logs[f'momentum/betas{beta_i}-te'] = beta
+
+            idx = 1
+
+        # Multiple parameter groups
+        for i in range(idx, len(lrs)):
+            group = optimizer.param_groups[i]
+            logs[f"lr/group{i}"] = float(lrs[i])
+            if optimizer_name.startswith("DAdapt".lower()) or optimizer_name == "Prodigy".lower():
+                logs[f"lr/d*lr/group{i}"] = (
+                    group["d"] * group["lr"]
+                )
+
+                logs["opt/d_max"] = group["d_max"]
+                logs["opt/d_hat"] = group["d_hat"]
+                logs["opt/d_numerator"] = group["d_numerator"]
+                logs["opt/d_denom"] = group["d_denom"]
+            if optimizer_name.endswith("ProdigyPlusScheduleFree".lower()):
+                logs[f"lr/d*lr/group{i}"] = optimizer.get_dlr(group)
+                d_numerator, d_denom = optimizer.get_running_values_for_group(group)
+                logs["opt/d_max"] = optimizer.get_d_max(group)
+                logs["opt/d_numerator"] = d_numerator
+                logs["opt/d_denom"] = d_denom
+                logs["opt/d_mean"] = optimizer.get_d_mean()
+
+            if "betas" in group:
+                for beta_i, beta in enumerate(group['betas']):
+                    logs[f'momentum/betas{beta_i+1}-group{i}'] = beta
+
+
+    if modules_scaled is not None:
+        logs["norm/modules_scaled"] = modules_scaled
+    if mean_norm is not None:
+        logs["norm/average"] = mean_norm
+    if maximum_norm is not None:
+        logs["norm/max"] = maximum_norm
+
+    return logs
