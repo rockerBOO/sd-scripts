@@ -193,7 +193,7 @@ class ImageInfo:
         self.latents_flipped: Optional[torch.Tensor] = None
         self.latents_npz: Optional[str] = None  # set in cache_latents
         self.latents_original_size: Optional[Tuple[int, int]] = None  # original image size, not latents size
-        self.latents_crop_ltrb: Optional[Tuple[int, int]] = (
+        self.latents_crop_ltrb: Optional[Tuple[int, int, int, int]] = (
             None  # crop left top right bottom in original pixel size, not latents size
         )
         self.cond_img_path: Optional[str] = None
@@ -358,7 +358,7 @@ class BucketManager:
         return reso, resized_size, ar_error
 
     @staticmethod
-    def get_crop_ltrb(bucket_reso: Tuple[int, int], image_size: Tuple[int, int]):
+    def get_crop_ltrb(bucket_reso: Tuple[int, int], image_size: Tuple[int, int]) -> Tuple[int, int, int, int]:
         # Stability AIの前処理に合わせてcrop left/topを計算する。crop rightはflipのaugmentationのために求める
         # Calculate crop left/top according to the preprocessing of Stability AI. Crop right is calculated for flip augmentation.
 
@@ -1697,13 +1697,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     latents = flipped_latents
                     alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
                     del flipped_latents
-                    image_info.latents_flipped = latents
-                else:
-                    latents = torch.FloatTensor(latents)
-                    image_info.latents = latents
-
-                image_info.latents_original_size = original_size
-                image_info.latents_crop_ltrb = crop_ltrb
+                latents = torch.FloatTensor(latents)
                 if alpha_mask is not None:
                     alpha_mask = torch.FloatTensor(alpha_mask)
                     image_info.alpha_mask = alpha_mask

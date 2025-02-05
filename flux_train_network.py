@@ -291,8 +291,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         org_redux_encoder = redux_encoder.device
 
         logger.info("move SigLIP and redux to gpu")
-        redux_encoder = accelerator.prepare(redux_encoder)
-        siglip_model = accelerator.prepare(siglip_model) 
+        siglip_model,redux_encoder = accelerator.prepare(siglip_model, redux_encoder)
         # siglip_model.to(accelerator.device, dtype=weight_dtype)
         # redux_encoder.to(accelerator.device, dtype=weight_dtype)
         caching_strategy = strategy_base.ImageEmbeddingsCachingStrategy.get_strategy()
