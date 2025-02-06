@@ -325,9 +325,9 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
         vis_embeds = redux_encoder(siglip_out.last_hidden_state).float()
         (b, t, h) = vis_embeds.shape
         s = int(sqrt(t))
-        vis_embeds = torch.nn.functional.interpolate(vis_embeds.view(b, s, s, h).transpose(1, -1),
-                                                    size=(grid_size, grid_size),
-                                                    mode="bicubic")
+        # vis_embeds = torch.nn.functional.interpolate(vis_embeds.view(b, s, s, h).transpose(1, -1),
+        #                                             size=(grid_size, grid_size),
+        #                                             mode="bicubic")
         vis_embeds = vis_embeds.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
         vis_ids = np.zeros(shape=(bsz, vis_embeds.shape[1], 3))
         vis_attn_masks = np.ones((bsz, vis_embeds.shape[1]))
@@ -340,9 +340,9 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
             flipped_vis_embeds = redux_encoder(siglip_out.last_hidden_state).float()
             (b, t, h) = flipped_vis_embeds.shape
             s = int(sqrt(t))
-            flipped_vis_embeds = torch.nn.functional.interpolate(flipped_vis_embeds.view(b, s, s, h).transpose(1, -1),
-                                                        size=(grid_size, grid_size),
-                                                        mode="bicubic")
+            # flipped_vis_embeds = torch.nn.functional.interpolate(flipped_vis_embeds.view(b, s, s, h).transpose(1, -1),
+            #                                             size=(grid_size, grid_size),
+            #                                             mode="bicubic")
             flipped_vis_embeds = flipped_vis_embeds.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
             flipped_vis_ids = np.zeros(shape=(bsz, flipped_vis_embeds.shape[1], 3))
             flipped_vis_attn_masks = np.ones((bsz, flipped_vis_embeds.shape[1]))

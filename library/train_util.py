@@ -1156,7 +1156,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         try:
             # iterate images
-            logger.info("caching image embeddings...")
+            logger.info(f"caching image embeddings (batch: {caching_strategy.batch_size}, disk: {caching_strategy.cache_to_disk})...")
             for i, info in enumerate(tqdm(image_infos)):
                 subset = self.image_to_subset[info.image_key]
 
@@ -1260,7 +1260,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         try:
             # iterate images
-            logger.info("caching latents...")
+            logger.info(f"caching latents (batch: {caching_strategy.batch_size}, disk: {caching_strategy.cache_to_disk})...")
             for i, info in enumerate(tqdm(image_infos)):
                 subset = self.image_to_subset[info.image_key]
 
@@ -6783,20 +6783,21 @@ def generate_step_logs(
             logs[f"lr/d*lr/{lr_desc}"] = (
                 group["d"] * group["lr"]
             )
-            logs["opt/d_max"] = group["d_max"]
-            logs["opt/d_hat"] = group["d_hat"]
-            logs["opt/d_numerator"] = group["d_numerator"]
-            logs["opt/d_denom"] = group["d_denom"]
+            logs[f"opt/d_max/{lr_desc}"] = group["d_max"]
+            logs[f"opt/d_hat/{lr_desc}"] = group["d_hat"]
+            logs[f"opt/d_numerator/{lr_desc}"] = group["d_numerator"]
+            logs[f"opt/d_denom/{lr_desc}"] = group["d_denom"]
         if (
             optimizer_name.endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
         ):  # tracking d*lr value of unet.
-            logs["lr/d*lr"] = optimizer.get_dlr(group)
+            logs[f"lr/d*lr/{lr_desc}"] = optimizer.get_dlr(group)
 
-            d_numerator, d_denom = optimizer.get_running_values_for_group(group)
-            logs["opt/d_max"] = optimizer.get_d_max(group)
-            logs["opt/d_numerator"] = d_numerator
-            logs["opt/d_denom"] = d_denom
-            logs["opt/d_mean"] = optimizer.get_d_mean()
+            logs[f"opt/d_max/{lr_desc}"] = optimizer.get_d_max(group)
+            logs[f"opt/d_numerator/{lr_desc}"] = group["d_numerator"]
+            logs[f"opt/d_denom/{lr_desc}"] = group["d_denom"]
+            logs[f"opt/prev_d_numerator/{lr_desc}"] = group["prev_d_numerator"]
+            logs[f"opt/max_d_numerator/{lr_desc}"] = group["max_d_numerator"]
+            logs[f"opt/d_mean/{lr_desc}"] = optimizer.get_d_mean()
     else:
         idx = 0
         # Text encoder only 
@@ -6810,10 +6811,10 @@ def generate_step_logs(
 
                 logs["lr/d*lr/textencoder"] = optimizer.get_dlr(group)
                 d_numerator, d_denom = optimizer.get_running_values_for_group(group)
-                logs["opt/d_max"] = optimizer.get_d_max(group)
-                logs["opt/d_numerator"] = d_numerator
-                logs["opt/d_denom"] = d_denom
-                logs["opt/d_mean"] = optimizer.get_d_mean()
+                logs["opt/d_max/textencoder"] = optimizer.get_d_max(group)
+                logs["opt/d_numerator/textencoder"] = d_numerator
+                logs["opt/d_denom/textencoder"] = d_denom
+                logs["opt/d_mean/textencoder"] = optimizer.get_d_mean()
 
             if "betas" in group:
                 for beta_i, beta in group['betas']:
@@ -6830,17 +6831,18 @@ def generate_step_logs(
                     group["d"] * group["lr"]
                 )
 
-                logs["opt/d_max"] = group["d_max"]
-                logs["opt/d_hat"] = group["d_hat"]
-                logs["opt/d_numerator"] = group["d_numerator"]
-                logs["opt/d_denom"] = group["d_denom"]
+                logs[f"opt/d_max/group{i}"] = group["d_max"]
+                logs[f"opt/d_hat/group{i}"] = group["d_hat"]
+                logs[f"opt/d_numerator/group{i}"] = group["d_numerator"]
+                logs[f"opt/d_denom/group{i}"] = group["d_denom"]
             if optimizer_name.endswith("ProdigyPlusScheduleFree".lower()):
                 logs[f"lr/d*lr/group{i}"] = optimizer.get_dlr(group)
-                d_numerator, d_denom = optimizer.get_running_values_for_group(group)
-                logs["opt/d_max"] = optimizer.get_d_max(group)
-                logs["opt/d_numerator"] = d_numerator
-                logs["opt/d_denom"] = d_denom
-                logs["opt/d_mean"] = optimizer.get_d_mean()
+                logs[f"opt/d_max/group{i}"] = optimizer.get_d_max(group)
+                logs[f"opt/d_numerator/group{i}"] = group["d_numerator"]
+                logs[f"opt/d_denom/group{i}"] = group["d_denom"]
+                logs[f"opt/prev_d_numerator/group{i}"] = group["prev_d_numerator"]
+                logs[f"opt/max_d_numerator/group{i}"] = group["max_d_numerator"]
+                logs[f"opt/d_mean/group{i}"] = optimizer.get_d_mean()
 
             if "betas" in group:
                 for beta_i, beta in enumerate(group['betas']):
