@@ -480,8 +480,13 @@ class NetworkTrainer:
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
 
+        vae.eval()
+        unet.eval()
+
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+
+        [te.eval() for te in text_encoders]
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -516,6 +521,7 @@ class NetworkTrainer:
                 val_dataset_group.new_cache_latents(vae, accelerator)
 
             vae.to("cpu")
+
             clean_memory_on_device(accelerator.device)
 
             accelerator.wait_for_everyone()
@@ -698,6 +704,7 @@ class NetworkTrainer:
         unet_weight_dtype = te_weight_dtype = weight_dtype
         # Experimental Feature: Put base model into fp8 to save vram
         if args.fp8_base or args.fp8_base_unet:
+            logger.info("Moving unet to fp8")
             assert torch.__version__ >= "2.1.0", "fp8_base requires torch>=2.1.0 / fp8を使う場合はtorch>=2.1.0が必要です。"
             assert (
                 args.mixed_precision != "no"
@@ -717,18 +724,21 @@ class NetworkTrainer:
             logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
             unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
+        logger.info(f"Moving unet {unet.dtype} to dtype {unet_weight_dtype}")
         unet.requires_grad_(False)
-        unet.to(dtype=unet_weight_dtype)
-        for i, t_enc in enumerate(text_encoders):
-            t_enc.requires_grad_(False)
-
-            # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu":
-                t_enc.to(dtype=te_weight_dtype)
-
-                # nn.Embedding not support FP8
-                if te_weight_dtype != weight_dtype:
-                    self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
+        # unet.eval()
+        # unet.to(dtype=unet_weight_dtype)
+        # for i, t_enc in enumerate(text_encoders):
+        #     t_enc.requires_grad_(False)
+        #
+        #     # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
+        #     if t_enc.device.type != "cpu":
+        #         t_enc.to(dtype=te_weight_dtype)
+        #
+        #         # nn.Embedding not support FP8
+        #         if te_weight_dtype != weight_dtype:
+        #             print(torch.cuda.memory_summary(accelerator.device, True))
+        #             self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -781,8 +791,6 @@ class NetworkTrainer:
             unet.eval()
             for t_enc in text_encoders:
                 t_enc.eval()
-
-        del t_enc
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
 
@@ -1196,6 +1204,7 @@ class NetworkTrainer:
             text_encoders = []
             text_encoder = None
 
+
         # For --sample_at_first
         optimizer_eval_fn()
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
@@ -1211,8 +1220,90 @@ class NetworkTrainer:
                 initial_step -= len(train_dataloader)
             global_step = initial_step
 
+        def human_readable(num):
+            magnitude = 0
+            while abs(num) >= 1000:
+                magnitude += 1
+                num /= 1000.0
+            return f"{num:.1f}{['', 'K', 'M', 'G', 'T', 'P'][magnitude]}"
+
+        def estimate_vram(num_trainable_params, num_non_trainable_params, dtype):
+            """
+            Estimate the VRAM usage of model parameters.
+
+            Args:
+            - num_trainable_params (int): The number of trainable model parameters.
+            - num_non_trainable_params (int): The number of non-trainable model parameters.
+            - dtype (torch.dtype): The precision level (torch.float8, torch.float16, torch.bfloat16, or torch.float32).
+
+            Returns:
+            - vram_usage_trainable (float): The estimated VRAM usage of trainable parameters in bytes.
+            - vram_usage_non_trainable (float): The estimated VRAM usage of non-trainable parameters in bytes.
+            - vram_usage_total (float): The estimated total VRAM usage in bytes.
+            """
+            # Calculate the total number of bits required to store the trainable parameters
+            total_bits_trainable = num_trainable_params * torch.finfo(dtype).bits
+
+            # Calculate the total number of bits required to store the non-trainable parameters
+            total_bits_non_trainable = num_non_trainable_params * torch.finfo(dtype).bits
+
+            # Convert the total number of bits to bytes
+            vram_usage_trainable = total_bits_trainable / 8
+            vram_usage_non_trainable = total_bits_non_trainable / 8
+            vram_usage_total = vram_usage_trainable + vram_usage_non_trainable
+
+            # Convert the VRAM usage to a human-readable format
+            def human_readable(vram_usage):
+                if vram_usage < 1024:
+                    return f"{vram_usage:.2f} bytes"
+                elif vram_usage < 1024 ** 2:
+                    return f"{vram_usage / 1024:.2f} KB"
+                elif vram_usage < 1024 ** 3:
+                    return f"{vram_usage / (1024 ** 2):.2f} MB"
+                elif vram_usage < 1024 ** 4:
+                    return f"{vram_usage / (1024 ** 3):.2f} GB"
+                else:
+                    return f"{vram_usage / (1024 ** 4):.2f} TB"
+
+            return human_readable(vram_usage_trainable), human_readable(vram_usage_non_trainable), human_readable(vram_usage_total)
+
         # log device and dtype for each model
-        logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
+        # num_parameters = sum(p.numel() for p in vae.parameters())
+        # logger.info(f"vae  dtype: {vae.dtype}, device: {vae.device}")
+
+        num_trainable_params = sum(p.numel() for p in vae.parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in vae.parameters() if p.requires_grad is False)
+        logger.info(f"vae dtype: {unet.dtype}, device: {vae.device}")
+        logger.info(f"vae trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"vae non_trainable parameters: {human_readable(num_non_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, vae.dtype)
+        logger.info(f"vae estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        num_trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in unet.parameters())
+        logger.info(f"unet dtype: {unet.dtype}, device: {unet.device}, desired: {unet_weight_dtype}")
+        logger.info(f"unet trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"unet non_trainable parameters: {human_readable(num_non_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, unet.dtype)
+        logger.info(f"unet estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        num_trainable_params = sum(p.numel() for p in accelerator.unwrap_model(network).parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in accelerator.unwrap_model(network).parameters() if p.requires_grad is False)
+        logger.info(f"network dtype: {accelerator.unwrap_model(network).dtype}, device: {accelerator.unwrap_model(network).device}")
+        logger.info(f"network trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"network non_trainable parameters: {human_readable(num_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, accelerator.unwrap_model(network).dtype)
+        logger.info(f"unet estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        # logger.info(f"network estimate VRAM: {estimate_vram(num_parameters, accelerator.unwrap_model(network).dtype)}")
+        # logger.info(f"network dtype: {accelerator.unwrap_model(network).dtype}, device: {accelerator.unwrap_model(network).device}")
+        # num_parameters = sum(p.numel() for p in accelerator.unwrap_model(network).parameters())
+        # logger.info(f"network trainable parameters: {human_readable(num_parameters)}")
+        # logger.info(f"network estimate VRAM: {estimate_vram(num_parameters, accelerator.unwrap_model(network).dtype)}")
+        # logger.warning(f"unet trainable {sum([1 for p in unet.parameters() if p.requires_grad])}")
+        for te in text_encoders:
+            logger.info(f"te dtype: {unet_weight_dtype}, device: {unet.device}")
+            logger.warning(f"te trainable {sum([1 for p in te.parameters() if p.requires_grad])}")
         for i, t_enc in enumerate(text_encoders):
             params_itr = t_enc.parameters()
             params_itr.__next__()  # skip the first parameter
@@ -1396,7 +1487,7 @@ class NetworkTrainer:
                     rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                     val_progress_bar = tqdm(
-                        range(validation_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
+                        range(validation_total_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps", leave=False
                     )
                     val_ts_step = 0
                     for val_step, batch in enumerate(val_dataloader):
@@ -1451,6 +1542,7 @@ class NetworkTrainer:
                         }
                         accelerator.log(logs, step=global_step)
 
+                    progress_bar.unpause()
                     restore_rng_state(rng_states)
                     args.min_timestep = original_args_min_timestep
                     args.max_timestep = original_args_max_timestep
@@ -1532,6 +1624,7 @@ class NetworkTrainer:
                     }
                     accelerator.log(logs, step=global_step)
 
+                progress_bar.unpause()
                 restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
@@ -1632,6 +1725,11 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use fp8 for U-Net (or DiT), Text Encoder is fp16 or bf16"
         " / U-Net（またはDiT）にfp8を使用する。Text Encoderはfp16またはbf16",
+    )
+    parser.add_argument(
+        "--fp8_base_te",
+        action="store_true",
+        help="use fp8 for Text Encoder",
     )
 
     parser.add_argument(

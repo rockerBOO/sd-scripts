@@ -32,6 +32,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+
 class FluxNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -234,14 +235,15 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
             logger.info("move text encoders to gpu")
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)  # always not fp8
-            text_encoders[1].to(accelerator.device)
 
             if text_encoders[1].dtype == torch.float8_e4m3fn:
                 # if we load fp8 weights, the model is already fp8, so we use it as is
+                logger.info(f"te dtype {text_encoders[1].dtype}, weight dtype {weight_dtype}")
                 self.prepare_text_encoder_fp8(1, text_encoders[1], text_encoders[1].dtype, weight_dtype)
+                text_encoders[1].to(accelerator.device)
             else:
                 # otherwise, we need to convert it to target dtype
-                text_encoders[1].to(weight_dtype)
+                text_encoders[1].to(accelerator.device, dtype=weight_dtype)
 
             with accelerator.autocast():
                 dataset.new_cache_text_encoder_outputs(text_encoders, accelerator)
@@ -433,11 +435,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         if args.vision_cond_dropout < 1.0:
             if random.uniform(0,1) > args.vision_cond_dropout:
-                vision_encoder_conds = batch.get("vision_encoder_outputs_list", None)
-                vis_t5_out, vis_txt_ids, vis_attn_mask = vision_encoder_conds
+                vis_t5_out = batch.get("vision_encoder_outputs", None)
+                vis_txt_ids= batch.get("vision_encoder_ids_outputs", None)
                 t5_out = torch.cat([t5_out, vis_t5_out], dim=1)
                 txt_ids = torch.cat([txt_ids, vis_txt_ids], dim=1)
-                if args.apply_t5_attn_mask:
+                if t5_attn_mask is not None:
+                    vis_attn_mask = batch.get("vision_encoder_attn_masks_outputs", None)
                     t5_attn_mask = torch.cat([t5_attn_mask, vis_attn_mask], dim=1)
 
         def call_dit(img, img_ids, t5_out, txt_ids, l_pooled, timesteps, guidance_vec, t5_attn_mask):

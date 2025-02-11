@@ -788,6 +788,14 @@ class LoRANetwork(torch.nn.Module):
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
         for lora in self.text_encoder_loras + self.unet_loras:

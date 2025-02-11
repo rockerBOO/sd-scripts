@@ -1,5 +1,6 @@
 # common functions for training
 
+from contextlib import contextmanager
 import argparse
 import ast
 import asyncio
@@ -209,6 +210,8 @@ class ImageInfo:
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
         self.vision_encoder_outputs: Optional[List[torch.Tensor]] = None
+        self.vision_encoder_ids_outputs: Optional[List[torch.Tensor]] = None
+        self.vision_encoder_attn_masks_outputs: Optional[List[torch.Tensor]] = None
         self.vision_encoder_npz: Optional[str] = None
 
     @staticmethod
@@ -1664,6 +1667,8 @@ class BaseDataset(torch.utils.data.Dataset):
         flippeds = []  # 変数名が微妙
         text_encoder_outputs_list = []
         vision_encoder_outputs_list = []
+        vision_encoder_ids_outputs_list = []
+        vision_encoder_attn_masks_outputs_list = []
         custom_attributes = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
@@ -1791,12 +1796,18 @@ class BaseDataset(torch.utils.data.Dataset):
 
             if image_info.vision_encoder_outputs is not None:
                 vision_encoder_outputs_list.append(image_info.vision_encoder_outputs)
+                vision_encoder_ids_outputs_list.append(image_info.vision_encoder_ids_outputs)
+                vision_encoder_attn_masks_outputs_list.append(image_info.vision_encoder_attn_masks_outputs)
             elif image_info.vision_encoder_npz is not None:
                 vision_encoder_outputs, flipped_vision_encoder_outputs = self.image_embedding_caching_strategy.load_image_embeddings_from_disk(image_info.vision_encoder_npz, image_info.bucket_reso)
                 if flipped:
-                    vision_encoder_outputs_list.append(flipped_vision_encoder_outputs)
+                    vision_encoder_outputs_list.append(flipped_vision_encoder_outputs[0])
+                    vision_encoder_ids_outputs_list.append(flipped_vision_encoder_outputs[1])
+                    vision_encoder_attn_masks_outputs_list.append(flipped_vision_encoder_outputs[2])
                 else:
-                    vision_encoder_outputs_list.append(vision_encoder_outputs)
+                    vision_encoder_outputs_list.append(vision_encoder_outputs[0])
+                    vision_encoder_ids_outputs_list.append(vision_encoder_outputs[1])
+                    vision_encoder_attn_masks_outputs_list.append(vision_encoder_outputs[2])
 
             if image_info.text_encoder_outputs is not None:
                 # cached
@@ -1854,8 +1865,13 @@ class BaseDataset(torch.utils.data.Dataset):
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
         example["loss_weights"] = torch.FloatTensor(loss_weights)
         example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
-        example["vision_encoder_outputs_list"] = none_or_stack_elements(vision_encoder_outputs_list, torch.FloatTensor)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
+
+        # example["vision_encoder_outputs_list"] = none_or_stack_elements(vision_encoder_outputs_list, torch.FloatTensor)
+
+        example["vision_encoder_outputs"] = torch.stack([torch.FloatTensor(t) for t in vision_encoder_outputs_list]).to(memory_format=torch.contiguous_format)
+        example["vision_encoder_ids_outputs"] = torch.stack([torch.IntTensor(t) for t in vision_encoder_ids_outputs_list]).to(memory_format=torch.contiguous_format)
+        example["vision_encoder_attn_masks_outputs"] = torch.stack([torch.IntTensor(t) for t in vision_encoder_attn_masks_outputs_list]).to(memory_format=torch.contiguous_format)
 
         # if one of alpha_masks is not None, we need to replace None with ones
         none_or_not = [x is None for x in alpha_mask_list]
@@ -5547,7 +5563,7 @@ def prepare_accelerator(args: argparse.Namespace):
         deepspeed_plugin=deepspeed_plugin,
         dataloader_config=dataloader_config
     )
-    print("accelerator device:", accelerator.device)
+    logger.info("accelerator device:", accelerator.device)
     return accelerator
 
 
@@ -6816,9 +6832,9 @@ def generate_step_logs(
                 logs["opt/d_denom/textencoder"] = d_denom
                 logs["opt/d_mean/textencoder"] = optimizer.get_d_mean()
 
-            if "betas" in group:
-                for beta_i, beta in group['betas']:
-                    logs[f'momentum/betas{beta_i}-te'] = beta
+            if "betas" in group and isinstance(group['betas'], tuple):
+                beta_i, beta = group['betas']
+                logs[f'momentum/betas{beta_i}-te'] = beta
 
             idx = 1
 
@@ -6844,9 +6860,9 @@ def generate_step_logs(
                 logs[f"opt/max_d_numerator/group{i}"] = group["max_d_numerator"]
                 logs[f"opt/d_mean/group{i}"] = optimizer.get_d_mean()
 
-            if "betas" in group:
-                for beta_i, beta in enumerate(group['betas']):
-                    logs[f'momentum/betas{beta_i+1}-group{i}'] = beta
+            if "betas" in group and isinstance(group['betas'], tuple):
+                beta_i, beta = group['betas']
+                logs[f'momentum/betas{beta_i+1}-group{i}'] = beta
 
 
     if modules_scaled is not None:
@@ -6857,3 +6873,15 @@ def generate_step_logs(
         logs["norm/max"] = maximum_norm
 
     return logs
+
+
+@contextmanager
+def timer(label):
+    """Context manager to time a block of code"""
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        logger.debug(f"{label}: {elapsed_time:.4f} seconds")
