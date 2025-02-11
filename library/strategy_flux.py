@@ -9,7 +9,8 @@ import PIL.Image
 from transformers import CLIPTokenizer, T5TokenizerFast, SiglipVisionModel, AutoProcessor
 
 from library import flux_utils, train_util
-from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
+from library.strategy_base import ImageEmbeddingsCachingStrategy, LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
+from library.flux_models import ReduxImageEncoder
 
 from library.utils import setup_logging
 
@@ -21,38 +22,6 @@ logger = logging.getLogger(__name__)
 
 CLIP_L_TOKENIZER_ID = "openai/clip-vit-large-patch14"
 T5_XXL_TOKENIZER_ID = "google/t5-v1_1-xxl"
-
-
-# FIXME: this is a very hacky way of handling the encoder model
-siglip_model = None
-siglip_processor = None
-redux_encoder = None
-
-def move_vision_encoder_to_device(device):
-    if siglip_model is not None:
-        siglip_model.to(device)
-    if redux_encoder is not None:
-        redux_encoder.to(device)
-
-
-class ReduxImageEncoder(torch.nn.Module):
-    def __init__(
-        self,
-        redux_dim: int = 1152,
-        txt_in_features: int = 4096,
-        device=None,
-        dtype=None,
-    ) -> None:
-        super().__init__()
-        self.redux_dim = redux_dim
-        self.device = device
-        self.dtype = dtype
-        self.redux_up = torch.nn.Linear(redux_dim, txt_in_features * 3, dtype=dtype)
-        self.redux_down = torch.nn.Linear(txt_in_features * 3, txt_in_features, dtype=dtype)
-
-    def forward(self, sigclip_embeds) -> torch.Tensor:
-        projected_x = self.redux_down(torch.nn.functional.silu(self.redux_up(sigclip_embeds)))
-        return projected_x
 
 
 class FluxTokenizeStrategy(TokenizeStrategy):
@@ -130,13 +99,9 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         apply_t5_attn_mask: bool = False,
-        vision_cond_size: int = 0,
-        redux_path: str = None,
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
         self.apply_t5_attn_mask = apply_t5_attn_mask
-        self.vision_cond_size = vision_cond_size
-        self.redux_path = redux_path
         self.warn_fp8_weights = False
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
@@ -180,49 +145,6 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         # apply_t5_attn_mask should be same as self.apply_t5_attn_mask
         return [l_pooled, t5_out, txt_ids, t5_attn_mask]
 
-    def encode_vision(self, infos, grid_size, t5_out, txt_ids):
-        global siglip_model
-        global siglip_processor
-        global redux_encoder
-
-        if siglip_model is None:
-            model_id = "google/siglip-so400m-patch14-384"
-            siglip_model = SiglipVisionModel.from_pretrained(
-                model_id, attn_implementation="sdpa", device_map="cuda")
-            siglip_processor = AutoProcessor.from_pretrained(model_id)
-
-        if redux_encoder is None:
-            if self.redux_path is None:
-                raise Exception("Vision encoding requires Redux model, but no file was provided.")
-            model_data = safetensors.torch.load_file(self.redux_path, device=torch.device("cpu").type)
-            redux_encoder = ReduxImageEncoder()
-            redux_encoder.load_state_dict(model_data)
-            redux_encoder = redux_encoder.to(device="cuda")
-
-        bsz = txt_ids.shape[0]
-        imgs = [PIL.Image.open(nfo.absolute_path) for nfo in infos]
-        siglip_in = siglip_processor(images=imgs, padding="max_length", return_tensors="pt")
-        siglip_in = siglip_in.to(device="cuda")
-
-        with torch.no_grad(), torch.autocast("cuda"):
-            siglip_out = siglip_model(**siglip_in)
-            new_embed = redux_encoder(siglip_out.last_hidden_state).float()
-            (b, t, h) = new_embed.shape
-            s = int(sqrt(t))
-            new_embed = torch.nn.functional.interpolate(new_embed.view(b, s, s, h).transpose(1, -1),
-                                                        size=(grid_size, grid_size),
-                                                        mode="bicubic")
-            new_embed = new_embed.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
-            new_ids = np.zeros(shape=(bsz, new_embed.shape[1], txt_ids.shape[2]))
-            attn_mask = np.ones((bsz, new_embed.shape[1]))
-
-        for i, info in enumerate(infos):
-            new_embed_i = new_embed[i]
-            new_ids_i = new_ids[i]
-            attn_mask_i = attn_mask[i]
-            info.vision_encoder_outputs = (new_embed_i, new_ids_i, attn_mask_i)
-
-
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
     ):
@@ -254,15 +176,12 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         txt_ids = txt_ids.cpu().numpy()
         t5_attn_mask = tokens_and_masks[2].cpu().numpy()
 
-        if self.vision_cond_size > 0:
-            assert self.vision_cond_size <= 27, "Downsample ratio must not be greater than 27."
-            self.encode_vision(infos, self.vision_cond_size, t5_out, txt_ids)
-
         for i, info in enumerate(infos):
             l_pooled_i = l_pooled[i]
             t5_out_i = t5_out[i]
             txt_ids_i = txt_ids[i]
             t5_attn_mask_i = t5_attn_mask[i]
+
             apply_t5_attn_mask_i = self.apply_t5_attn_mask
 
             if self.cache_to_disk:
@@ -277,6 +196,7 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             else:
                 # it's fine that attn mask is not None. it's overwritten before calling the model if necessary
                 info.text_encoder_outputs = (l_pooled_i, t5_out_i, txt_ids_i, t5_attn_mask_i)
+
 
 
 class FluxLatentsCachingStrategy(LatentsCachingStrategy):
@@ -316,6 +236,165 @@ class FluxLatentsCachingStrategy(LatentsCachingStrategy):
 
         if not train_util.HIGH_VRAM:
             train_util.clean_memory_on_device(vae.device)
+
+
+class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
+    FLUX_IMAGE_EMBEDDING_NPZ_SUFFIX = "_img_emb_flux.npz"
+
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+        super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
+
+    @property
+    def cache_suffix(self) -> str:
+        return self.FLUX_IMAGE_EMBEDDING_NPZ_SUFFIX
+
+    def get_image_embeddings_npz_path(self, absolute_path: str) -> str:
+        return (
+            os.path.splitext(absolute_path)[0]
+            + self.FLUX_IMAGE_EMBEDDING_NPZ_SUFFIX
+        )
+
+    def is_disk_cached_image_embeddings_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool):
+        if not self.cache_to_disk:
+            return False
+        if not os.path.exists(npz_path):
+            return False
+        if self.skip_disk_cache_validity_check:
+            return True
+
+        # expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
+        # expected_latents_size = (bucket_reso[1], bucket_reso[0])  # bucket_reso is (W, H)
+
+        # e.g. "_32x64", HxW
+        # key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
+        # key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"
+        key_reso_suffix = ""
+
+        try:
+            npz = np.load(npz_path)
+            if "vis_embed" + key_reso_suffix not in npz:
+                return False
+            if flip_aug and "flipped_vis_embed" + key_reso_suffix not in npz:
+                return False
+        except Exception as e:
+            logger.error(f"Error loading file: {npz_path}")
+            raise e
+
+        return True
+
+
+    def load_image_embeddings_from_disk(
+        self, npz_path: str, bucket_reso: Tuple[int, int]
+    ) -> Tuple[Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]]], Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]]]]:
+        # if latents_stride is None:
+        #     key_reso_suffix = ""
+        # else:
+        #     latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
+        #     key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"  # e.g. "_32x64", HxW
+
+        # latents_size = (bucket_reso[1], bucket_reso[0])  # bucket_reso is (W, H)
+        # key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"  # e.g. "_32x64", HxW
+        key_reso_suffix = ""
+
+        npz = np.load(npz_path, allow_pickle=True)
+        if "vis_embed" + key_reso_suffix not in npz:
+            raise ValueError(f"vis_embed{key_reso_suffix} not found in {npz_path}")
+
+        vis_embed = npz["vis_embed" + key_reso_suffix]
+        vis_id = npz["vis_id" + key_reso_suffix].tolist()
+        vis_attn_mask = npz["vis_attn_mask" + key_reso_suffix].tolist()
+
+        flipped_vis_embed = npz["flipped_vis_embed" + key_reso_suffix]
+        flipped_vis_id = npz["flipped_vis_id" + key_reso_suffix].tolist()
+        flipped_vis_attn_mask = npz["flipped_vis_attn_mask" + key_reso_suffix].tolist()
+        flipped = (flipped_vis_embed, flipped_vis_id, flipped_vis_attn_mask)
+        return (vis_embed, vis_id, vis_attn_mask), flipped
+
+
+    @torch.no_grad()
+    def cache_batch_image_embeddings(self, siglip_model: SiglipVisionModel, redux_encoder: ReduxImageEncoder, batch: List, grid_size: int, flip_aug: bool):
+        bsz = len(batch)
+        imgs = [train_util.load_image(nfo.absolute_path) for nfo in batch]
+        # TODO support flipping (??)
+        flipped_image_embeddings = None
+
+        processor = AutoProcessor.from_pretrained("google/siglip-so400m-patch14-384")
+        siglip_in = processor(images=imgs, padding="max_length", return_tensors="pt").to(siglip_model.device, dtype=siglip_model.dtype)
+
+        siglip_out = siglip_model(**siglip_in)
+        vis_embeds = redux_encoder(siglip_out.last_hidden_state).float()
+        (b, t, h) = vis_embeds.shape
+        s = int(sqrt(t))
+        vis_embeds = torch.nn.functional.interpolate(vis_embeds.view(b, s, s, h).transpose(1, -1),
+                                                    size=(grid_size, grid_size),
+                                                    mode="bicubic")
+        vis_embeds = vis_embeds.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
+        vis_ids = np.zeros(shape=(bsz, vis_embeds.shape[1], 3))
+        vis_attn_masks = np.ones((bsz, vis_embeds.shape[1]))
+
+        if flip_aug:
+            imgs = [np.flip(img, axis=2) for img in imgs]
+            siglip_in = processor(images=imgs, padding="max_length", return_tensors="pt").to(siglip_model.device, dtype=siglip_model.dtype)
+
+            siglip_out = siglip_model(**siglip_in)
+            flipped_vis_embeds = redux_encoder(siglip_out.last_hidden_state).float()
+            (b, t, h) = flipped_vis_embeds.shape
+            s = int(sqrt(t))
+            flipped_vis_embeds = torch.nn.functional.interpolate(flipped_vis_embeds.view(b, s, s, h).transpose(1, -1),
+                                                        size=(grid_size, grid_size),
+                                                        mode="bicubic")
+            flipped_vis_embeds = flipped_vis_embeds.transpose(1, -1).reshape(b, -1, h).cpu().numpy()
+            flipped_vis_ids = np.zeros(shape=(bsz, flipped_vis_embeds.shape[1], 3))
+            flipped_vis_attn_masks = np.ones((bsz, flipped_vis_embeds.shape[1]))
+            flipped_image_embeddings =[(flipped_vis_embeds[i], flipped_vis_ids[i], flipped_vis_attn_masks[i]) for i in range(len(flipped_vis_embeds))]
+        else:
+            flipped_vis_embeds = [None] * vis_embeds.shape[0]
+            flipped_vis_ids = [None] * vis_embeds.shape[0]
+            flipped_vis_attn_masks =  [None] * vis_embeds.shape[0]
+            
+            flipped_image_embeddings =[(flipped_vis_embeds[i], flipped_vis_ids[i], flipped_vis_attn_masks[i]) for i in range(len(flipped_vis_embeds))]
+
+        for i, info in enumerate(batch):
+            vis_embed = vis_embeds[i]
+            vis_id = vis_ids[i]
+            vis_attn_mask = vis_attn_masks[i]
+
+            if self.cache_to_disk:
+                self.save_image_embeddings_to_disk(
+                    info.vision_encoder_npz, vis_embed, vis_id, vis_attn_mask, flipped_image_embeddings[i], key_reso_suffix=""
+                )
+                # TODO Make setting to toggle this
+                # Caching in memory as well
+                info.vision_encoder_outputs = (vis_embed, vis_id, vis_attn_mask)
+            else:
+                info.vision_encoder_outputs = (vis_embed, vis_id, vis_attn_mask)
+
+            
+    def save_image_embeddings_to_disk(
+        self,
+        npz_path,
+        vis_embed,
+        vis_id,
+        vis_attn_mask,
+        flipped_image_embeddings=None,
+        key_reso_suffix="",
+    ):
+        kwargs = {}
+
+        if os.path.exists(npz_path):
+            # load existing npz and update it
+            npz = np.load(npz_path)
+            for key in npz.files:
+                kwargs[key] = npz[key]
+
+        kwargs["vis_embed" + key_reso_suffix] = vis_embed
+        kwargs["vis_id" + key_reso_suffix] = vis_id
+        kwargs["vis_attn_mask" + key_reso_suffix] = vis_attn_mask
+        if flipped_image_embeddings is not None:
+            kwargs["flipped_vis_embed" + key_reso_suffix] = flipped_image_embeddings[0]
+            kwargs["flipped_vis_id" + key_reso_suffix] = flipped_image_embeddings[1]
+            kwargs["flipped_vis_attn_mask" + key_reso_suffix] = flipped_image_embeddings[2]
+        np.savez(npz_path, **kwargs)
 
 
 if __name__ == "__main__":

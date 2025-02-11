@@ -474,6 +474,8 @@ def apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas):
         # add the model_pred to the noisy_model_input
         model_pred = model_pred + noisy_model_input
     elif args.model_prediction_type == "sigma_scaled":
+        if sigmas is None:
+            raise RuntimeError("model_prediction_type=sigma_scaled can not be used with timestep_sampling / model_prediction_type=sigma_scaled は timestep_sampling では使用できません")
         # apply sigma scaling
         model_pred = model_pred * (-sigmas) + noisy_model_input
 
@@ -636,3 +638,5 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
         default=1.0,
         help="Probability of dropout for Redux conditioning.",
     )
+    parser.add_argument("--cache_image_embeddings_to_disk", default=False)
+    parser.add_argument("--image_embeddings_batch_size", default=1)

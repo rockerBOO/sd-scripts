@@ -966,10 +966,10 @@ class Flux(nn.Module):
 
         print("FLUX: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, num_blocks: int, device: torch.device):
+    def enable_block_swap(self, num_blocks: int, device: torch.device, single_num_blocks: Optional[int] = None):
         self.blocks_to_swap = num_blocks
         double_blocks_to_swap = num_blocks // 2
-        single_blocks_to_swap = (num_blocks - double_blocks_to_swap) * 2
+        single_blocks_to_swap = single_num_blocks if single_num_blocks else (num_blocks - double_blocks_to_swap) * 2
 
         assert double_blocks_to_swap <= self.num_double_blocks - 2 and single_blocks_to_swap <= self.num_single_blocks - 2, (
             f"Cannot swap more than {self.num_double_blocks - 2} double blocks and {self.num_single_blocks - 2} single blocks. "
@@ -1491,3 +1491,23 @@ class FluxLower(nn.Module):
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
 """
+
+class ReduxImageEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        redux_dim: int = 1152,
+        txt_in_features: int = 4096,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.redux_dim = redux_dim
+        self.device = device
+        self.dtype = dtype
+        self.redux_up = torch.nn.Linear(redux_dim, txt_in_features * 3, dtype=dtype)
+        self.redux_down = torch.nn.Linear(txt_in_features * 3, txt_in_features, dtype=dtype)
+
+    def forward(self, sigclip_embeds) -> torch.Tensor:
+        projected_x = self.redux_down(torch.nn.functional.silu(self.redux_up(sigclip_embeds)))
+        return projected_x
+

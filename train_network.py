@@ -59,78 +59,6 @@ class NetworkTrainer:
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
 
-    # TODO 他のスクリプトと共通化する
-    def generate_step_logs(
-        self,
-        args: argparse.Namespace,
-        current_loss,
-        avr_loss,
-        lr_scheduler,
-        lr_descriptions,
-        optimizer=None,
-        keys_scaled=None,
-        mean_norm=None,
-        maximum_norm=None,
-    ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
-
-        if keys_scaled is not None:
-            logs["max_norm/keys_scaled"] = keys_scaled
-            logs["max_norm/average_key_norm"] = mean_norm
-            logs["max_norm/max_key_norm"] = maximum_norm
-
-        lrs = lr_scheduler.get_last_lr()
-        for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
-                lr_desc = lr_descriptions[i]
-            else:
-                idx = i - (0 if args.network_train_unet_only else -1)
-                if idx == -1:
-                    lr_desc = "textencoder"
-                else:
-                    if len(lrs) > 2:
-                        lr_desc = f"group{idx}"
-                    else:
-                        lr_desc = "unet"
-
-            logs[f"lr/{lr_desc}"] = lr
-
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                # tracking d*lr value
-                logs[f"lr/d*lr/{lr_desc}"] = (
-                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                )
-            if (
-                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
-            ):  # tracking d*lr value of unet.
-                logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
-        else:
-            idx = 0
-            if not args.network_train_unet_only:
-                logs["lr/textencoder"] = float(lrs[0])
-
-                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
-                    logs['momentum/betas1-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][0]
-                    logs['momentum/betas2-te'] = lr_scheduler.optimizers[-1].param_groups[0]['betas'][1]
-
-                idx = 1
-
-            for i in range(idx, len(lrs)):
-                logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                    logs[f"lr/d*lr/group{i}"] = (
-                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                    )
-                if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
-                    logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
-
-                if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
-                    logs[f'momentum/betas1-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][0]
-                    logs[f'momentum/betas2-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][1]
-
-
-        return logs
-
     def assert_extra_args(
         self,
         args,
@@ -169,6 +97,9 @@ class NetworkTrainer:
     def get_text_encoder_outputs_caching_strategy(self, args):
         return None
 
+    def get_image_embeddings_caching_strategy(self, args):
+        return None
+
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         """
         Returns a list of models that will be used for text encoding. SDXL uses wrapped and unwrapped models.
@@ -186,6 +117,9 @@ class NetworkTrainer:
     def cache_text_encoder_outputs_if_needed(self, args, accelerator, unet, vae, text_encoders, dataset, weight_dtype):
         for t_enc in text_encoders:
             t_enc.to(accelerator.device, dtype=weight_dtype)
+
+    def cache_image_embeddings_if_needed(self, args, accelerator: Accelerator, dataset: train_util.DatasetGroup, weight_dtype: torch.dtype):
+        pass
 
     def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, **kwargs):
         noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
@@ -321,7 +255,10 @@ class NetworkTrainer:
     ) -> torch.nn.Module:
         return accelerator.prepare(unet)
 
-    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
+        pass
+
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
 
     # endregion
@@ -451,6 +388,9 @@ class NetworkTrainer:
         latents_caching_strategy = self.get_latents_caching_strategy(args)
         strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
 
+        image_embeddings_caching_strategy = self.get_image_embeddings_caching_strategy(args)
+        strategy_base.ImageEmbeddingsCachingStrategy.set_strategy(image_embeddings_caching_strategy)
+
         # データセットを準備する
         if args.dataset_class is None:
             blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
@@ -540,8 +480,13 @@ class NetworkTrainer:
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
 
+        vae.eval()
+        unet.eval()
+
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+
+        [te.eval() for te in text_encoders]
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -576,6 +521,7 @@ class NetworkTrainer:
                 val_dataset_group.new_cache_latents(vae, accelerator)
 
             vae.to("cpu")
+
             clean_memory_on_device(accelerator.device)
 
             accelerator.wait_for_everyone()
@@ -589,8 +535,10 @@ class NetworkTrainer:
         if text_encoder_outputs_caching_strategy is not None:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
+        self.cache_image_embeddings_if_needed(args, accelerator, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+            self.cache_image_embeddings_if_needed(args, accelerator, val_dataset_group, weight_dtype)
 
         # prepare network
         net_kwargs = {}
@@ -756,6 +704,7 @@ class NetworkTrainer:
         unet_weight_dtype = te_weight_dtype = weight_dtype
         # Experimental Feature: Put base model into fp8 to save vram
         if args.fp8_base or args.fp8_base_unet:
+            logger.info("Moving unet to fp8")
             assert torch.__version__ >= "2.1.0", "fp8_base requires torch>=2.1.0 / fp8を使う場合はtorch>=2.1.0が必要です。"
             assert (
                 args.mixed_precision != "no"
@@ -775,18 +724,21 @@ class NetworkTrainer:
             logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
             unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
+        logger.info(f"Moving unet {unet.dtype} to dtype {unet_weight_dtype}")
         unet.requires_grad_(False)
-        unet.to(dtype=unet_weight_dtype)
-        for i, t_enc in enumerate(text_encoders):
-            t_enc.requires_grad_(False)
-
-            # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu":
-                t_enc.to(dtype=te_weight_dtype)
-
-                # nn.Embedding not support FP8
-                if te_weight_dtype != weight_dtype:
-                    self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
+        # unet.eval()
+        # unet.to(dtype=unet_weight_dtype)
+        # for i, t_enc in enumerate(text_encoders):
+        #     t_enc.requires_grad_(False)
+        #
+        #     # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
+        #     if t_enc.device.type != "cpu":
+        #         t_enc.to(dtype=te_weight_dtype)
+        #
+        #         # nn.Embedding not support FP8
+        #         if te_weight_dtype != weight_dtype:
+        #             print(torch.cuda.memory_summary(accelerator.device, True))
+        #             self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -839,8 +791,6 @@ class NetworkTrainer:
             unet.eval()
             for t_enc in text_encoders:
                 t_enc.eval()
-
-        del t_enc
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
 
@@ -989,6 +939,11 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
         }
+
+        if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+            import wandb
+            wandb_tracker = accelerator.get_tracker("wandb")
+            metadata['ss_wandb_name'] = wandb_tracker.run.name
 
         self.update_metadata(metadata, args)  # architecture specific metadata
 
@@ -1249,10 +1204,10 @@ class NetworkTrainer:
             text_encoders = []
             text_encoder = None
 
+
         # For --sample_at_first
         optimizer_eval_fn()
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-        optimizer_train_fn()
         is_tracking = len(accelerator.trackers) > 0
         if is_tracking:
             # log empty object to commit the sample images to wandb
@@ -1265,8 +1220,90 @@ class NetworkTrainer:
                 initial_step -= len(train_dataloader)
             global_step = initial_step
 
+        def human_readable(num):
+            magnitude = 0
+            while abs(num) >= 1000:
+                magnitude += 1
+                num /= 1000.0
+            return f"{num:.1f}{['', 'K', 'M', 'G', 'T', 'P'][magnitude]}"
+
+        def estimate_vram(num_trainable_params, num_non_trainable_params, dtype):
+            """
+            Estimate the VRAM usage of model parameters.
+
+            Args:
+            - num_trainable_params (int): The number of trainable model parameters.
+            - num_non_trainable_params (int): The number of non-trainable model parameters.
+            - dtype (torch.dtype): The precision level (torch.float8, torch.float16, torch.bfloat16, or torch.float32).
+
+            Returns:
+            - vram_usage_trainable (float): The estimated VRAM usage of trainable parameters in bytes.
+            - vram_usage_non_trainable (float): The estimated VRAM usage of non-trainable parameters in bytes.
+            - vram_usage_total (float): The estimated total VRAM usage in bytes.
+            """
+            # Calculate the total number of bits required to store the trainable parameters
+            total_bits_trainable = num_trainable_params * torch.finfo(dtype).bits
+
+            # Calculate the total number of bits required to store the non-trainable parameters
+            total_bits_non_trainable = num_non_trainable_params * torch.finfo(dtype).bits
+
+            # Convert the total number of bits to bytes
+            vram_usage_trainable = total_bits_trainable / 8
+            vram_usage_non_trainable = total_bits_non_trainable / 8
+            vram_usage_total = vram_usage_trainable + vram_usage_non_trainable
+
+            # Convert the VRAM usage to a human-readable format
+            def human_readable(vram_usage):
+                if vram_usage < 1024:
+                    return f"{vram_usage:.2f} bytes"
+                elif vram_usage < 1024 ** 2:
+                    return f"{vram_usage / 1024:.2f} KB"
+                elif vram_usage < 1024 ** 3:
+                    return f"{vram_usage / (1024 ** 2):.2f} MB"
+                elif vram_usage < 1024 ** 4:
+                    return f"{vram_usage / (1024 ** 3):.2f} GB"
+                else:
+                    return f"{vram_usage / (1024 ** 4):.2f} TB"
+
+            return human_readable(vram_usage_trainable), human_readable(vram_usage_non_trainable), human_readable(vram_usage_total)
+
         # log device and dtype for each model
-        logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
+        # num_parameters = sum(p.numel() for p in vae.parameters())
+        # logger.info(f"vae  dtype: {vae.dtype}, device: {vae.device}")
+
+        num_trainable_params = sum(p.numel() for p in vae.parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in vae.parameters() if p.requires_grad is False)
+        logger.info(f"vae dtype: {unet.dtype}, device: {vae.device}")
+        logger.info(f"vae trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"vae non_trainable parameters: {human_readable(num_non_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, vae.dtype)
+        logger.info(f"vae estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        num_trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in unet.parameters())
+        logger.info(f"unet dtype: {unet.dtype}, device: {unet.device}, desired: {unet_weight_dtype}")
+        logger.info(f"unet trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"unet non_trainable parameters: {human_readable(num_non_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, unet.dtype)
+        logger.info(f"unet estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        num_trainable_params = sum(p.numel() for p in accelerator.unwrap_model(network).parameters() if p.requires_grad is True)
+        num_non_trainable_params = sum(p.numel() for p in accelerator.unwrap_model(network).parameters() if p.requires_grad is False)
+        logger.info(f"network dtype: {accelerator.unwrap_model(network).dtype}, device: {accelerator.unwrap_model(network).device}")
+        logger.info(f"network trainable parameters: {human_readable(num_trainable_params)}")
+        logger.info(f"network non_trainable parameters: {human_readable(num_trainable_params)}")
+        vram_usage_trainable, vram_usage_non_trainable, vram_usage_total = estimate_vram(num_trainable_params, num_non_trainable_params, accelerator.unwrap_model(network).dtype)
+        logger.info(f"unet estimate trainable VRAM {vram_usage_trainable} non_trainable: {vram_usage_non_trainable} total: {vram_usage_total}")
+
+        # logger.info(f"network estimate VRAM: {estimate_vram(num_parameters, accelerator.unwrap_model(network).dtype)}")
+        # logger.info(f"network dtype: {accelerator.unwrap_model(network).dtype}, device: {accelerator.unwrap_model(network).device}")
+        # num_parameters = sum(p.numel() for p in accelerator.unwrap_model(network).parameters())
+        # logger.info(f"network trainable parameters: {human_readable(num_parameters)}")
+        # logger.info(f"network estimate VRAM: {estimate_vram(num_parameters, accelerator.unwrap_model(network).dtype)}")
+        # logger.warning(f"unet trainable {sum([1 for p in unet.parameters() if p.requires_grad])}")
+        for te in text_encoders:
+            logger.info(f"te dtype: {unet_weight_dtype}, device: {unet.device}")
+            logger.warning(f"te trainable {sum([1 for p in te.parameters() if p.requires_grad])}")
         for i, t_enc in enumerate(text_encoders):
             params_itr = t_enc.parameters()
             params_itr.__next__()  # skip the first parameter
@@ -1275,6 +1312,10 @@ class NetworkTrainer:
             logger.info(f"text_encoder [{i}] dtype: {param_3rd.dtype}, device: {t_enc.device}")
 
         clean_memory_on_device(accelerator.device)
+
+        progress_bar = tqdm(
+            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+        )
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1290,6 +1331,34 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+        def switch_rng_state(seed: int) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
+            cpu_rng_state = torch.get_rng_state()
+            if accelerator.device.type == "cuda":
+                gpu_rng_state = torch.cuda.get_rng_state()
+            elif accelerator.device.type == "xpu":
+                gpu_rng_state = torch.xpu.get_rng_state()
+            elif accelerator.device.type == "mps":
+                gpu_rng_state = torch.cuda.get_rng_state()
+            else:
+                gpu_rng_state = None
+            python_rng_state = random.getstate()
+
+            torch.manual_seed(seed)
+            random.seed(seed)
+
+            return (cpu_rng_state, gpu_rng_state, python_rng_state)
+
+        def restore_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
+            cpu_rng_state, gpu_rng_state, python_rng_state = rng_states
+            torch.set_rng_state(cpu_rng_state)
+            if gpu_rng_state is not None:
+                if accelerator.device.type == "cuda":
+                    torch.cuda.set_rng_state(gpu_rng_state)
+                elif accelerator.device.type == "xpu":
+                    torch.xpu.set_rng_state(gpu_rng_state)
+                elif accelerator.device.type == "mps":
+                    torch.cuda.set_rng_state(gpu_rng_state)
+            random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
@@ -1306,6 +1375,8 @@ class NetworkTrainer:
                 initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
+                optimizer_train_fn()
+                accelerator.unwrap_model(network).train()
                 current_step.value = global_step
                 if initial_step > 0:
                     initial_step -= 1
@@ -1314,8 +1385,8 @@ class NetworkTrainer:
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
-                    # temporary, for batch processing
-                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                    # preprocess batch for each model
+                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
                     loss = self.process_batch(
                         batch,
@@ -1336,9 +1407,13 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                     # Checks if the accelerator has performed an optimization step behind the scenes
                     if accelerator.sync_gradients:
+                        global_step += 1
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
@@ -1346,33 +1421,36 @@ class NetworkTrainer:
 
                         max_mean_logs = {}
                         if args.scale_weight_norms:
-                            keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
+                            modules_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
                                 args.scale_weight_norms, accelerator.device
                             )
-                            max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
+                            max_mean_logs = {"scaled": modules_scaled, "avg norm": mean_norm}
                         else:
-                            keys_scaled, mean_norm, maximum_norm = None, None, None
+                            norms = accelerator.unwrap_model(network).get_norms(accelerator.device)
+                            mean_norm = sum(norms) / len(norms)
+                            maximum_norm = max(norms)
+                            modules_scaled = None
+                            max_mean_logs = {"avg norm": mean_norm}
 
                         current_loss = loss.detach().item()
-                        loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                        loss_recorder.add(epoch=epoch, step=global_step // (epoch + 1), loss=current_loss)
                         avr_loss: float = loss_recorder.moving_average
-                        logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                        logs = {"avg_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                         progress_bar.set_postfix(**{**max_mean_logs, **logs})
                         progress_bar.update(1)
-                        global_step += 1
 
                         if is_tracking:
-                            logs = self.generate_step_logs(
+                            logs = train_util.generate_step_logs(
                                 args,
                                 current_loss,
                                 avr_loss,
                                 lr_scheduler,
                                 lr_descriptions,
-                                optimizer,
-                                keys_scaled,
+                                modules_scaled,
                                 mean_norm,
                                 maximum_norm,
                             )
+                            
                             accelerator.log(logs, step=global_step)
 
                         optimizer_eval_fn()
@@ -1394,12 +1472,8 @@ class NetworkTrainer:
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                                     remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
 
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
 
                 # VALIDATION PER STEP
                 should_validate_step = (
@@ -1410,11 +1484,10 @@ class NetworkTrainer:
                 if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
                     optimizer_eval_fn()
                     accelerator.unwrap_model(network).eval()
-                    rng_state = torch.get_rng_state()
-                    torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                    rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                     val_progress_bar = tqdm(
-                        range(validation_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
+                        range(validation_total_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps", leave=False
                     )
                     val_ts_step = 0
                     for val_step, batch in enumerate(val_dataloader):
@@ -1422,8 +1495,7 @@ class NetworkTrainer:
                             break
 
                         for timestep in validation_timesteps:
-                            # temporary, for batch processing
-                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
@@ -1459,6 +1531,7 @@ class NetworkTrainer:
                                 }
                                 accelerator.log(logs, step=global_step)
 
+                            self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
                             val_ts_step += 1
 
                     if is_tracking:
@@ -1469,11 +1542,10 @@ class NetworkTrainer:
                         }
                         accelerator.log(logs, step=global_step)
 
-                    torch.set_rng_state(rng_state)
+                    progress_bar.unpause()
+                    restore_rng_state(rng_states)
                     args.min_timestep = original_args_min_timestep
                     args.max_timestep = original_args_max_timestep
-                    optimizer_train_fn()
-                    accelerator.unwrap_model(network).train()
 
                 if global_step >= args.max_train_steps:
                     break
@@ -1486,8 +1558,7 @@ class NetworkTrainer:
             if should_validate_epoch and len(val_dataloader) > 0:
                 optimizer_eval_fn()
                 accelerator.unwrap_model(network).eval()
-                rng_state = torch.get_rng_state()
-                torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                 val_progress_bar = tqdm(
                     range(validation_total_steps),
@@ -1505,7 +1576,7 @@ class NetworkTrainer:
                         args.min_timestep = args.max_timestep = timestep
 
                         # temporary, for batch processing
-                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                         loss = self.process_batch(
                             batch,
@@ -1540,6 +1611,7 @@ class NetworkTrainer:
                             }
                             accelerator.log(logs, step=global_step)
 
+                        self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
                         val_ts_step += 1
 
                 if is_tracking:
@@ -1552,11 +1624,10 @@ class NetworkTrainer:
                     }
                     accelerator.log(logs, step=global_step)
 
-                torch.set_rng_state(rng_state)
+                progress_bar.unpause()
+                restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
-                optimizer_train_fn()
-                accelerator.unwrap_model(network).train()
 
             # END OF EPOCH
             if is_tracking:
@@ -1566,7 +1637,6 @@ class NetworkTrainer:
             accelerator.wait_for_everyone()
 
             # 指定エポックごとにモデルを保存
-            optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
@@ -1581,8 +1651,8 @@ class NetworkTrainer:
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
+            optimizer_eval_fn()
             self.sample_images(accelerator, args, epoch + 1, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
-            optimizer_train_fn()
 
             # end of epoch
 
@@ -1593,7 +1663,6 @@ class NetworkTrainer:
             network = accelerator.unwrap_model(network)
 
         accelerator.end_training()
-        optimizer_eval_fn()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
@@ -1656,6 +1725,11 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use fp8 for U-Net (or DiT), Text Encoder is fp16 or bf16"
         " / U-Net（またはDiT）にfp8を使用する。Text Encoderはfp16またはbf16",
+    )
+    parser.add_argument(
+        "--fp8_base_te",
+        action="store_true",
+        help="use fp8 for Text Encoder",
     )
 
     parser.add_argument(

@@ -376,6 +376,9 @@ class TextEncoderOutputsCachingStrategy:
     ):
         raise NotImplementedError
 
+    def cache_image_embeddings(self, batch: List):
+        raise NotImplementedError
+
 
 class LatentsCachingStrategy:
     # TODO commonize utillity functions to this class, such as npz handling etc.
@@ -516,7 +519,7 @@ class LatentsCachingStrategy:
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]], Optional[Tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
         """
         for SD/SDXL
         """
@@ -524,7 +527,7 @@ class LatentsCachingStrategy:
 
     def _default_load_latents_from_disk(
         self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]], Optional[Tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
         if latents_stride is None:
             key_reso_suffix = ""
         else:
@@ -540,14 +543,14 @@ class LatentsCachingStrategy:
         crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
         flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
         alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
-        return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
+        return latents, (original_size[0],original_size[1]), (crop_ltrb[0],crop_ltrb[1],crop_ltrb[2],crop_ltrb[3]), flipped_latents, alpha_mask
 
     def save_latents_to_disk(
         self,
         npz_path,
         latents_tensor,
         original_size,
-        crop_ltrb,
+        crop_ltrb: Tuple[int, int, int, int],
         flipped_latents_tensor=None,
         alpha_mask=None,
         key_reso_suffix="",
@@ -568,3 +571,35 @@ class LatentsCachingStrategy:
         if alpha_mask is not None:
             kwargs["alpha_mask" + key_reso_suffix] = alpha_mask.float().cpu().numpy()
         np.savez(npz_path, **kwargs)
+
+class ImageEmbeddingsCachingStrategy:
+    # TODO commonize utillity functions to this class, such as npz handling etc.
+
+    _strategy = None  # strategy instance: actual strategy class
+
+    def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
+        self._cache_to_disk = cache_to_disk
+        self._batch_size = batch_size
+        self.skip_disk_cache_validity_check = skip_disk_cache_validity_check
+
+    @classmethod
+    def set_strategy(cls, strategy):
+        if cls._strategy is not None:
+            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
+        cls._strategy = strategy
+
+    @classmethod
+    def get_strategy(cls) -> Optional["ImageEmbeddingsCachingStrategy"]:
+        return cls._strategy
+
+    @property
+    def cache_to_disk(self):
+        return self._cache_to_disk
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    @property
+    def cache_suffix(self):
+        raise NotImplementedError

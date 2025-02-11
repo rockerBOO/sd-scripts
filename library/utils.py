@@ -350,7 +350,7 @@ class MemoryEfficientSafeOpen:
 
 
 def load_safetensors(
-    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = torch.float32
+    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = None
 ) -> dict[str, torch.Tensor]:
     if disable_mmap:
         # return safetensors.torch.load(open(path, "rb").read())

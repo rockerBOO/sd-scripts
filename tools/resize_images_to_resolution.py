@@ -22,13 +22,12 @@ def resize_images(src_img_folder, dst_img_folder, max_resolution="512x512", divi
   if not os.path.exists(dst_img_folder):
     os.makedirs(dst_img_folder)
 
+  cv2_interpolation = cv2.INTER_AREA
   # Select interpolation method
   if interpolation == 'lanczos4':
     pil_interpolation = Image.LANCZOS
   elif interpolation == 'cubic':
     pil_interpolation = Image.BICUBIC
-  else:
-    cv2_interpolation = cv2.INTER_AREA
 
   # Iterate through all files in src_img_folder
   img_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp")                   # copy from train_util.py
