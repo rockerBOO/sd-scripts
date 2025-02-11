@@ -366,9 +366,9 @@ def load_safetensors(
             state_dict = load_file(path, device=device)
         except:
             state_dict = load_file(path)  # prevent device invalid Error
-        # if dtype is not None:
-        #     for key in state_dict.keys():
-        #         state_dict[key] = state_dict[key].to(dtype=dtype)
+        if dtype is not None:
+            for key in state_dict.keys():
+                state_dict[key] = state_dict[key].to(dtype=dtype)
         return state_dict
 
 
