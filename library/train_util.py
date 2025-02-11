@@ -5563,7 +5563,7 @@ def prepare_accelerator(args: argparse.Namespace):
         deepspeed_plugin=deepspeed_plugin,
         dataloader_config=dataloader_config
     )
-    logger.info("accelerator device:", accelerator.device)
+    logger.info(f"accelerator device: {accelerator.device}")
     return accelerator
 
 
