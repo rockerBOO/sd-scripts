@@ -365,9 +365,13 @@ class FluxImageEmbeddingCachingStrategy(ImageEmbeddingsCachingStrategy):
                 )
                 # TODO Make setting to toggle this
                 # Caching in memory as well
-                info.vision_encoder_outputs = (vis_embed, vis_id, vis_attn_mask)
+                info.vision_encoder_outputs = vis_embed
+                info.vision_encoder_ids_outputs = vis_id
+                info.vision_encoder_attn_masks_outputs = vis_attn_mask
             else:
-                info.vision_encoder_outputs = (vis_embed, vis_id, vis_attn_mask)
+                info.vision_encoder_outputs = vis_embed
+                info.vision_encoder_ids_outputs = vis_id
+                info.vision_encoder_attn_masks_outputs = vis_attn_mask
 
             
     def save_image_embeddings_to_disk(
