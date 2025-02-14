@@ -1444,7 +1444,7 @@ class NetworkTrainer:
                     rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                     val_progress_bar = tqdm(
-                        range(validation_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
+                        range(validation_total_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
                     )
                     val_ts_step = 0
                     for val_step, batch in enumerate(val_dataloader):
