@@ -2,6 +2,7 @@ Fork repo mixing my different PR's together for experimental testing
 
 ## PRs
 
+- https://github.com/kohya-ss/sd-scripts/pull/1903 Val loss improvement 
 - https://github.com/kohya-ss/sd-scripts/pull/1936 Add resize interpolation parameter
 - https://github.com/kohya-ss/sd-scripts/pull/1908 Move scale_weight_norms inside sync_gradients
 - https://github.com/kohya-ss/sd-scripts/pull/1894 Add pin_memory to DataLoader and update ImageInfo to support
