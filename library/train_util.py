@@ -207,6 +207,7 @@ class ImageInfo:
         self.text_encoder_pool2: Optional[torch.Tensor] = None
 
         self.alpha_mask: Optional[torch.Tensor] = None  # alpha mask can be flipped in runtime
+        self.resize_interpolation: Optional[str] = None
 
 
 class BucketManager:
@@ -431,6 +432,7 @@ class BaseSubset:
         custom_attributes: Optional[Dict[str, Any]] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
+        resize_interpolation: Optional[str] = None,
     ) -> None:
         self.image_dir = image_dir
         self.alpha_mask = alpha_mask if alpha_mask is not None else False
@@ -460,6 +462,8 @@ class BaseSubset:
 
         self.validation_seed = validation_seed
         self.validation_split = validation_split
+
+        self.resize_interpolation = resize_interpolation
 
 
 class DreamBoothSubset(BaseSubset):
@@ -492,6 +496,7 @@ class DreamBoothSubset(BaseSubset):
         custom_attributes: Optional[Dict[str, Any]] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
+        resize_interpolation: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -519,6 +524,7 @@ class DreamBoothSubset(BaseSubset):
             custom_attributes=custom_attributes,
             validation_seed=validation_seed,
             validation_split=validation_split,
+            resize_interpolation=resize_interpolation,
         )
 
         self.is_reg = is_reg
@@ -561,6 +567,7 @@ class FineTuningSubset(BaseSubset):
         custom_attributes: Optional[Dict[str, Any]] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
+        resize_interpolation: Optional[str] = None,
     ) -> None:
         assert metadata_file is not None, "metadata_file must be specified / metadata_fileは指定が必須です"
 
@@ -588,6 +595,7 @@ class FineTuningSubset(BaseSubset):
             custom_attributes=custom_attributes,
             validation_seed=validation_seed,
             validation_split=validation_split,
+            resize_interpolation=resize_interpolation,
         )
 
         self.metadata_file = metadata_file
@@ -626,6 +634,7 @@ class ControlNetSubset(BaseSubset):
         custom_attributes: Optional[Dict[str, Any]] = None,
         validation_seed: Optional[int] = None,
         validation_split: Optional[float] = 0.0,
+        resize_interpolation: Optional[str] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -653,6 +662,7 @@ class ControlNetSubset(BaseSubset):
             custom_attributes=custom_attributes,
             validation_seed=validation_seed,
             validation_split=validation_split,
+            resize_interpolation=resize_interpolation,
         )
 
         self.conditioning_data_dir = conditioning_data_dir
@@ -673,6 +683,7 @@ class BaseDataset(torch.utils.data.Dataset):
         resolution: Optional[Tuple[int, int]],
         network_multiplier: float,
         debug_dataset: bool,
+        resize_interpolation: Optional[str] = None
     ) -> None:
         super().__init__()
 
@@ -706,6 +717,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.aug_helper = AugHelper()
 
         self.image_transforms = IMAGE_TRANSFORMS
+
+        if resize_interpolation is not None:
+            assert validate_interpolation_fn(resize_interpolation), f"Resize interpolation \"{resize_interpolation}\" is not a valid interpolation"
+        self.resize_interpolation = resize_interpolation
 
         self.image_data: Dict[str, ImageInfo] = {}
         self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
@@ -1496,7 +1511,9 @@ class BaseDataset(torch.utils.data.Dataset):
         nh = int(height * scale + 0.5)
         nw = int(width * scale + 0.5)
         assert nh >= self.height and nw >= self.width, f"internal error. small scale {scale}, {width}*{height}"
-        image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
+        interpolation = get_cv2_interpolation(subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation)
+        logger.info(f"Interpolation: {interpolation}")
+        image = cv2.resize(image, (nw, nh), interpolation=interpolation if interpolation is not None else cv2.INTER_AREA)
         face_cx = int(face_cx * scale + 0.5)
         face_cy = int(face_cy * scale + 0.5)
         height, width = nh, nw
@@ -1593,7 +1610,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
-                        subset.random_crop, img, image_info.bucket_reso, image_info.resized_size
+                        subset.random_crop, img, image_info.bucket_reso, image_info.resized_size, resize_interpolation=image_info.resize_interpolation
                     )
                 else:
                     if face_cx > 0:  # 顔位置情報あり
@@ -1854,8 +1871,9 @@ class DreamBoothDataset(BaseDataset):
         debug_dataset: bool,
         validation_split: float,
         validation_seed: Optional[int],
+        resize_interpolation: Optional[str],
     ) -> None:
-        super().__init__(resolution, network_multiplier, debug_dataset)
+        super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
 
@@ -2082,6 +2100,7 @@ class DreamBoothDataset(BaseDataset):
 
             for img_path, caption, size in zip(img_paths, captions, sizes):
                 info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path)
+                info.resize_interpolation = subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 if size is not None:
                     info.image_size = size
                 if subset.is_reg:
@@ -2365,8 +2384,9 @@ class ControlNetDataset(BaseDataset):
         debug_dataset: bool,
         validation_split: float,
         validation_seed: Optional[int],        
+        resize_interpolation: Optional[str] = None,
     ) -> None:
-        super().__init__(resolution, network_multiplier, debug_dataset)
+        super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         db_subsets = []
         for subset in subsets:
@@ -2398,6 +2418,7 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
+                resize_interpolation=subset.resize_interpolation,
             )
             db_subsets.append(db_subset)
 
@@ -2416,6 +2437,7 @@ class ControlNetDataset(BaseDataset):
             debug_dataset,
             validation_split,
             validation_seed,
+            resize_interpolation,
         )
 
         # config_util等から参照される値をいれておく（若干微妙なのでなんとかしたい）
@@ -2425,6 +2447,7 @@ class ControlNetDataset(BaseDataset):
         self.num_reg_images = self.dreambooth_dataset_delegate.num_reg_images        
         self.validation_split = validation_split
         self.validation_seed = validation_seed 
+        self.resize_interpolation = resize_interpolation
 
         # assert all conditioning data exists
         missing_imgs = []
@@ -2512,8 +2535,10 @@ class ControlNetDataset(BaseDataset):
                 assert (
                     cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
                 ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
+
+                interpolation = get_cv2_interpolation(self.resize_interpolation)
                 cond_img = cv2.resize(
-                    cond_img, image_info.resized_size, interpolation=cv2.INTER_AREA
+                    cond_img, image_info.resized_size, interpolation=interpolation if interpolation is not None else cv2.INTER_AREA
                 )  # INTER_AREAでやりたいのでcv2でリサイズ
 
                 # TODO support random crop
@@ -2925,7 +2950,7 @@ def load_image(image_path, alpha=False):
 
 # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
 def trim_and_resize_if_required(
-    random_crop: bool, image: np.ndarray, reso, resized_size: Tuple[int, int]
+    random_crop: bool, image: np.ndarray, reso, resized_size: Tuple[int, int], resize_interpolation: Optional[str] = None
 ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int, int, int]]:
     image_height, image_width = image.shape[0:2]
     original_size = (image_width, image_height)  # size before resize
@@ -2933,7 +2958,8 @@ def trim_and_resize_if_required(
     if image_width != resized_size[0] or image_height != resized_size[1]:
         # リサイズする
         if image_width > resized_size[0] and image_height > resized_size[1]:
-            image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
+            interpolation = get_cv2_interpolation(resize_interpolation)
+            image = cv2.resize(image, resized_size, interpolation=interpolation if interpolation is not None else cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
         else:
             image = pil_resize(image, resized_size)
 
@@ -2980,7 +3006,7 @@ def load_images_and_masks_for_caching(
     for info in image_infos:
         image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
-        image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size)
+        image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation)
 
         original_sizes.append(original_size)
         crop_ltrbs.append(crop_ltrb)
@@ -3021,7 +3047,7 @@ def cache_batch_latents(
     for info in image_infos:
         image = load_image(info.absolute_path, use_alpha_mask) if info.image is None else np.array(info.image, np.uint8)
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
-        image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size)
+        image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size, resize_interpolation=info.resize_interpolation)
 
         info.latents_original_size = original_size
         info.latents_crop_ltrb = crop_ltrb
@@ -6528,3 +6554,29 @@ class LossRecorder:
         if losses == 0:
             return 0
         return self.loss_total / losses
+
+def get_cv2_interpolation(interpolation: Optional[str]) -> Optional[int]:
+    """
+    Convert interpolation ovalue to cv2 interpolation integer
+    """
+    if interpolation is None:
+        return None 
+
+    if interpolation == "lanczos":
+        return cv2.INTER_LANCZOS4
+    elif interpolation == "nearest":
+        return cv2.INTER_NEAREST
+    elif interpolation == "bilinear" or interpolation == "linear":
+        return cv2.INTER_LINEAR
+    elif interpolation == "bicubic" or interpolation == "cubic":
+        return cv2.INTER_CUBIC
+    elif interpolation == "area":
+        return cv2.INTER_AREA
+    else:
+        return None
+
+def validate_interpolation_fn(interpolation_str: str) -> bool:
+    """
+    Check if a interpolation function is supported
+    """
+    return interpolation_str in ["lanczos", "nearest", "bilinear", "linear", "bicubic", "cubic", "area"]
