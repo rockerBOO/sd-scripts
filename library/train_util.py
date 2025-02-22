@@ -14,7 +14,7 @@ import shutil
 import time
 import typing
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState, DataLoaderConfiguration
 import glob
 import math
 import os
@@ -2555,14 +2555,7 @@ class ControlNetDataset(BaseDataset):
                     cond_img.shape[0] == original_size_hw[0] and cond_img.shape[1] == original_size_hw[1]
                 ), f"size of conditioning image is not match / 画像サイズが合いません: {image_info.absolute_path}"
 
-<<<<<<< HEAD
-                interpolation = get_cv2_interpolation(self.resize_interpolation)
-                cond_img = cv2.resize(
-                    cond_img, image_info.resized_size, interpolation=interpolation if interpolation is not None else cv2.INTER_AREA
-                )  # INTER_AREAでやりたいのでcv2でリサイズ
-=======
                 cond_img = resize_image(cond_img, original_size_hw[1], original_size_hw[0], target_size_hw[1], target_size_hw[0], self.resize_interpolation)
->>>>>>> resize-interpolation
 
                 # TODO support random crop
                 # 現在サポートしているcropはrandomではなく中央のみ
@@ -2979,16 +2972,7 @@ def trim_and_resize_if_required(
     original_size = (image_width, image_height)  # size before resize
 
     if image_width != resized_size[0] or image_height != resized_size[1]:
-<<<<<<< HEAD
-        # リサイズする
-        if image_width > resized_size[0] and image_height > resized_size[1]:
-            interpolation = get_cv2_interpolation(resize_interpolation)
-            image = cv2.resize(image, resized_size, interpolation=interpolation if interpolation is not None else cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
-        else:
-            image = pil_resize(image, resized_size)
-=======
         image = resize_image(image, image_width, image_height, resized_size[0], resized_size[1], resize_interpolation)
->>>>>>> resize-interpolation
 
     image_height, image_width = image.shape[0:2]
 
@@ -6062,7 +6046,7 @@ def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler
     elif args.huber_schedule == "snr":
         if not hasattr(noise_scheduler, "alphas_cumprod"):
             raise NotImplementedError("Huber schedule 'snr' is not supported with the current model.")
-        alphas_cumprod = torch.index_select(noise_scheduler.alphas_cumprod, 0, timesteps.cpu())
+        alphas_cumprod = torch.index_select(noise_scheduler.alphas_cumprod, 0, timesteps)
         sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
         result = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
         result = result.to(timesteps.device)
@@ -6639,31 +6623,3 @@ class LossRecorder:
             return 0
         return self.loss_total / losses
 
-<<<<<<< HEAD
-def get_cv2_interpolation(interpolation: Optional[str]) -> Optional[int]:
-    """
-    Convert interpolation value to cv2 interpolation integer
-    """
-    if interpolation is None:
-        return None 
-
-    if interpolation == "lanczos":
-        return cv2.INTER_LANCZOS4
-    elif interpolation == "nearest":
-        return cv2.INTER_NEAREST
-    elif interpolation == "bilinear" or interpolation == "linear":
-        return cv2.INTER_LINEAR
-    elif interpolation == "bicubic" or interpolation == "cubic":
-        return cv2.INTER_CUBIC
-    elif interpolation == "area":
-        return cv2.INTER_AREA
-    else:
-        return None
-
-def validate_interpolation_fn(interpolation_str: str) -> bool:
-    """
-    Check if a interpolation function is supported
-    """
-    return interpolation_str in ["lanczos", "nearest", "bilinear", "linear", "bicubic", "cubic", "area"]
-=======
->>>>>>> resize-interpolation

@@ -1446,7 +1446,7 @@ class NetworkTrainer:
                                 mean_norm,
                                 maximum_norm,
                             )
-                            accelerator.log(logs, step=global_step)
+                            self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                         optimizer_eval_fn()
                         self.sample_images(
