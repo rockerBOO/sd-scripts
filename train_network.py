@@ -131,6 +131,45 @@ class NetworkTrainer:
 
         return logs
 
+    def step_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int):
+        self.accelerator_logging(accelerator, logs, global_step, global_step, epoch)
+
+    def epoch_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int):
+        self.accelerator_logging(accelerator, logs, epoch, global_step, epoch)
+
+    def val_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int, val_step: int):
+        self.accelerator_logging(accelerator, logs, global_step + val_step, global_step, epoch, val_step)
+
+    def accelerator_logging(
+        self, accelerator: Accelerator, logs: dict, step_value: int, global_step: int, epoch: int, val_step: Optional[int] = None
+    ):
+        """
+        step_value is for tensorboard, other values are for wandb
+        """
+        tensorboard_tracker = None
+        wandb_tracker = None
+        other_trackers = []
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                tensorboard_tracker = accelerator.get_tracker("tensorboard")
+            elif tracker.name == "wandb":
+                wandb_tracker = accelerator.get_tracker("wandb")
+            else:
+                other_trackers.append(accelerator.get_tracker(tracker.name))
+
+        if tensorboard_tracker is not None:
+            tensorboard_tracker.log(logs, step=step_value)
+
+        if wandb_tracker is not None:
+            logs["global_step"] = global_step
+            logs["epoch"] = epoch
+            if val_step is not None:
+                logs["val_step"] = val_step
+            wandb_tracker.log(logs)
+
+        for tracker in other_trackers:
+            tracker.log(logs, step=step_value)
+
     def assert_extra_args(
         self,
         args,
@@ -321,7 +360,10 @@ class NetworkTrainer:
     ) -> torch.nn.Module:
         return accelerator.prepare(unet)
 
-    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
+        pass
+
+    def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
 
     # endregion
@@ -1293,6 +1335,34 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+        def switch_rng_state(seed: int) -> tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]:
+            cpu_rng_state = torch.get_rng_state()
+            if accelerator.device.type == "cuda":
+                gpu_rng_state = torch.cuda.get_rng_state()
+            elif accelerator.device.type == "xpu":
+                gpu_rng_state = torch.xpu.get_rng_state()
+            elif accelerator.device.type == "mps":
+                gpu_rng_state = torch.cuda.get_rng_state()
+            else:
+                gpu_rng_state = None
+            python_rng_state = random.getstate()
+
+            torch.manual_seed(seed)
+            random.seed(seed)
+
+            return (cpu_rng_state, gpu_rng_state, python_rng_state)
+
+        def restore_rng_state(rng_states: tuple[torch.ByteTensor, Optional[torch.ByteTensor], tuple]):
+            cpu_rng_state, gpu_rng_state, python_rng_state = rng_states
+            torch.set_rng_state(cpu_rng_state)
+            if gpu_rng_state is not None:
+                if accelerator.device.type == "cuda":
+                    torch.cuda.set_rng_state(gpu_rng_state)
+                elif accelerator.device.type == "xpu":
+                    torch.xpu.set_rng_state(gpu_rng_state)
+                elif accelerator.device.type == "mps":
+                    torch.cuda.set_rng_state(gpu_rng_state)
+            random.setstate(python_rng_state)
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}\n")
@@ -1317,8 +1387,8 @@ class NetworkTrainer:
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
-                    # temporary, for batch processing
-                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                    # preprocess batch for each model
+                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
                     loss = self.process_batch(
                         batch,
@@ -1410,23 +1480,73 @@ class NetworkTrainer:
                     and global_step != 0  # Skip first step
                     and global_step % args.validate_every_n_steps == 0
                 )
+                if args.scale_weight_norms:
+                    keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
+                        args.scale_weight_norms, accelerator.device
+                    )
+                    max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
+                else:
+                    keys_scaled, mean_norm, maximum_norm = None, None, None
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    global_step += 1
+
+                    optimizer_eval_fn()
+                    self.sample_images(
+                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                    )
+
+                    # 指定ステップごとにモデルを保存
+                    if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+
+                            if args.save_state:
+                                train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                            remove_step_no = train_util.get_remove_step_no(args, global_step)
+                            if remove_step_no is not None:
+                                remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                                remove_model(remove_ckpt_name)
+                    optimizer_train_fn()
+
+                current_loss = loss.detach().item()
+                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+
+                if args.scale_weight_norms:
+                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
+
+                if is_tracking:
+                    logs = self.generate_step_logs(
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                    )
+                    self.step_logging(accelerator, logs, global_step, epoch + 1)
+
+                # VALIDATION PER STEP: global_step is already incremented
+                # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
+                should_validate_step = args.validate_every_n_steps is not None and global_step % args.validate_every_n_steps == 0
                 if accelerator.sync_gradients and validation_steps > 0 and should_validate_step:
                     optimizer_eval_fn()
                     accelerator.unwrap_model(network).eval()
-                    rng_state = torch.get_rng_state()
-                    torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                    rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                     val_progress_bar = tqdm(
                         range(validation_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
                     )
-                    val_ts_step = 0
+                    val_timesteps_step = 0
                     for val_step, batch in enumerate(val_dataloader):
                         if val_step >= validation_steps:
                             break
 
                         for timestep in validation_timesteps:
-                            # temporary, for batch processing
-                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                            self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
@@ -1449,20 +1569,18 @@ class NetworkTrainer:
                             )
 
                             current_loss = loss.detach().item()
-                            val_step_loss_recorder.add(epoch=epoch, step=val_ts_step, loss=current_loss)
+                            val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
                                 {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
                             )
 
-                            if is_tracking:
-                                logs = {
-                                    "loss/validation/step_current": current_loss,
-                                    "val_step": (epoch * validation_total_steps) + val_ts_step,
-                                }
-                                accelerator.log(logs, step=global_step)
+                            # if is_tracking:
+                            #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
+                            #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
 
-                            val_ts_step += 1
+                            self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                            val_timesteps_step += 1
 
                     if is_tracking:
                         loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
@@ -1470,13 +1588,14 @@ class NetworkTrainer:
                             "loss/validation/step_average": val_step_loss_recorder.moving_average,
                             "loss/validation/step_divergence": loss_validation_divergence,
                         }
-                        accelerator.log(logs, step=global_step)
+                        self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
 
-                    torch.set_rng_state(rng_state)
+                    restore_rng_state(rng_states)
                     args.min_timestep = original_args_min_timestep
                     args.max_timestep = original_args_max_timestep
                     optimizer_train_fn()
                     accelerator.unwrap_model(network).train()
+                    progress_bar.unpause()
 
                 if global_step >= args.max_train_steps:
                     break
@@ -1489,8 +1608,7 @@ class NetworkTrainer:
             if should_validate_epoch and len(val_dataloader) > 0:
                 optimizer_eval_fn()
                 accelerator.unwrap_model(network).eval()
-                rng_state = torch.get_rng_state()
-                torch.manual_seed(args.validation_seed if args.validation_seed is not None else args.seed)
+                rng_states = switch_rng_state(args.validation_seed if args.validation_seed is not None else args.seed)
 
                 val_progress_bar = tqdm(
                     range(validation_total_steps),
@@ -1499,7 +1617,7 @@ class NetworkTrainer:
                     desc="epoch validation steps",
                 )
 
-                val_ts_step = 0
+                val_timesteps_step = 0
                 for val_step, batch in enumerate(val_dataloader):
                     if val_step >= validation_steps:
                         break
@@ -1508,7 +1626,7 @@ class NetworkTrainer:
                         args.min_timestep = args.max_timestep = timestep
 
                         # temporary, for batch processing
-                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                        self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
                         loss = self.process_batch(
                             batch,
@@ -1529,42 +1647,39 @@ class NetworkTrainer:
                         )
 
                         current_loss = loss.detach().item()
-                        val_epoch_loss_recorder.add(epoch=epoch, step=val_ts_step, loss=current_loss)
+                        val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
                         val_progress_bar.update(1)
                         val_progress_bar.set_postfix(
                             {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
                         )
 
-                        if is_tracking:
-                            logs = {
-                                "loss/validation/epoch_current": current_loss,
-                                "epoch": epoch + 1,
-                                "val_step": (epoch * validation_total_steps) + val_ts_step,
-                            }
-                            accelerator.log(logs, step=global_step)
+                        # if is_tracking:
+                        #     logs = {f"loss/validation/epoch_current_{timestep}": current_loss}
+                        #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
 
-                        val_ts_step += 1
+                        self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
+                        val_timesteps_step += 1
 
                 if is_tracking:
                     avr_loss: float = val_epoch_loss_recorder.moving_average
-                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average 
+                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
                     logs = {
                         "loss/validation/epoch_average": avr_loss,
                         "loss/validation/epoch_divergence": loss_validation_divergence,
-                        "epoch": epoch + 1,
                     }
-                    accelerator.log(logs, step=global_step)
+                    self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
-                torch.set_rng_state(rng_state)
+                restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
                 args.max_timestep = original_args_max_timestep
                 optimizer_train_fn()
                 accelerator.unwrap_model(network).train()
+                progress_bar.unpause()
 
             # END OF EPOCH
             if is_tracking:
-                logs = {"loss/epoch_average": loss_recorder.moving_average, "epoch": epoch + 1}
-                accelerator.log(logs, step=global_step)
+                logs = {"loss/epoch_average": loss_recorder.moving_average}
+                self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
             accelerator.wait_for_everyone()
 
