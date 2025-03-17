@@ -97,7 +97,7 @@ def batchify(
                 start = end
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def sample_images(
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -244,7 +244,7 @@ def sample_images(
     clean_memory_on_device(accelerator.device)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def sample_image_inference(
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -305,6 +305,8 @@ def sample_image_inference(
     if seed is not None:
         generator.manual_seed(seed)
 
+    prompts = []
+
     for prompt_dict in prompt_dicts:
         controlnet_image = prompt_dict.get("controlnet_image")
         prompt: str = prompt_dict.get("prompt", "")
@@ -317,6 +319,8 @@ def sample_image_inference(
                 negative_prompt = negative_prompt.replace(
                     prompt_replacement[0], prompt_replacement[1]
                 )
+
+        prompts.append(prompt)
 
         if negative_prompt is None:
             negative_prompt = ""
@@ -436,7 +440,7 @@ def sample_image_inference(
     clean_memory_on_device(accelerator.device)
     org_vae_device = vae.device  # will be on cpu
     vae.to(accelerator.device)  # distributed_state.device is same as accelerator.device
-    for img, prompt_dict in zip(x, prompt_dicts):
+    for img, prompt_dict, prompt in zip(x, prompt_dicts, prompts):
 
         img = (img / vae.scale_factor) + vae.shift_factor
 

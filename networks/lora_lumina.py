@@ -7,6 +7,10 @@
 # https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
+import time
+from functools import wraps
+from contextlib import contextmanager
+from torch.profiler import profile, record_function, ProfilerActivity
 import math
 import os
 from typing import Dict, List, Optional, Tuple, Type, Union
@@ -21,6 +25,62 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+@contextmanager
+def timer(label):
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"{label} took {elapsed_time:.3f} seconds to execute")
+
+def timer_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"{func.__name__} took {elapsed_time:.3f} seconds to execute")
+        return result
+    return wrapper
+
+@contextmanager
+def temp_random_seed(seed, device=None):
+    """
+    Context manager that temporarily sets a specific random seed and then
+    restores the original RNG state afterward.
+    
+    Args:
+        seed (int): The random seed to set temporarily
+        device (torch.device, optional): The device to set the seed for.
+            If None, will detect from the current context.
+    """
+    # Save original RNG states
+    original_cpu_rng_state = torch.get_rng_state()
+    original_cuda_rng_states = None
+    if torch.cuda.is_available():
+        original_cuda_rng_states = torch.cuda.get_rng_state_all()
+    
+    # Determine if we need to set CUDA seed
+    set_cuda = False
+    if device is not None:
+        set_cuda = device.type == 'cuda'
+    elif torch.cuda.is_available():
+        set_cuda = True
+        
+    try:
+        # Set the temporary seed
+        torch.manual_seed(seed)
+        if set_cuda:
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        # Restore original RNG states
+        torch.set_rng_state(original_cpu_rng_state)
+        if torch.cuda.is_available() and original_cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(original_cuda_rng_states)
 
 class LoRAModule(torch.nn.Module):
     """
@@ -38,6 +98,8 @@ class LoRAModule(torch.nn.Module):
         rank_dropout: Optional[float] = None,
         module_dropout: Optional[float] = None,
         split_dims: Optional[List[int]] = None,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -58,35 +120,28 @@ class LoRAModule(torch.nn.Module):
         assert isinstance(out_dim, int)
 
         self.lora_dim = lora_dim
+
         self.split_dims = split_dims
 
         if split_dims is None:
-            if org_module.__class__.__name__ == "Conv2d":
-                kernel_size = org_module.kernel_size
-                stride = org_module.stride
-                padding = org_module.padding
-                self.lora_down = nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
-                self.lora_up = nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=False)
-            else:
-                self.lora_down = nn.Linear(in_dim, self.lora_dim, bias=False)
-                self.lora_up = nn.Linear(self.lora_dim, out_dim, bias=False)
+            self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
+            self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
 
-            nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_up.weight)
+            torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+            torch.nn.init.zeros_(self.lora_up.weight)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
             assert org_module.__class__.__name__ == "Linear", "split_dims is only supported for Linear"
             # print(f"split_dims: {split_dims}")
-            self.lora_down = nn.ModuleList(
-                [nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
+            self.lora_down = torch.nn.ModuleList(
+                [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
-            self.lora_up = nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-
+            self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
             for lora_down in self.lora_down:
-                nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
+                torch.nn.init.kaiming_uniform_(lora_down.weight, a=math.sqrt(5))
             for lora_up in self.lora_up:
-                nn.init.zeros_(lora_up.weight)
+                torch.nn.init.zeros_(lora_up.weight)
 
         if isinstance(alpha, Tensor):
             alpha = alpha.detach().cpu().float().item()  # without casting, bf16 causes error
@@ -101,9 +156,17 @@ class LoRAModule(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
+        self.ggpo_sigma = ggpo_sigma
+        self.ggpo_beta = ggpo_beta
+
+        self.perturbation_norm_factor = 1.0 / math.sqrt(org_module.weight.shape[0])
+
+
     def apply_to(self):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
+
+        self._org_module_weight = self.org_module.weight.detach().to(device=self.lora_down.weight.device, dtype=self.lora_down.weight.dtype)
         del self.org_module
 
     def forward(self, x):
@@ -138,7 +201,18 @@ class LoRAModule(torch.nn.Module):
 
             lx = self.lora_up(lx)
 
-            return org_forwarded + lx * self.multiplier * scale
+            # LoRA Gradient-Guided Perturbation Optimization
+            if self.training and hasattr(self, 'perturbation_seed') and self.ggpo_sigma is not None and self.ggpo_beta is not None:
+                perturbation_seed = torch.randint(0, 2**32 - 1, (1,)).detach().item()
+                with torch.no_grad(), temp_random_seed(perturbation_seed):
+                    perturbation_scale = (self.ggpo_sigma * torch.sqrt(self.combined_weight_norms ** 2)) + (self.ggpo_beta * (self.grad_norms ** 2))
+                    perturbation_scale_factor = (perturbation_scale * self.perturbation_norm_factor).to(self.device)
+                    perturbation = torch.randn_like(self._org_module_weight,  dtype=self.dtype, device=self.device)
+                    perturbation.mul_(perturbation_scale_factor)
+                    perturbation_output = x @ perturbation.T  # Result: (batch × n)
+                return org_forwarded + (self.multiplier * scale * lx) + perturbation_output
+            else:
+                return org_forwarded + lx * self.multiplier * scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
 
@@ -165,6 +239,57 @@ class LoRAModule(torch.nn.Module):
 
             return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
 
+    @torch.no_grad()
+    def update_norms(self):
+        # Not running GGPO so not currently running update norms
+        if self.ggpo_beta is None or self.ggpo_sigma is None:
+            return
+
+        # only update norms when we are training 
+        if self.training is False:
+            print(f"skipping update_norms for {self.lora_name}")
+            return
+
+        with torch.autocast(self.device.type):
+            module_weights = self.lora_up.weight @ self.lora_down.weight
+            module_weights.mul(self.scale)
+            org_device = self._org_module_weight.device
+            org_weight = self._org_module_weight.to(device=self.device)
+            combined_weight = org_weight + module_weights
+
+            self.weight_norms = torch.norm(module_weights, dim=1, keepdim=True)
+            self.combined_weight_norms = torch.norm(combined_weight, dim=1, keepdim=True)
+
+            self._org_module_weight.to(device=org_device)
+
+    @torch.no_grad()
+    def update_grad_norms(self):
+        if self.training is False:
+            print(f"skipping update_grad_norms for {self.lora_name}")
+            return
+
+        lora_down_grad = None
+        lora_up_grad = None
+
+        for name, param in self.named_parameters():
+            if name == "lora_down.weight":
+                lora_down_grad = param.grad
+            elif name == "lora_up.weight":
+                lora_up_grad = param.grad
+
+        # Calculate gradient norms if we have both gradients
+        if lora_down_grad is not None and lora_up_grad is not None:
+            with torch.autocast(self.device.type):
+                approx_grad = self.scale * ((self.lora_up.weight @ lora_down_grad) + (lora_up_grad @ self.lora_down.weight))
+                self.grad_norms = torch.norm(approx_grad, dim=1, keepdim=True)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
 
 class LoRAInfModule(LoRAModule):
     def __init__(
@@ -364,6 +489,15 @@ def create_network(
     if split_qkv is not None:
         split_qkv = True if split_qkv == "True" else False
 
+    ggpo_beta = kwargs.get("ggpo_beta", None)
+    ggpo_sigma = kwargs.get("ggpo_sigma", None)
+
+    if ggpo_beta is not None:
+        ggpo_beta = float(ggpo_beta)
+
+    if ggpo_sigma is not None:
+        ggpo_sigma = float(ggpo_sigma)
+
     # verbose
     verbose = kwargs.get("verbose", False)
     if verbose is not None:
@@ -385,6 +519,8 @@ def create_network(
         split_qkv=split_qkv,
         type_dims=type_dims,
         embedder_dims=embedder_dims,
+        ggpo_beta=ggpo_beta,
+        ggpo_sigma=ggpo_sigma,
         verbose=verbose,
     )
 
@@ -484,6 +620,8 @@ class LoRANetwork(torch.nn.Module):
         type_dims: Optional[List[int]] = None,
         embedder_dims: Optional[List[int]] = None,
         train_block_indices: Optional[List[bool]] = None,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
         verbose: Optional[bool] = False,
     ) -> None:
         super().__init__()
@@ -525,6 +663,12 @@ class LoRANetwork(torch.nn.Module):
             logger.info(f"split qkv for LoRA")
         if self.train_blocks is not None:
             logger.info(f"train {self.train_blocks} blocks only")
+
+        if ggpo_beta is not None and ggpo_sigma is not None:
+            logger.info(f"LoRA-GGPO training sigma: {ggpo_sigma} beta: {ggpo_beta}")
+        else:
+            print("ggpo beta", ggpo_beta)
+            print("ggpo_sigma", ggpo_sigma)
 
         # create module instances
         def create_modules(
@@ -613,6 +757,8 @@ class LoRANetwork(torch.nn.Module):
                             dropout=dropout,
                             rank_dropout=rank_dropout,
                             module_dropout=module_dropout,
+                            ggpo_beta=ggpo_beta,
+                            ggpo_sigma=ggpo_sigma,
                         )
                         loras.append(lora)
 
@@ -679,6 +825,35 @@ class LoRANetwork(torch.nn.Module):
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
+
+    def update_norms(self):
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.update_norms()
+
+    def update_grad_norms(self):
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.update_grad_norms()
+
+    def grad_norms(self) -> Tensor:
+        grad_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "grad_norms"):
+                grad_norms.append(lora.grad_norms.mean(dim=0))
+        return torch.stack(grad_norms) if len(grad_norms) > 0 else torch.tensor([])
+
+    def weight_norms(self) -> Tensor:
+        weight_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "weight_norms"):
+                weight_norms.append(lora.weight_norms.mean(dim=0))
+        return torch.stack(weight_norms) if len(weight_norms) > 0 else torch.tensor([])
+
+    def combined_weight_norms(self) -> Tensor:
+        combined_weight_norms = []
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if hasattr(lora, "combined_weight_norms"):
+                combined_weight_norms.append(lora.combined_weight_norms.mean(dim=0))
+        return torch.stack(combined_weight_norms) if len(combined_weight_norms) > 0 else torch.tensor([])
 
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":
@@ -1021,7 +1196,8 @@ class LoRANetwork(torch.nn.Module):
 
             updown *= scale
 
-            norm = updown.norm().clamp(min=max_norm_value / 2)
+            updown_norm = updown.norm()
+            norm = updown_norm.clamp(min=max_norm_value / 2)
             desired = torch.clamp(norm, max=max_norm_value)
             ratio = desired.cpu() / norm.cpu()
             sqrt_ratio = ratio**0.5
@@ -1029,7 +1205,7 @@ class LoRANetwork(torch.nn.Module):
                 keys_scaled += 1
                 state_dict[upkeys[i]] *= sqrt_ratio
                 state_dict[downkeys[i]] *= sqrt_ratio
-            scalednorm = updown.norm() * ratio
+            scalednorm = updown_norm * ratio
             norms.append(scalednorm.item())
 
         return keys_scaled, sum(norms) / len(norms), max(norms)
