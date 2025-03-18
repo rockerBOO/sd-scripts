@@ -20,6 +20,95 @@ import torch
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 
+init_ipex()
+
+from accelerate.utils import set_seed
+from accelerate import Accelerator
+from diffusers import DDPMScheduler
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+from library import deepspeed_utils, model_util, strategy_base, strategy_sd
+
+import library.train_util as train_util
+from library.train_util import DreamBoothDataset
+import library.config_util as config_util
+from library.config_util import (
+    ConfigSanitizer,
+    BlueprintGenerator,
+)
+import library.huggingface_util as huggingface_util
+import library.custom_train_functions as custom_train_functions
+from library.custom_train_functions import (
+    apply_snr_weight,
+    get_weighted_text_embeddings,
+    prepare_scheduler_for_custom_training,
+    scale_v_prediction_loss_like_noise_prediction,
+    add_v_prediction_like_loss,
+    apply_debiased_estimation,
+    apply_masked_loss,
+)
+from library.utils import setup_logging, add_logging_arguments
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class NetworkTrainer:
+    def __init__(self):
+        self.vae_scale_factor = 0.18215
+        self.is_sdxl = False
+
+    # TODO 他のスクリプトと共通化する
+    def generate_step_logs(
+        self,
+        args: argparse.Namespace,
+        current_loss,
+        avr_loss,
+        lr_scheduler,
+        lr_descriptions,
+        optimizer=None,
+        keys_scaled=None,
+        mean_norm=None,
+        maximum_norm=None,
+        mean_grad_norm=None,
+        mean_combined_norm=None
+    ):
+        logs = {"loss/current": current_loss, "loss/average": avr_loss}
+
+        if keys_scaled is not None:
+            logs["max_norm/keys_scaled"] = keys_scaled
+            logs["max_norm/max_key_norm"] = maximum_norm
+        if mean_norm is not None:
+            logs["norm/avg_key_norm"] = mean_norm
+        if mean_grad_norm is not None:
+            logs["norm/avg_grad_norm"] = mean_grad_norm
+        if mean_combined_norm is not None:
+            logs["norm/avg_combined_norm"] = mean_combined_norm
+
+        lrs = lr_scheduler.get_last_lr()
+        for i, lr in enumerate(lrs):
+            if lr_descriptions is not None:
+                lr_desc = lr_descriptions[i]
+            else:
+                idx = i - (0 if args.network_train_unet_only else -1)
+                if idx == -1:
+                    lr_desc = "textencoder"
+                else:
+                    if len(lrs) > 2:
+                        lr_desc = f"group{idx}"
+                    else:
+                        lr_desc = "unet"
+
+            logs[f"lr/{lr_desc}"] = lr
+
+            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                # tracking d*lr value
+                logs[f"lr/d*lr/{lr_desc}"] = (
+                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
+                )
+            if (
+                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
             ):  # tracking d*lr value of unet.
                 logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
         else:
@@ -1339,62 +1428,75 @@ from library.device_utils import init_ipex, clean_memory_on_device
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        max_mean_logs = {}
-                        if args.scale_weight_norms:
-                            keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
-                                args.scale_weight_norms, accelerator.device
-                            )
-                            max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
-                        else:
-                            keys_scaled, mean_norm, maximum_norm = None, None, None
-
-                        current_loss = loss.detach().item()
-                        loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                        avr_loss: float = loss_recorder.moving_average
-                        logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                        progress_bar.set_postfix(**{**max_mean_logs, **logs})
-                        progress_bar.update(1)
-                        global_step += 1
-
-                        if is_tracking:
-                            logs = self.generate_step_logs(
-                                args,
-                                current_loss,
-                                avr_loss,
-                                lr_scheduler,
-                                lr_descriptions,
-                                optimizer,
-                                keys_scaled,
-                                mean_norm,
-                                maximum_norm,
-                            )
-                            accelerator.log(logs, step=global_step)
-
-                        optimizer_eval_fn()
-                        self.sample_images(
-                            accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
-                        )
-
-                        # 指定ステップごとにモデルを保存
-                        if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
-                            accelerator.wait_for_everyone()
-                            if accelerator.is_main_process:
-                                ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
-
-                                if args.save_state:
-                                    train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
-
-                                remove_step_no = train_util.get_remove_step_no(args, global_step)
-                                if remove_step_no is not None:
-                                    remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
-                                    remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
+                        if hasattr(network, "update_grad_norms"):
+                            network.update_grad_norms()
+                        if hasattr(network, "update_norms"):
+                            network.update_norms()
 
 
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                if args.scale_weight_norms:
+                    keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
+                        args.scale_weight_norms, accelerator.device
+                    )
+                    mean_grad_norm = None
+                    mean_combined_norm = None
+                    max_mean_logs = {"Keys Scaled": keys_scaled, "Average key norm": mean_norm}
+                else:
+                    if hasattr(network, "weight_norms"):
+                        mean_norm = network.weight_norms().mean().item()
+                        mean_grad_norm = network.grad_norms().mean().item()
+                        mean_combined_norm = network.combined_weight_norms().mean().item()
+                        weight_norms = network.weight_norms()
+                        maximum_norm = weight_norms.max().item() if weight_norms.numel() > 0 else None
+                        keys_scaled = None
+                        max_mean_logs = {"avg weight norm": mean_norm, "avg grad norm": mean_grad_norm, "avg comb norm": mean_combined_norm}
+                    else:
+                        keys_scaled, mean_norm, maximum_norm = None, None, None
+                        mean_grad_norm = None
+                        mean_combined_norm = None
+                        max_mean_logs = {}
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    global_step += 1
+
+                    optimizer_eval_fn()
+                    self.sample_images(
+                        accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
+                    )
+
+                    # 指定ステップごとにモデルを保存
+                    if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+
+                            if args.save_state:
+                                train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+
+                            remove_step_no = train_util.get_remove_step_no(args, global_step)
+                            if remove_step_no is not None:
+                                remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
+                                remove_model(remove_ckpt_name)
+                    optimizer_train_fn()
+
+                current_loss = loss.detach().item()
+                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                avr_loss: float = loss_recorder.moving_average
+                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**{**max_mean_logs, **logs})
+
+                if is_tracking:
+                    logs = self.generate_step_logs(
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm, mean_grad_norm, mean_combined_norm
+                    )
+                    self.step_logging(accelerator, logs, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
                 # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
