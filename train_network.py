@@ -20,88 +20,6 @@ import torch
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 
-init_ipex()
-
-from accelerate.utils import set_seed
-from accelerate import Accelerator
-from diffusers import DDPMScheduler
-from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from library import deepspeed_utils, model_util, strategy_base, strategy_sd
-
-import library.train_util as train_util
-from library.train_util import DreamBoothDataset
-import library.config_util as config_util
-from library.config_util import (
-    ConfigSanitizer,
-    BlueprintGenerator,
-)
-import library.huggingface_util as huggingface_util
-import library.custom_train_functions as custom_train_functions
-from library.custom_train_functions import (
-    apply_snr_weight,
-    get_weighted_text_embeddings,
-    prepare_scheduler_for_custom_training,
-    scale_v_prediction_loss_like_noise_prediction,
-    add_v_prediction_like_loss,
-    apply_debiased_estimation,
-    apply_masked_loss,
-)
-from library.utils import setup_logging, add_logging_arguments
-
-setup_logging()
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-class NetworkTrainer:
-    def __init__(self):
-        self.vae_scale_factor = 0.18215
-        self.is_sdxl = False
-
-    # TODO 他のスクリプトと共通化する
-    def generate_step_logs(
-        self,
-        args: argparse.Namespace,
-        current_loss,
-        avr_loss,
-        lr_scheduler,
-        lr_descriptions,
-        optimizer=None,
-        keys_scaled=None,
-        mean_norm=None,
-        maximum_norm=None,
-    ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
-
-        if keys_scaled is not None:
-            logs["max_norm/keys_scaled"] = keys_scaled
-            logs["max_norm/average_key_norm"] = mean_norm
-            logs["max_norm/max_key_norm"] = maximum_norm
-
-        lrs = lr_scheduler.get_last_lr()
-        for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
-                lr_desc = lr_descriptions[i]
-            else:
-                idx = i - (0 if args.network_train_unet_only else -1)
-                if idx == -1:
-                    lr_desc = "textencoder"
-                else:
-                    if len(lrs) > 2:
-                        lr_desc = f"group{idx}"
-                    else:
-                        lr_desc = "unet"
-
-            logs[f"lr/{lr_desc}"] = lr
-
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
-                # tracking d*lr value
-                logs[f"lr/d*lr/{lr_desc}"] = (
-                    lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                )
-            if (
-                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
             ):  # tracking d*lr value of unet.
                 logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
         else:
@@ -130,6 +48,45 @@ class NetworkTrainer:
 
 
         return logs
+
+    def step_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int):
+        self.accelerator_logging(accelerator, logs, global_step, global_step, epoch)
+
+    def epoch_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int):
+        self.accelerator_logging(accelerator, logs, epoch, global_step, epoch)
+
+    def val_logging(self, accelerator: Accelerator, logs: dict, global_step: int, epoch: int, val_step: int):
+        self.accelerator_logging(accelerator, logs, global_step + val_step, global_step, epoch, val_step)
+
+    def accelerator_logging(
+        self, accelerator: Accelerator, logs: dict, step_value: int, global_step: int, epoch: int, val_step: Optional[int] = None
+    ):
+        """
+        step_value is for tensorboard, other values are for wandb
+        """
+        tensorboard_tracker = None
+        wandb_tracker = None
+        other_trackers = []
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                tensorboard_tracker = accelerator.get_tracker("tensorboard")
+            elif tracker.name == "wandb":
+                wandb_tracker = accelerator.get_tracker("wandb")
+            else:
+                other_trackers.append(accelerator.get_tracker(tracker.name))
+
+        if tensorboard_tracker is not None:
+            tensorboard_tracker.log(logs, step=step_value)
+
+        if wandb_tracker is not None:
+            logs["global_step"] = global_step
+            logs["epoch"] = epoch
+            if val_step is not None:
+                logs["val_step"] = val_step
+            wandb_tracker.log(logs)
+
+        for tracker in other_trackers:
+            tracker.log(logs, step=step_value)
 
     def assert_extra_args(
         self,
@@ -1282,6 +1239,10 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        progress_bar = tqdm(
+            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+        )
+
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
         )
@@ -1446,7 +1407,7 @@ class NetworkTrainer:
                     val_progress_bar = tqdm(
                         range(validation_total_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="validation steps"
                     )
-                    val_ts_step = 0
+                    val_timesteps_step = 0
                     for val_step, batch in enumerate(val_dataloader):
                         if val_step >= validation_steps:
                             break
@@ -1475,21 +1436,18 @@ class NetworkTrainer:
                             )
 
                             current_loss = loss.detach().item()
-                            val_step_loss_recorder.add(epoch=epoch, step=val_ts_step, loss=current_loss)
+                            val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
                                 {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
                             )
 
-                            if is_tracking:
-                                logs = {
-                                    "loss/validation/step_current": current_loss,
-                                    "val_step": (epoch * validation_total_steps) + val_ts_step,
-                                }
-                                accelerator.log(logs, step=global_step)
+                            # if is_tracking:
+                            #     logs = {f"loss/validation/step_current_{timestep}": current_loss}
+                            #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
 
                             self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                            val_ts_step += 1
+                            val_timesteps_step += 1
 
                     if is_tracking:
                         loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
@@ -1497,7 +1455,7 @@ class NetworkTrainer:
                             "loss/validation/step_average": val_step_loss_recorder.moving_average,
                             "loss/validation/step_divergence": loss_validation_divergence,
                         }
-                        accelerator.log(logs, step=global_step)
+                        self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
 
                     restore_rng_state(rng_states)
                     args.min_timestep = original_args_min_timestep
@@ -1526,7 +1484,7 @@ class NetworkTrainer:
                     desc="epoch validation steps",
                 )
 
-                val_ts_step = 0
+                val_timesteps_step = 0
                 for val_step, batch in enumerate(val_dataloader):
                     if val_step >= validation_steps:
                         break
@@ -1556,32 +1514,27 @@ class NetworkTrainer:
                         )
 
                         current_loss = loss.detach().item()
-                        val_epoch_loss_recorder.add(epoch=epoch, step=val_ts_step, loss=current_loss)
+                        val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
                         val_progress_bar.update(1)
                         val_progress_bar.set_postfix(
                             {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
                         )
 
-                        if is_tracking:
-                            logs = {
-                                "loss/validation/epoch_current": current_loss,
-                                "epoch": epoch + 1,
-                                "val_step": (epoch * validation_total_steps) + val_ts_step,
-                            }
-                            accelerator.log(logs, step=global_step)
+                        # if is_tracking:
+                        #     logs = {f"loss/validation/epoch_current_{timestep}": current_loss}
+                        #     self.val_logging(accelerator, logs, global_step, epoch + 1, val_step)
 
                         self.on_validation_step_end(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
-                        val_ts_step += 1
+                        val_timesteps_step += 1
 
                 if is_tracking:
                     avr_loss: float = val_epoch_loss_recorder.moving_average
-                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - avr_loss 
+                    loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
                     logs = {
                         "loss/validation/epoch_average": avr_loss,
                         "loss/validation/epoch_divergence": loss_validation_divergence,
-                        "epoch": epoch + 1,
                     }
-                    accelerator.log(logs, step=global_step)
+                    self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
                 restore_rng_state(rng_states)
                 args.min_timestep = original_args_min_timestep
@@ -1592,8 +1545,8 @@ class NetworkTrainer:
 
             # END OF EPOCH
             if is_tracking:
-                logs = {"loss/epoch_average": loss_recorder.moving_average, "epoch": epoch + 1}
-                accelerator.log(logs, step=global_step)
+                logs = {"loss/epoch_average": loss_recorder.moving_average}
+                self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
             accelerator.wait_for_everyone()
 
