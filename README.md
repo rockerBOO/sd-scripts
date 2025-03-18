@@ -8,6 +8,9 @@ Fork repo mixing my different PR's together for experimental testing
 - https://github.com/kohya-ss/sd-scripts/pull/1894 Add pin_memory to DataLoader and update ImageInfo to support
 - https://github.com/kohya-ss/sd-scripts/pull/1873 Add scale map to apply_max_norm_regularization
 - https://github.com/kohya-ss/sd-scripts/pull/1870 Add rank_stabilized for networks
+- https://github.com/kohya-ss/sd-scripts/pull/1991 Support alpha cumulative product using shifted sigmas for Flux
+- https://github.com/kohya-ss/sd-scripts/pull/1992 Add IP noise gamma for Flux
+- https://github.com/kohya-ss/sd-scripts/pull/1974 Add LoRA-GGPO for Flux
 
 ## Merged PRs
 
