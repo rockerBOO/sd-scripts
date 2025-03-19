@@ -82,7 +82,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
-        rank_stabilized: Optional[bool] = False
+        rank_stabilized: Optional[bool] = False,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
     ):
