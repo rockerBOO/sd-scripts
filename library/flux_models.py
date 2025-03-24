@@ -512,9 +512,12 @@ class EmbedND(nn.Module):
         self.axes_dim = axes_dim
 
     def forward(self, ids: Tensor, scale=1.0) -> Tensor:
+        """
+        scale: NTK factor for increasing the embedding space for large images
+        """
         n_axes = ids.shape[-1]
         emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta*scale) for i in range(n_axes)],
+            [rope(ids[..., i], self.axes_dim[i], self.theta * scale) for i in range(n_axes)],
             dim=-3,
         )
 
@@ -723,7 +726,16 @@ class DoubleStreamBlock(nn.Module):
             # F.scaled_dot_product_attention expects attn_mask to be bool for binary mask
             attn_mask = txt_attention_mask.to(torch.bool)  # b, seq_len
             attn_mask = torch.cat(
-                (attn_mask, torch.ones(attn_mask.shape[0], img.shape[1], device=attn_mask.device, dtype=torch.bool)), dim=1
+                (
+                    attn_mask,
+                    torch.ones(
+                        attn_mask.shape[0],
+                        img.shape[1],
+                        device=attn_mask.device,
+                        dtype=torch.bool,
+                    ),
+                ),
+                dim=1,
             )  # b, seq_len + img_len
 
             # broadcast attn_mask to all heads
@@ -747,11 +759,26 @@ class DoubleStreamBlock(nn.Module):
         return img, txt
 
     def forward(
-        self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None
+        self,
+        img: Tensor,
+        txt: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        txt_attention_mask: Optional[Tensor] = None,
+        proportional_attention=False,
     ) -> tuple[Tensor, Tensor]:
         if self.training and self.gradient_checkpointing:
             if not self.cpu_offload_checkpointing:
-                return checkpoint(self._forward, img, txt, vec, pe, txt_attention_mask, use_reentrant=False)
+                return checkpoint(
+                    self._forward,
+                    img,
+                    txt,
+                    vec,
+                    pe,
+                    txt_attention_mask,
+                    proportional_attention=proportional_attention,
+                    use_reentrant=False,
+                )
             # cpu offload checkpointing
 
             def create_custom_forward(func):
@@ -763,7 +790,14 @@ class DoubleStreamBlock(nn.Module):
                 return custom_forward
 
             return torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self._forward), img, txt, vec, pe, txt_attention_mask, use_reentrant=False
+                create_custom_forward(self._forward),
+                img,
+                txt,
+                vec,
+                pe,
+                txt_attention_mask,
+                proportional_attention=proportional_attention,
+                use_reentrant=False,
             )
 
         else:
@@ -831,7 +865,10 @@ class SingleStreamBlock(nn.Module):
                 (
                     attn_mask,
                     torch.ones(
-                        attn_mask.shape[0], x.shape[1] - txt_attention_mask.shape[1], device=attn_mask.device, dtype=torch.bool
+                        attn_mask.shape[0],
+                        x.shape[1] - txt_attention_mask.shape[1],
+                        device=attn_mask.device,
+                        dtype=torch.bool,
                     ),
                 ),
                 dim=1,
@@ -852,10 +889,17 @@ class SingleStreamBlock(nn.Module):
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        vec: Tensor,
+        pe: Tensor,
+        txt_attention_mask: Optional[Tensor] = None,
+        proportional_attention=False,
+    ) -> Tensor:
         if self.training and self.gradient_checkpointing:
             if not self.cpu_offload_checkpointing:
-                return checkpoint(self._forward, x, vec, pe, txt_attention_mask, use_reentrant=False)
+                return checkpoint(self._forward, x, vec, pe, txt_attention_mask, proportional_attention, use_reentrant=False)
 
             # cpu offload checkpointing
 
@@ -868,7 +912,13 @@ class SingleStreamBlock(nn.Module):
                 return custom_forward
 
             return torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self._forward), x, vec, pe, txt_attention_mask, use_reentrant=False
+                create_custom_forward(self._forward),
+                x,
+                vec,
+                pe,
+                txt_attention_mask,
+                proportional_attention=proportional_attention,
+                use_reentrant=False,
             )
         else:
             return self._forward(x, vec, pe, txt_attention_mask)
@@ -929,10 +979,7 @@ class Flux(nn.Module):
         )
 
         self.single_blocks = nn.ModuleList(
-            [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
-                for _ in range(params.depth_single_blocks)
-            ]
+            [SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio) for _ in range(params.depth_single_blocks)]
         )
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
@@ -993,10 +1040,16 @@ class Flux(nn.Module):
         )
 
         self.offloader_double = custom_offloading_utils.ModelOffloader(
-            self.double_blocks, self.num_double_blocks, double_blocks_to_swap, device  # , debug=True
+            self.double_blocks,
+            self.num_double_blocks,
+            double_blocks_to_swap,
+            device,  # , debug=True
         )
         self.offloader_single = custom_offloading_utils.ModelOffloader(
-            self.single_blocks, self.num_single_blocks, single_blocks_to_swap, device  # , debug=True
+            self.single_blocks,
+            self.num_single_blocks,
+            single_blocks_to_swap,
+            device,  # , debug=True
         )
         print(
             f"FLUX: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
@@ -1035,6 +1088,7 @@ class Flux(nn.Module):
         guidance: Tensor | None = None,
         txt_attention_mask: Tensor | None = None,
         proportional_attention=None,
+        ntk_factor=1.0,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -1050,7 +1104,7 @@ class Flux(nn.Module):
         txt = self.txt_in(txt)
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
+        pe = self.pe_embedder(ids, ntk_factor)
         if block_controlnet_hidden_states is not None:
             controlnet_depth = len(block_controlnet_hidden_states)
         if block_controlnet_single_hidden_states is not None:
@@ -1058,20 +1112,40 @@ class Flux(nn.Module):
 
         if not self.blocks_to_swap:
             for block_idx, block in enumerate(self.double_blocks):
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask, proportional_attention=proportional_attention)
+                img, txt = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                    proportional_attention=proportional_attention,
+                )
                 if block_controlnet_hidden_states is not None and controlnet_depth > 0:
                     img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
 
             img = torch.cat((txt, img), 1)
             for block_idx, block in enumerate(self.single_blocks):
-                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask, proportional_attention=proportional_attention)
+                img = block(
+                    img,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                    proportional_attention=proportional_attention,
+                )
                 if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
                     img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
         else:
             for block_idx, block in enumerate(self.double_blocks):
                 self.offloader_double.wait_for_block(block_idx)
 
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask, proportional_attention=proportional_attention)
+                img, txt = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                    proportional_attention=proportional_attention,
+                )
                 if block_controlnet_hidden_states is not None and controlnet_depth > 0:
                     img = img + block_controlnet_hidden_states[block_idx % controlnet_depth]
 
@@ -1082,7 +1156,13 @@ class Flux(nn.Module):
             for block_idx, block in enumerate(self.single_blocks):
                 self.offloader_single.wait_for_block(block_idx)
 
-                img = block(img, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask, proportional_attention=proportional_attention)
+                img = block(
+                    img,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                    proportional_attention=proportional_attention,
+                )
                 if block_controlnet_single_hidden_states is not None and controlnet_single_depth > 0:
                     img = img + block_controlnet_single_hidden_states[block_idx % controlnet_single_depth]
 
@@ -1143,10 +1223,7 @@ class ControlNetFlux(nn.Module):
         )
 
         self.single_blocks = nn.ModuleList(
-            [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
-                for _ in range(controlnet_single_depth)
-            ]
+            [SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio) for _ in range(controlnet_single_depth)]
         )
 
         self.gradient_checkpointing = False
@@ -1186,7 +1263,7 @@ class ControlNetFlux(nn.Module):
             nn.SiLU(),
             nn.Conv2d(16, 16, 3, padding=1, stride=2),
             nn.SiLU(),
-            zero_module(nn.Conv2d(16, 16, 3, padding=1))
+            zero_module(nn.Conv2d(16, 16, 3, padding=1)),
         )
 
     @property
@@ -1236,10 +1313,16 @@ class ControlNetFlux(nn.Module):
         )
 
         self.offloader_double = custom_offloading_utils.ModelOffloader(
-            self.double_blocks, self.num_double_blocks, double_blocks_to_swap, device  # , debug=True
+            self.double_blocks,
+            self.num_double_blocks,
+            double_blocks_to_swap,
+            device,  # , debug=True
         )
         self.offloader_single = custom_offloading_utils.ModelOffloader(
-            self.single_blocks, self.num_single_blocks, single_blocks_to_swap, device  # , debug=True
+            self.single_blocks,
+            self.num_single_blocks,
+            single_blocks_to_swap,
+            device,  # , debug=True
         )
         print(
             f"FLUX: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
@@ -1301,7 +1384,13 @@ class ControlNetFlux(nn.Module):
         block_single_samples = ()
         if not self.blocks_to_swap:
             for block in self.double_blocks:
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                img, txt = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                )
                 block_samples = block_samples + (img,)
 
             img = torch.cat((txt, img), 1)
@@ -1312,7 +1401,13 @@ class ControlNetFlux(nn.Module):
             for block_idx, block in enumerate(self.double_blocks):
                 self.offloader_double.wait_for_block(block_idx)
 
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe, txt_attention_mask=txt_attention_mask)
+                img, txt = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    pe=pe,
+                    txt_attention_mask=txt_attention_mask,
+                )
                 block_samples = block_samples + (img,)
 
                 self.offloader_double.submit_move_blocks(self.double_blocks, block_idx)
