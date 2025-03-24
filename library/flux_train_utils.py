@@ -637,4 +637,9 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
         type=float,
         default=1.0,
         help="Probability of dropout for Redux conditioning.",
+    # bypass guidance module for flux
+    parser.add_argument(
+        "--bypass_flux_guidance"
+        , action="store_true"
+        , help="bypass flux guidance module for Flex.1-Alpha Training / Flex.1-Alpha トレーニング用バイパス フラックス ガイダンス モジュール"
     )
