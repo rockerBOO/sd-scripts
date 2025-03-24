@@ -446,10 +446,10 @@ configs = {
 # region math
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
+def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, attn_mask: Optional[Tensor] = None, attention_scale=None) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=attention_scale)
     x = rearrange(x, "B H L D -> B L (H D)")
 
     return x
@@ -511,10 +511,10 @@ class EmbedND(nn.Module):
         self.theta = theta
         self.axes_dim = axes_dim
 
-    def forward(self, ids: Tensor) -> Tensor:
+    def forward(self, ids: Tensor, scale=1.0) -> Tensor:
         n_axes = ids.shape[-1]
         emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            [rope(ids[..., i], self.axes_dim[i], self.theta*scale) for i in range(n_axes)],
             dim=-3,
         )
 
@@ -608,17 +608,23 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        self.head_dim = head_dim
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.norm = QKNorm(head_dim)
         self.proj = nn.Linear(dim, dim)
 
     # this is not called from DoubleStreamBlock/SingleStreamBlock because they uses attention function directly
-    def forward(self, x: Tensor, pe: Tensor) -> Tensor:
+    def forward(self, x: Tensor, pe: Tensor, proportional_attention=False) -> Tensor:
         qkv = self.qkv(x)
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
-        x = attention(q, k, v, pe=pe)
+        if proportional_attention:
+            train_seq_len = 512 + 64 * 64
+            attention_scale = math.sqrt(math.log(k.size(2), train_seq_len) / self.head_dim)
+        else:
+            attention_scale = math.sqrt(1 / self.head_dim)
+        x = attention(q, k, v, pe=pe, attention_scale=attention_scale)
         x = self.proj(x)
         return x
 
@@ -687,7 +693,7 @@ class DoubleStreamBlock(nn.Module):
         self.cpu_offload_checkpointing = False
 
     def _forward(
-        self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None
+        self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None, proportional_attention=False
     ) -> tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
@@ -723,7 +729,12 @@ class DoubleStreamBlock(nn.Module):
             # broadcast attn_mask to all heads
             attn_mask = attn_mask[:, None, None, :].expand(-1, q.shape[1], q.shape[2], -1)
 
-        attn = attention(q, k, v, pe=pe, attn_mask=attn_mask)
+        if proportional_attention:
+            train_seq_len = 512 + 64 * 64
+            attention_scale = math.sqrt(math.log(k.size(2), train_seq_len) / (self.hidden_size // self.num_heads))
+        else:
+            attention_scale = math.sqrt(1 / (self.hidden_size // self.num_heads))
+        attn = attention(q, k, v, pe=pe, attn_mask=attn_mask, attention_scale=attention_scale)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img blocks
@@ -803,7 +814,7 @@ class SingleStreamBlock(nn.Module):
         self.gradient_checkpointing = False
         self.cpu_offload_checkpointing = False
 
-    def _forward(self, x: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None) -> Tensor:
+    def _forward(self, x: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None, proportional_attention=False) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
@@ -829,8 +840,13 @@ class SingleStreamBlock(nn.Module):
             # broadcast attn_mask to all heads
             attn_mask = attn_mask[:, None, None, :].expand(-1, q.shape[1], q.shape[2], -1)
 
+        if proportional_attention:
+            train_seq_len = 512 + 64 * 64
+            attention_scale = math.sqrt(math.log(k.size(2), train_seq_len) / (self.hidden_size // self.num_heads))
+        else:
+            attention_scale = math.sqrt(1 / (self.hidden_size // self.num_heads))
         # compute attention
-        attn = attention(q, k, v, pe=pe, attn_mask=attn_mask)
+        attn = attention(q, k, v, pe=pe, attn_mask=attn_mask, attention_scale=attention_scale)
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
