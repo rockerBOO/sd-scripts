@@ -7,19 +7,16 @@
 # https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
-import math
 import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type, Union
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel
-import numpy as np
 import torch
 from torch import Tensor
 from tqdm import tqdm
-import re
 from library.utils import setup_logging
-from library.train_util import initialize_lora, initialize_pissa, initialize_urae
+from library.lora_util import initialize_lora, initialize_pissa, initialize_urae
 
 setup_logging()
 import logging
@@ -75,10 +72,10 @@ class LoRAModule(torch.nn.Module):
     def __init__(
         self,
         lora_name,
-        org_module: torch.nn.Module,
+        org_module: torch.nn.Linear,
         multiplier=1.0,
         lora_dim=4,
-        alpha=1,
+        alpha=1.0,
         dropout=None,
         rank_dropout=None,
         module_dropout=None,
@@ -96,17 +93,13 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
 
-        if org_module.__class__.__name__ == "Conv2d":
-            in_dim = org_module.in_channels
-            out_dim = org_module.out_channels
-        else:
-            in_dim = org_module.in_features
-            out_dim = org_module.out_features
+        in_dim = org_module.in_features
+        out_dim = org_module.out_features
 
         self.lora_dim = lora_dim
 
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
+        if isinstance(alpha, torch.Tensor):
+            alpha = alpha.detach().float().item()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
@@ -114,50 +107,14 @@ class LoRAModule(torch.nn.Module):
         self.split_dims = split_dims
 
         if split_dims is None:
-            if org_module.__class__.__name__ == "Conv2d":
-                kernel_size = org_module.kernel_size
-                stride = org_module.stride
-                padding = org_module.padding
-                self.lora_down = torch.nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
-                self.lora_up = torch.nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=False)
-            else:
-                self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
-                self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
-
-            if initialize == "urae":
-                initialize_urae(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim)
-                # Need to store the original weights so we can get a plain LoRA out
-                self._org_lora_up = self.lora_up.weight.data.detach().clone()
-                self._org_lora_down = self.lora_down.weight.data.detach().clone()
-            elif initialize == "pissa":
-                initialize_pissa(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim)
-                # Need to store the original weights so we can get a plain LoRA out
-                self._org_lora_up = self.lora_up.weight.data.detach().clone()
-                self._org_lora_down = self.lora_down.weight.data.detach().clone()
-            else:
-                initialize_lora(self.lora_down, self.lora_up)
+            self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
+            self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
         else:
-            # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
-            assert org_module.__class__.__name__ == "Linear", "split_dims is only supported for Linear"
-            # print(f"split_dims: {split_dims}")
             self.lora_down = torch.nn.ModuleList(
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-            for lora_down, lora_up in zip(self.lora_down, self.lora_up):
-                if initialize == "urae":
-                    initialize_urae(org_module, lora_down, lora_up, self.scale, self.lora_dim)
-                    # Need to store the original weights so we can get a plain LoRA out
-                    self._org_lora_up = lora_up.weight.data.detach().clone()
-                    self._org_lora_down = lora_down.weight.data.detach().clone()
-                elif initialize == "pissa":
-                    initialize_pissa(org_module, lora_down, lora_up, self.scale, self.lora_dim)
-                    # Need to store the original weights so we can get a plain LoRA out
-                    self._org_lora_up = lora_up.weight.data.detach().clone()
-                    self._org_lora_down = lora_down.weight.data.detach().clone()
-                else:
-                    initialize_lora(lora_down, lora_up)
 
         # same as microsoft's
         self.multiplier = multiplier
@@ -183,7 +140,7 @@ class LoRAModule(torch.nn.Module):
 
         del self.org_module
 
-    def forward(self, x):
+    def forward(self, x) -> torch.Tensor:
         org_forwarded = self.org_forward(x)
 
         # module dropout
@@ -237,10 +194,6 @@ class LoRAModule(torch.nn.Module):
             if self.rank_dropout is not None and self.training:
                 masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
                 for i in range(len(lxs)):
-                    if len(lx.size()) == 3:
-                        masks[i] = masks[i].unsqueeze(1)
-                    elif len(lx.size()) == 4:
-                        masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
                     lxs[i] = lxs[i] * masks[i]
 
                 # scaling for rank dropout: treat as if the rank is changed
@@ -367,10 +320,10 @@ class LoRAInfModule(LoRAModule):
     def __init__(
         self,
         lora_name,
-        org_module: torch.nn.Module,
+        org_module: torch.nn.Linear,
         multiplier=1.0,
         lora_dim=4,
-        alpha=1,
+        alpha=1.0,
         **kwargs,
     ):
         # no dropout for inference
@@ -480,6 +433,8 @@ class LoRAInfModule(LoRAModule):
             lx = self.lora_up(lx)
             return self.org_forward(x) + lx * self.multiplier * self.scale
         else:
+            assert isinstance(self.lora_down, torch.nn.ModuleList)
+            assert isinstance(self.lora_up, torch.nn.ModuleList)
             lxs = [lora_down(x) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
             return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
@@ -636,6 +591,11 @@ def create_network(
     if verbose is not None:
         verbose = True if verbose == "True" else False
 
+    # Computation device, used in initialization 
+    comp_device = kwargs.get("comp_device", None)
+    if comp_device is not None:
+        comp_device = torch.device(comp_device)
+
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
         text_encoders,
@@ -658,6 +618,7 @@ def create_network(
         ggpo_beta=ggpo_beta,
         ggpo_sigma=ggpo_sigma,
         initialize=initialize,
+        comp_device=comp_device,
         verbose=verbose,
     )
 
@@ -678,7 +639,7 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, flux, weigh
     # if unet is an instance of SdxlUNet2DConditionModel or subclass, set is_sdxl to True
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
-            from safetensors.torch import load_file, safe_open
+            from safetensors.torch import load_file
 
             weights_sd = load_file(file)
         else:
@@ -760,7 +721,7 @@ class LoRANetwork(torch.nn.Module):
         module_dropout: Optional[float] = None,
         conv_lora_dim: Optional[int] = None,
         conv_alpha: Optional[float] = None,
-        module_class: Type[object] = LoRAModule,
+        module_class: Union[Type[LoRAModule], Type[LoRAInfModule]] = LoRAModule,
         modules_dim: Optional[Dict[str, int]] = None,
         modules_alpha: Optional[Dict[str, int]] = None,
         train_blocks: Optional[str] = None,
@@ -773,6 +734,7 @@ class LoRANetwork(torch.nn.Module):
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
         initialize: Optional[str] = None,
+        comp_device: Optional[torch.device] = None,
         verbose: Optional[bool] = False,
         rank_stabilized: Optional[bool] = False,
     ) -> None:
@@ -802,7 +764,7 @@ class LoRANetwork(torch.nn.Module):
         self.loraplus_text_encoder_lr_ratio = None
 
         if modules_dim is not None:
-            logger.info(f"create LoRA network from weights")
+            logger.info("create LoRA network from weights")
             self.in_dims = [0] * 5  # create in_dims
             # verbose = True
         else:
@@ -819,13 +781,13 @@ class LoRANetwork(torch.nn.Module):
             logger.info(f"LoRA-GGPO training sigma: {ggpo_sigma} beta: {ggpo_beta}")
 
         if self.split_qkv:
-            logger.info(f"split qkv for LoRA")
+            logger.info("split qkv for LoRA")
         if self.train_blocks is not None:
             logger.info(f"train {self.train_blocks} blocks only")
 
 
         if train_t5xxl:
-            logger.info(f"train T5XXL as well")
+            logger.info("train T5XXL as well")
 
         # create module instances
         def create_modules(
@@ -862,13 +824,13 @@ class LoRANetwork(torch.nn.Module):
                             lora_name = prefix + "." + (name + "." if name else "") + child_name
                             lora_name = lora_name.replace(".", "_")
 
-                            if filter is not None and not filter in lora_name:
+                            if filter is not None and filter not in lora_name:
                                 continue
 
                             dim = None
                             alpha = None
 
-                            if modules_dim is not None:
+                            if modules_dim is not None and modules_alpha is not None:
                                 # モジュール指定あり
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
@@ -937,12 +899,13 @@ class LoRANetwork(torch.nn.Module):
                                 elif "single" in lora_name and "linear1" in lora_name:
                                     split_dims = [3072] * 3 + [12288]
 
+                            assert module_class is LoRAModule or module_class is LoRAInfModule, f"Module class is not valid {type(module_class)}"
                             lora = module_class(
                                 lora_name,
                                 child_module,
                                 self.multiplier,
                                 dim,
-                                alpha,
+                                alpha or 1.0,
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
@@ -952,6 +915,8 @@ class LoRANetwork(torch.nn.Module):
                                 ggpo_sigma=ggpo_sigma,
                                 initialize=initialize,
                             )
+                            assert isinstance(lora, LoRAModule)
+                            lora.initialize_weights(child_module, initialize, comp_device)
                             loras.append(lora)
 
                 if target_replace_modules is None:
@@ -960,8 +925,9 @@ class LoRANetwork(torch.nn.Module):
 
         # create LoRA for text encoder
         # 毎回すべてのモジュールを作るのは無駄なので要検討
-        self.text_encoder_loras: List[Union[LoRAModule, LoRAInfModule]] = []
+        self.text_encoder_loras: List[LoRAInfModule] = []
         skipped_te = []
+        text_encoders = text_encoders if isinstance(text_encoders, list) else [text_encoders]
         for i, text_encoder in enumerate(text_encoders):
             index = i
             if not train_t5xxl and index > 0:  # 0: CLIP, 1: T5XXL, so we skip T5XXL if train_t5xxl is False
@@ -990,7 +956,7 @@ class LoRANetwork(torch.nn.Module):
         if initialize is not None:
             logger.info(f"Initialize FLUX LoRA using {initialize}")
 
-        self.unet_loras: List[Union[LoRAModule, LoRAInfModule]]
+        self.unet_loras: List[LoRAInfModule] = []
         self.unet_loras, skipped_un = create_modules(True, None, unet, target_replace_modules)
 
         # img, time, vector, guidance, txt
@@ -1324,14 +1290,13 @@ class LoRANetwork(torch.nn.Module):
         state_dict = self.state_dict()
 
         if self.initialize in ['pissa']:
-            loras: List[LoRAInfModule] = self.text_encoder_loras + self.unet_loras
+            loras: List[Union[LoRAModule, LoRAInfModule]] = self.text_encoder_loras + self.unet_loras
             def convert_pissa_to_standard_lora(trained_up: Tensor, trained_down: Tensor, orig_up: Tensor, orig_down: Tensor, rank: int):
                 # Calculate ΔW = A'B' - AB
                 delta_w = (trained_up @ trained_down) - (orig_up @ orig_down)
 
                 # We need to create new low-rank matrices that represent this delta
-                # One approach is to do SVD on delta_w
-                U, S, V = torch.linalg.svd(delta_w, full_matrices=False)
+                U, S, V = torch.linalg.svd(delta_w.to(device="cuda", dtype=torch.float32), full_matrices=False)
 
                 # Take the top 2*r singular values (as suggested in the paper)
                 rank = rank * 2
@@ -1351,7 +1316,8 @@ class LoRANetwork(torch.nn.Module):
                     lora_down_key = f"{lora.lora_name}.lora_down.weight"
                     lora_up = state_dict[lora_up_key]
                     lora_down = state_dict[lora_down_key]
-                    up, down = convert_pissa_to_standard_lora(lora_up, lora_down, lora._org_lora_up, lora._org_lora_down, lora.lora_dim)
+                    with torch.autocast("cuda"):
+                        up, down = convert_pissa_to_standard_lora(lora_up, lora_down, lora._org_lora_up, lora._org_lora_down, lora.lora_dim)
                     state_dict[lora_up_key] = up.detach()
                     state_dict[lora_down_key] = down.detach()
                     progress.update(1)
