@@ -8,6 +8,7 @@
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
 import os
+import math
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type, Union
 from diffusers import AutoencoderKL
@@ -133,6 +134,43 @@ class LoRAModule(torch.nn.Module):
             self.perturbation_seed = torch.randint(0, 2**32 - 1, (1,)).detach().item()
             self.initialize_norm_cache(org_module.weight)
             self.org_module_shape: tuple[int] = org_module.weight.shape
+
+    def initialize_weights(self, org_module: torch.nn.Module, initialize: Optional[str], device: Optional[torch.device]):
+        """
+        Inititalize the weights for the LoRA
+
+        org_module: original module we are applying the LoRA to
+        device: device to run initialization computation on
+        """
+        if self.split_dims is None:
+            if initialize == "urae":
+                initialize_urae(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim, device=device)
+                # Need to store the original weights so we can get a plain LoRA out
+                self._org_lora_up = self.lora_up.weight.data.detach().clone()
+                self._org_lora_down = self.lora_down.weight.data.detach().clone()
+            elif initialize == "pissa":
+                initialize_pissa(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim, device=device)
+                # Need to store the original weights so we can get a plain LoRA out
+                self._org_lora_up = self.lora_up.weight.data.detach().clone()
+                self._org_lora_down = self.lora_down.weight.data.detach().clone()
+            else:
+                initialize_lora(self.lora_down, self.lora_up)
+        else:
+            assert isinstance(self.lora_down, torch.nn.ModuleList)
+            assert isinstance(self.lora_up, torch.nn.ModuleList)
+            for lora_down, lora_up in zip(self.lora_down, self.lora_up):
+                if initialize == "urae":
+                    initialize_urae(org_module, lora_down, lora_up, self.scale, self.lora_dim, device=device)
+                    # Need to store the original weights so we can get a plain LoRA out
+                    self._org_lora_up = lora_up.weight.data.detach().clone()
+                    self._org_lora_down = lora_down.weight.data.detach().clone()
+                elif initialize == "pissa":
+                    initialize_pissa(org_module, lora_down, lora_up, self.scale, self.lora_dim, device=device)
+                    # Need to store the original weights so we can get a plain LoRA out
+                    self._org_lora_up = lora_up.weight.data.detach().clone()
+                    self._org_lora_down = lora_down.weight.data.detach().clone()
+                else:
+                    initialize_lora(lora_down, lora_up)
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
