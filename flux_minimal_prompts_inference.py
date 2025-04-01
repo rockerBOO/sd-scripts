@@ -105,17 +105,18 @@ def generate_image(
     clip_l: CLIPTextModel,
     t5xxl,
     ae,
-    prompt: str,
+    prompts: str | list[str],
     seed: Optional[int],
     image_width: int,
     image_height: int,
     steps: Optional[int],
     guidance: float,
-    negative_prompt: Optional[str],
+    negative_prompt: Optional[str | list[str]],
     cfg_scale: float,
     iteration: int=None
 ):
     seed = seed if seed is not None else random.randint(0, 2**32 - 1)
+    batch_size = len(prompts) if isinstance(prompts, list) else 1
     logger.info(f"Seed: {seed}")
 
     # make first noise with packed shape
@@ -123,7 +124,7 @@ def generate_image(
     packed_latent_height, packed_latent_width = math.ceil(image_height / 16), math.ceil(image_width / 16)
     noise_dtype = torch.float32 if is_fp8(dtype) else dtype
     noise = torch.randn(
-        1,
+        batch_size,
         packed_latent_height * packed_latent_width,
         16 * 2 * 2,
         device=device,
@@ -139,7 +140,7 @@ def generate_image(
     #     img = repeat(img, "1 ... -> bs ...", bs=bs)
 
     # txt2img only needs img_ids
-    img_ids = flux_utils.prepare_img_ids(1, packed_latent_height, packed_latent_width)
+    img_ids = flux_utils.prepare_img_ids(batch_size, packed_latent_height, packed_latent_width)
 
     # prepare fp8 models
     if is_fp8(clip_l_dtype) and (not hasattr(clip_l, "fp8_prepared") or not clip_l.fp8_prepared):
@@ -181,7 +182,7 @@ def generate_image(
     clip_l = clip_l.to(device)
     t5xxl = t5xxl.to(device)
 
-    def encode(prpt: str):
+    def encode(prpt: list[str] | str):
         tokens_and_masks = tokenize_strategy.tokenize(prpt)
         with torch.no_grad():
             if is_fp8(clip_l_dtype):
@@ -203,7 +204,7 @@ def generate_image(
                     )
         return l_pooled, t5_out, txt_ids, t5_attn_mask
 
-    l_pooled, t5_out, txt_ids, t5_attn_mask = encode(prompt)
+    l_pooled, t5_out, txt_ids, t5_attn_mask = encode(prompts)
     if negative_prompt:
         neg_l_pooled, neg_t5_out, _, neg_t5_attn_mask = encode(negative_prompt)
     else:
@@ -275,22 +276,26 @@ def generate_image(
 
     x = x.clamp(-1, 1)
     x = x.permute(0, 2, 3, 1)
-    img = Image.fromarray((127.5 * (x + 1.0)).float().cpu().numpy().astype(np.uint8)[0])
 
-    # restore guidance module
-    if args.bypass_flux_guidance:
-        restore_flux_guidance(model)
-    
-    # save image
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    if iteration is None:
-        output_path = os.path.join(output_dir, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    else:
-        output_path = os.path.join(output_dir, f"{prompt}_{iteration:05d}.png")
-    img.save(output_path)
+    images = (127.5 * (x + 1.0)).float().cpu().numpy().astype(np.uint8)
+    for i, (prompt, image) in enumerate(zip(prompts, images)):
+        it = iteration * batch_size + i + 1
+        img = Image.fromarray(image)
 
-    logger.info(f"Saved image to {output_path}")
+        # restore guidance module
+        if args.bypass_flux_guidance:
+            restore_flux_guidance(model)
+        
+        # save image
+        output_dir = args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        if iteration is None:
+            output_path = os.path.join(output_dir, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        else:
+            output_path = os.path.join(output_dir, f"{prompt}_{iteration+i:05d}.png")
+        img.save(output_path)
+
+        logger.info(f"Saved image to {output_path}")
 
 
 if __name__ == "__main__":
@@ -324,6 +329,8 @@ if __name__ == "__main__":
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--offload", action="store_true", help="Offload to CPU")
     parser.add_argument("--bypass_flux_guidance", action="store_true", help="Bypass flux guidance for flex")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--block_swap", type=int, help="blocks to swap")
     parser.add_argument(
         "--lora_weights",
         type=str,
@@ -379,7 +386,8 @@ if __name__ == "__main__":
     model.eval()
     logger.info(f"Casting model to {flux_dtype}")
     model.to(dtype=flux_dtype)  # make sure model is dtype
-    model.enable_block_swap(6, device)
+    if args.block_swap is not None:
+        model.enable_block_swap(args.block_swap, device)
     # if is_fp8(flux_dtype):
     #     model = accelerator.prepare(model)
     #     if args.offload:
@@ -435,14 +443,23 @@ if __name__ == "__main__":
             with open(args.prompts_file) as f:
                 prompts = f.readlines()
 
-        progress = tqdm(desc="images", total=len(prompts))
-        for i, prompt in enumerate(prompts):
+        def chunk_list(lst, chunk_size):
+            """Split a list into chunks of specified size."""
+            return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
+        
+        prompts = [p.strip() for p in prompts]
+        # prompts_chunks = chunk_list(prompts, args.batch_size)
+
+        progress = tqdm(desc="images", total=len(prompts) // args.batch_size)
+        for batch_idx, i in enumerate(range(0, len(prompts), args.batch_size)):
+        # for i, prompts in enumerate(prompts_chunks):
+            prompts_chunk = prompts[i:i + args.batch_size]
             generate_image(
                 model,
                 clip_l,
                 t5xxl,
                 ae,
-                prompt.strip(),
+                prompts_chunk,
                 args.seed,
                 args.width,
                 args.height,
