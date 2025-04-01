@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import re
+from tqdm import tqdm
 from dataclasses import replace
 from typing import List, Optional, Tuple, Union
 
@@ -547,3 +548,93 @@ def convert_diffusers_sd_to_bfl(
 
 
 # endregion
+
+def denoise_with_cfg(
+    model: flux_models.Flux,
+    img: torch.Tensor,
+    img_ids: torch.Tensor,
+    txt: torch.Tensor,
+    txt_ids: torch.Tensor,
+    vec: torch.Tensor,
+    timesteps: list[float],
+    guidance: float = 4.0,
+    t5_attn_mask: Optional[torch.Tensor] = None,
+    neg_txt: Optional[torch.Tensor] = None,
+    neg_vec: Optional[torch.Tensor] = None,
+    neg_t5_attn_mask: Optional[torch.Tensor] = None,
+    controlnet: Optional[flux_models.ControlNetFlux] = None,
+    controlnet_img: Optional[torch.Tensor] = None,
+    cfg_scale: Optional[float] = None,
+    proportional_attention: Optional[bool] = None,
+    ntk_factor = 1.0,
+):
+    # this is ignored for schnell
+    logger.info(f"guidance: {guidance}, cfg_scale: {cfg_scale}")
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+
+    # prepare classifier free guidance
+    if cfg_scale != 1.0 and neg_txt is not None and neg_vec is not None:
+        b_img_ids = torch.cat([img_ids, img_ids], dim=0)
+        b_txt_ids = torch.cat([txt_ids, txt_ids], dim=0)
+        b_txt = torch.cat([neg_txt, txt], dim=0)
+        b_vec = torch.cat([neg_vec, vec], dim=0)
+        if t5_attn_mask is not None and neg_t5_attn_mask is not None:
+            b_t5_attn_mask = torch.cat([neg_t5_attn_mask, t5_attn_mask], dim=0)
+        else:
+            b_t5_attn_mask = None
+    else:
+        b_img_ids = img_ids
+        b_txt_ids = txt_ids
+        b_txt = txt
+        b_vec = vec
+        b_t5_attn_mask = t5_attn_mask
+
+    for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
+        t_vec = torch.full((b_img_ids.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        model.prepare_block_swap_before_forward()
+        if controlnet is not None:
+            block_samples, block_single_samples = controlnet(
+                img=img,
+                img_ids=img_ids,
+                controlnet_cond=controlnet_img,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+                txt_attention_mask=t5_attn_mask,
+            )
+        else:
+            block_samples = None
+            block_single_samples = None
+
+        # classifier free guidance
+        if cfg_scale != 1.0 and neg_txt is not None and neg_vec is not None:
+            b_img = torch.cat([img, img], dim=0)
+        else:
+            b_img = img
+
+        pred = model(
+            img=b_img,
+            img_ids=b_img_ids,
+            txt=b_txt,
+            txt_ids=b_txt_ids,
+            y=b_vec,
+            block_controlnet_hidden_states=block_samples,
+            block_controlnet_single_hidden_states=block_single_samples,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            txt_attention_mask=b_t5_attn_mask,
+            proportional_attention=proportional_attention,
+            ntk_factor=ntk_factor
+        )
+
+        # classifier free guidance
+        if cfg_scale != 1.0 and neg_txt is not None and neg_vec is not None:
+            pred_uncond, pred = torch.chunk(pred, 2, dim=0)
+            pred = pred_uncond + cfg_scale * (pred - pred_uncond)
+
+        img = img + (t_prev - t_curr) * pred
+
+    return img
+

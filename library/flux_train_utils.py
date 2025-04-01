@@ -235,7 +235,7 @@ def sample_image_inference(
         controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)
 
     with accelerator.autocast(), torch.no_grad():
-        x = denoise(flux, noise, img_ids, t5_out, txt_ids, l_pooled, timesteps=timesteps, guidance=scale, t5_attn_mask=t5_attn_mask, controlnet=controlnet, controlnet_img=controlnet_image, proportional_attention=args.proportional_attention, ntk_factor=args.ntk_factor)
+        x = flux_utils.denoise_with_cfg(flux, noise, img_ids, t5_out, txt_ids, l_pooled, timesteps=timesteps, guidance=scale, t5_attn_mask=t5_attn_mask, controlnet=controlnet, controlnet_img=controlnet_image, proportional_attention=args.proportional_attention, ntk_factor=args.ntk_factor)
 
     x = flux_utils.unpack_latents(x, packed_latent_height, packed_latent_width)
 
@@ -319,7 +319,6 @@ def denoise(
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
 
-
     for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         model.prepare_block_swap_before_forward()
@@ -355,7 +354,6 @@ def denoise(
 
         img = img + (t_prev - t_curr) * pred
 
-    model.prepare_block_swap_before_forward()
     return img
 
 
