@@ -531,7 +531,9 @@ def convert_diffusers_sd_to_bfl(
         if len(values) == 1:
             flux_sd[key] = values[0][1]
         else:
-            flux_sd[key] = torch.cat([value[1] for value in sorted(values, key=lambda x: x[0])])
+            org_dtype = values[0].dtype
+            flux_sd[key] = torch.cat([value[1].to(dtype=torch.float32) for value in sorted(values, key=lambda x: x[0])])
+            flux_sd[key] = flux_sd[key].to(org_dtype)
 
     # special case for final_layer.adaLN_modulation.1.weight and final_layer.adaLN_modulation.1.bias
     def swap_scale_shift(weight):
