@@ -10,16 +10,17 @@ Fork repo mixing my different PR's together for experimental testing
 - https://github.com/kohya-ss/sd-scripts/pull/1870 Add rank_stabilized for networks
 - https://github.com/kohya-ss/sd-scripts/pull/1991 Support alpha cumulative product using shifted sigmas for Flux
 - https://github.com/kohya-ss/sd-scripts/pull/1992 Add IP noise gamma for Flux
-- https://github.com/kohya-ss/sd-scripts/pull/1974 Add LoRA-GGPO for Flux
 - https://github.com/kohya-ss/sd-scripts/pull/2001 Add initialization URAE, PiSSA for flux
 - https://github.com/kohya-ss/sd-scripts/pull/2002 Add URAE Ultra-Resolution Adaptation with Ease support
 - https://github.com/kohya-ss/sd-scripts/pull/2000 Add flexibility to block swapping for Flex model
+- https://github.com/kohya-ss/sd-scripts/pull/2019 Add gradient noise scale logging
 
 - https://github.com/kohya-ss/sd-scripts/pull/1893 Implement Flex.1 Alpha Functionality
 
 ## Merged PRs
 
 - https://github.com/kohya-ss/sd-scripts/pull/1864 Validation loss
+- https://github.com/kohya-ss/sd-scripts/pull/1974 Add LoRA-GGPO for Flux
 
 
 This repository contains training, generation and utility scripts for Stable Diffusion.
