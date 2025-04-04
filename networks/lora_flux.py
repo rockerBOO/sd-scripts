@@ -16,6 +16,7 @@ from transformers import CLIPTextModel
 import torch
 from torch import Tensor
 from tqdm import tqdm
+import re
 from library.utils import setup_logging
 from library.device_utils import clean_memory_on_device
 from library.lora_util import initialize_lora, initialize_pissa, initialize_urae
@@ -92,15 +93,6 @@ class LoRAModule(torch.nn.Module):
         self.sum_grads = None
         self.sum_squared_grads = None
 
-        self.ggpo_sigma = ggpo_sigma
-        self.ggpo_beta = ggpo_beta
-
-        if self.ggpo_beta is not None and self.ggpo_sigma is not None:
-            self.combined_weight_norms = None
-            self.grad_norms = None
-            self.perturbation_norm_factor = 1.0 / math.sqrt(org_module.weight.shape[0])
-            self.initialize_norm_cache(org_module.weight)
-            self.org_module_shape: tuple[int] = org_module.weight.shape
 
     def initialize_weights(self, org_module: torch.nn.Module, initialize: Optional[str], device: Optional[torch.device]):
         """
@@ -594,6 +586,7 @@ def create_network(
     if split_qkv is not None:
         split_qkv = True if split_qkv == "True" else False
 
+    initialize = kwargs.get("initialize", None)
     ggpo_beta = kwargs.get("ggpo_beta", None)
     ggpo_sigma = kwargs.get("ggpo_sigma", None)
 
@@ -604,7 +597,6 @@ def create_network(
         ggpo_sigma = float(ggpo_sigma)
 
 
-    initialize = kwargs.get("initialize", None)
     # train T5XXL
     train_t5xxl = kwargs.get("train_t5xxl", False)
     if train_t5xxl is not None:
@@ -639,10 +631,10 @@ def create_network(
         in_dims=in_dims,
         train_double_block_indices=train_double_block_indices,
         train_single_block_indices=train_single_block_indices,
-        ggpo_beta=ggpo_beta,
-        ggpo_sigma=ggpo_sigma,
         initialize=initialize,
         comp_device=comp_device,
+        ggpo_beta=ggpo_beta,
+        ggpo_sigma=ggpo_sigma,
         verbose=verbose,
     )
 
@@ -755,10 +747,10 @@ class LoRANetwork(torch.nn.Module):
         in_dims: Optional[List[int]] = None,
         train_double_block_indices: Optional[List[bool]] = None,
         train_single_block_indices: Optional[List[bool]] = None,
-        ggpo_beta: Optional[float] = None,
-        ggpo_sigma: Optional[float] = None,
         initialize: Optional[str] = None,
         comp_device: Optional[torch.device] = None,
+        ggpo_beta: Optional[float] = None,
+        ggpo_sigma: Optional[float] = None,
         verbose: Optional[bool] = False,
         rank_stabilized: Optional[bool] = False,
     ) -> None:
