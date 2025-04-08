@@ -45,6 +45,7 @@ from library.custom_train_functions import (
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    WaveletLoss
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -333,7 +334,7 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
-        return noise_pred, target, timesteps, None
+        return noise_pred, noisy_latents, target, sigmas, timesteps, None
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler, latents: Optional[torch.Tensor]) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -401,7 +402,18 @@ class NetworkTrainer:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
             else:
                 # latentに変換
-                latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
+                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                else:
+                    chunks = [
+                        batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
+                    ]
+                    list_latents = []
+                    for chunk in chunks:
+                        with torch.no_grad():
+                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            list_latents.append(chunk)
+                    latents = torch.cat(list_latents, dim=0)
 
                 # NaNが含まれていれば警告を表示し0に置き換える
                 if torch.any(torch.isnan(latents)):
@@ -447,7 +459,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -463,6 +475,18 @@ class NetworkTrainer:
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+
+        if args.wavelet_loss_alpha:
+            # Calculate flow-based clean estimate using the target
+            flow_based_clean = noisy_latents - sigmas.view(-1, 1, 1, 1) * target
+            
+            # Calculate model-based denoised estimate
+            model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
+
+            wav_loss, pred_combined_hf, target_combined_hf = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
+            # Weight the losses as needed
+            loss = loss + args.wavelet_loss_alpha * wav_loss
+
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -1042,6 +1066,12 @@ class NetworkTrainer:
             "ss_validate_every_n_epochs": args.validate_every_n_epochs,
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
+            "ss_wavelet_loss": args.wavelet_loss,
+            "ss_wavelet_loss_alpha": args.wavelet_loss_alpha,
+            "ss_wavelet_loss_type": args.wavelet_loss_type,
+            "ss_wavelet_loss_transform": args.wavelet_loss_transform,
+            "ss_wavelet_loss_wavelet": args.wavelet_loss_wavelet,
+            "ss_wavelet_loss_level": args.wavelet_loss_level,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1261,6 +1291,36 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
         val_step_loss_recorder = train_util.LossRecorder()
         val_epoch_loss_recorder = train_util.LossRecorder()
+
+        if args.wavelet_loss:
+            def loss_fn(args):
+                loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
+                if loss_type == "huber":
+                    def huber(pred, target, reduction="mean"):
+                        if args.huber_c is None:
+                            raise NotImplementedError("huber_c not implemented correctly")
+                        b_size = pred.shape[0]
+                        huber_c = torch.full((b_size,), args.huber_c * args.huber_scale, device=pred.device)
+                        huber_c = huber_c.view(-1, 1, 1, 1)
+                        loss = 2 * huber_c * (torch.sqrt((pred - target) ** 2 + huber_c**2) - huber_c)
+                        return loss.mean()
+                    return huber
+
+                elif loss_type == "smooth_l1":
+                    def smooth_l1(pred, target, reduction="mean"):
+                        if args.huber_c is None:
+                            raise NotImplementedError("huber_c not implemented correctly")
+                        b_size = pred.shape[0]
+                        huber_c = torch.full((b_size,), args.huber_c * args.huber_scale, device=pred.device)
+                        huber_c = huber_c.view(-1, 1, 1, 1)
+                        loss = 2 * (torch.sqrt((pred - target) ** 2 + huber_c**2) - huber_c)
+                        return loss.mean()
+                elif loss_type == "l2":
+                    return  torch.nn.functional.mse_loss
+                elif loss_type == "l1":
+                    return torch.nn.functional.l1_loss
+
+            self.wavelet_loss = WaveletLoss(wavelet=args.wavelet_loss_wavelet, level=args.wavelet_loss_level, loss_fn=loss_fn(args), device=accelerator.device)
 
         del train_dataset_group
         if val_dataset_group is not None:
