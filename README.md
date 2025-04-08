@@ -14,6 +14,7 @@ Fork repo mixing my different PR's together for experimental testing
 - https://github.com/kohya-ss/sd-scripts/pull/2002 Add URAE Ultra-Resolution Adaptation with Ease support
 - https://github.com/kohya-ss/sd-scripts/pull/2000 Add flexibility to block swapping for Flex model
 - https://github.com/kohya-ss/sd-scripts/pull/2019 Add gradient noise scale logging
+- https://github.com/kohya-ss/sd-scripts/pull/2037 Add wavelet loss for networks 
 
 - https://github.com/kohya-ss/sd-scripts/pull/1893 Implement Flex.1 Alpha Functionality
 
