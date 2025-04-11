@@ -7,6 +7,7 @@
 # https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
+import math
 import os
 import math
 from contextlib import contextmanager
@@ -103,10 +104,23 @@ class LoRAModule(torch.nn.Module):
             self.initialize_norm_cache(org_module.weight)
             self.org_module_shape: tuple[int] = org_module.weight.shape
 
+        self._org_lora_up = None
+        self._org_lora_down = None
+
+        self.ggpo_sigma = ggpo_sigma
+        self.ggpo_beta = ggpo_beta
+
+        if self.ggpo_beta is not None and self.ggpo_sigma is not None:
+            self.combined_weight_norms = None
+            self.grad_norms = None
+            self.perturbation_norm_factor = 1.0 / math.sqrt(org_module.weight.shape[0])
+            self.initialize_norm_cache(org_module.weight)
+            self.org_module_shape: tuple[int] = org_module.weight.shape
+
 
     def initialize_weights(self, org_module: torch.nn.Module, initialize: Optional[str], device: Optional[torch.device]):
         """
-        Inititalize the weights for the LoRA
+        Initialize the weights for the LoRA
 
         org_module: original module we are applying the LoRA to
         device: device to run initialization computation on
@@ -141,12 +155,12 @@ class LoRAModule(torch.nn.Module):
                 else:
                     initialize_lora(lora_down, lora_up)
 
-        if hasattr(self, "_org_lora_up") and hasattr(self, "_org_lora_down"):
-            if self._org_lora_up is not None and self._org_lora_down is not None:
-                # TODO: Capture option if we should keep on VRAM
-                # offloading to CPU
-                self._org_lora_up = self._org_lora_up.to("cpu")
-                self._org_lora_down = self._org_lora_down.to("cpu")
+        if self._org_lora_up is not None and self._org_lora_down is not None:
+            # TODO: Capture option if we should keep on VRAM
+            # offloading to CPU
+            self._org_lora_up = self._org_lora_up.to("cpu")
+            self._org_lora_down = self._org_lora_down.to("cpu")
+
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
