@@ -1083,7 +1083,8 @@ class NetworkTrainer:
             "ss_wavelet_loss_transform": args.wavelet_loss_transform,
             "ss_wavelet_loss_wavelet": args.wavelet_loss_wavelet,
             "ss_wavelet_loss_level": args.wavelet_loss_level,
-            "ss_wavelet_loss_band_weights": args.wavelet_loss_band_weights,
+            "ss_wavelet_loss_band_weights": json.dumps(args.wavelet_loss_band_weights) if args.wavelet_loss_band_weights is not None else None,
+            "ss_wavelet_loss_band_level_weights": json.dumps(args.wavelet_loss_band_level_weights) if args.wavelet_loss_band_weights is not None else None,
             "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
             "ss_wavelet_loss_rectified_flow": args.wavelet_loss_rectified_flow,
         }
@@ -1313,6 +1314,7 @@ class NetworkTrainer:
             self.wavelet_loss = WaveletLoss(
                 wavelet=args.wavelet_loss_wavelet, 
                 level=args.wavelet_loss_level, 
+                band_level_weights=args.wavelet_loss_band_level_weights, 
                 band_weights=args.wavelet_loss_band_weights, 
                 ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
                 device=accelerator.device
@@ -1327,6 +1329,8 @@ class NetworkTrainer:
                 logger.info(f"\tLL level threshold: {args.wavelet_loss_ll_level_threshold}")
             if args.wavelet_loss_band_weights is not None:
                 logger.info(f"\tBand weights: {args.wavelet_loss_band_weights}")
+            if args.wavelet_loss_band_level_weights is not None:
+                logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
 
         del train_dataset_group
         if val_dataset_group is not None:
