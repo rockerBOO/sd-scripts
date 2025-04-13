@@ -18,6 +18,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 import re
+from library.model_utils import AID
 from library.utils import setup_logging
 from library.device_utils import clean_memory_on_device
 from library.network_utils import initialize_lora, initialize_pissa, initialize_urae, lora_dropout_down, lora_dropout_up
@@ -48,6 +49,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         lora_dropout=None,
+        aid_dropout=None,
         split_dims: Optional[List[int]] = None,
         rank_stabilized: Optional[bool] = False,
         ggpo_beta: Optional[float] = None,
@@ -95,6 +97,8 @@ class LoRAModule(torch.nn.Module):
         self.sum_grads = None
         self.sum_squared_grads = None
         self.lora_dropout = lora_dropout
+
+        self.aid = AID(dropout_prob=aid_dropout)  # AID activation
 
         self.ggpo_sigma = ggpo_sigma
         self.ggpo_beta = ggpo_beta
@@ -209,6 +213,9 @@ class LoRAModule(torch.nn.Module):
                 lx = lora_dropout_up(self.lora_up.weight, lx, dropout_prob=self.lora_dropout)
             else:
                 lx = self.lora_up(lx)
+
+            if self.aid_dropout is not None and self.training:
+                lx = self.aid(lx)
 
             # LoRA Gradient-Guided Perturbation Optimization
             if (
@@ -621,6 +628,9 @@ def create_network(
     lora_dropout = kwargs.get("lora_dropout", None)
     if lora_dropout is not None:
         lora_dropout = float(lora_dropout)
+    aid_dropout = kwargs.get("aid_dropout", None)
+    if aid_dropout is not None:
+        aid_dropout = float(aid_dropout)
 
     # single or double blocks
     train_blocks = kwargs.get("train_blocks", None)  # None (default), "all" (same as None), "single", "double"
@@ -668,6 +678,7 @@ def create_network(
         rank_dropout=rank_dropout,
         module_dropout=module_dropout,
         lora_dropout=lora_dropout,
+        aid_dropout=aid_dropout,
         conv_lora_dim=conv_dim,
         conv_alpha=conv_alpha,
         train_blocks=train_blocks,
@@ -782,6 +793,7 @@ class LoRANetwork(torch.nn.Module):
         rank_dropout: Optional[float] = None,
         module_dropout: Optional[float] = None,
         lora_dropout: Optional[float] = None,
+        aid_dropout: Optional[float] = None,
         conv_lora_dim: Optional[int] = None,
         conv_alpha: Optional[float] = None,
         module_class: Union[Type[LoRAModule], Type[LoRAInfModule]] = LoRAModule,
@@ -812,6 +824,7 @@ class LoRANetwork(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
         self.lora_dropout = lora_dropout
+        self.aid_dropout = aid_dropout
         self.train_blocks = train_blocks if train_blocks is not None else "all"
         self.split_qkv = split_qkv
         self.train_t5xxl = train_t5xxl
@@ -982,6 +995,7 @@ class LoRANetwork(torch.nn.Module):
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
                                 lora_dropout=lora_dropout,
+                                aid_dropout=aid_dropout,
                                 split_dims=split_dims,
                                 rank_stabilized=rank_stabilized,
                                 ggpo_beta=ggpo_beta,
