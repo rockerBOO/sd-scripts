@@ -18,7 +18,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 import re
-from library.model_utils import AID_GELU
+from library.model_utils import AID
 from library.utils import setup_logging
 from library.device_utils import clean_memory_on_device
 from library.network_utils import initialize_lora, initialize_pissa, initialize_urae, lora_dropout_down, lora_dropout_up
@@ -114,7 +114,7 @@ class LoRAModule(torch.nn.Module):
         self.lora_dropout = lora_dropout
 
         self.aid = (
-            AID_GELU(dropout_prob=aid_dropout, approximate="tanh") if aid_dropout is not None else torch.nn.Identity()
+            AID(aid_dropout) if aid_dropout is not None else torch.nn.Identity()
         )  # AID activation
 
         self.ggpo_sigma = ggpo_sigma
