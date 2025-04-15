@@ -45,7 +45,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
-from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
+from transformers import AutoTokenizer, CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection, T5Tokenizer
 import transformers
 from diffusers.optimization import (
     SchedulerType as DiffusersSchedulerType,
@@ -355,6 +355,8 @@ class BucketDataset(torch.utils.data.Dataset):
         self.set_current_step = self.base_dataset.set_current_step
         self.set_max_train_steps = self.base_dataset.set_max_train_steps
         self.set_seed = self.base_dataset.set_seed
+
+        self._length = 0
     
     def prepare_buckets(self):
         """Initialize bucket manager and assign images to buckets"""
@@ -476,199 +478,6 @@ class BucketDataset(torch.utils.data.Dataset):
                     # If tensors have different shapes, keep as list
                     batch[key] = values
             # Handle lists and other types
-            elif isinstance(first_item[key], list):
-                batch[key] = [val for item_val in values for val in item_val]
-            else:
-                batch[key] = values
-        
-        return batch
-
-class MultiBucketDataset(torch.utils.data.Dataset):
-    """
-    A dataset that combines multiple datasets under a single bucketing system.
-    """
-    def __init__(
-        self,
-        datasets,
-        batch_size,
-        min_bucket_reso: int,
-        max_bucket_reso: int,
-        bucket_no_upscale=False,
-        bucket_reso_steps=64
-    ):
-        super().__init__()
-        self.datasets = datasets
-        self.batch_size = batch_size
-        
-        # Bucket settings
-        self.bucket_no_upscale = bucket_no_upscale
-        self.min_bucket_reso = min_bucket_reso
-        self.max_bucket_reso = max_bucket_reso
-        self.bucket_reso_steps = bucket_reso_steps
-        
-        # Bucket data structures
-        self.bucket_manager: Optional[BucketManager] = None
-        self.buckets_indices = []
-        self.bucket_info: dict[str, Any] = {}
-        
-        # Dataset mapping - keep track of which dataset each image belongs to
-        self.dataset_map = {}  # image_key -> dataset_index
-        
-        # Track current state - we'll sync this to all datasets
-        self.current_epoch = 0
-        self.current_step = 0
-        self.max_train_steps = 0
-        self.seed = 0
-    
-    def set_current_epoch(self, epoch):
-        """Set current epoch for all datasets"""
-        self.current_epoch = epoch
-        for ds in self.datasets:
-            ds.set_current_epoch(epoch)
-    
-    def set_current_step(self, step):
-        """Set current step for all datasets"""
-        self.current_step = step
-        for ds in self.datasets:
-            ds.set_current_step(step)
-    
-    def set_max_train_steps(self, max_train_steps):
-        """Set max train steps for all datasets"""
-        self.max_train_steps = max_train_steps
-        for ds in self.datasets:
-            ds.set_max_train_steps(max_train_steps)
-    
-    def set_seed(self, seed):
-        """Set seed for all datasets"""
-        self.seed = seed
-        for ds in self.datasets:
-            ds.set_seed(seed)
-    
-    def prepare_buckets(self):
-        """Initialize bucket manager and assign images from all datasets to buckets"""
-        # Create bucket manager
-        width, height = self.datasets[0].width, self.datasets[0].height
-        self.bucket_manager = BucketManager(
-            self.bucket_no_upscale,
-            (width, height),
-            self.min_bucket_reso,
-            self.max_bucket_reso,
-            self.bucket_reso_steps,
-        )
-        
-        if not self.bucket_no_upscale:
-            self.bucket_manager.make_buckets()
-        else:
-            logger.warning("bucket_no_upscale is set - min/max bucket resolution ignored")
-            
-        # Assign images from all datasets to buckets
-        logger.info("Assigning images to buckets from multiple datasets")
-        img_ar_errors = []
-        
-        for dataset_index, dataset in enumerate(self.datasets):
-            for image_key, image_info in dataset.image_data.items():
-                # Create a unique key for this image across all datasets
-                unique_key = f"{dataset_index}_{image_key}"
-                self.dataset_map[unique_key] = dataset_index
-                
-                image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
-                    image_width, image_height
-                )
-                img_ar_errors.append(abs(ar_error))
-                
-                # Add image to bucket (with repeats)
-                for _ in range(image_info.num_repeats):
-                    self.bucket_manager.add_image(image_info.bucket_reso, unique_key)
-                    
-        # Sort buckets
-        self.bucket_manager.sort()
-        
-        # Log bucket information
-        self.bucket_info = {"buckets": {}}
-        logger.info("Number of images per bucket (including repeats):")
-        for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
-            count = len(bucket)
-            if count > 0:
-                self.bucket_info["buckets"][i] = {"resolution": reso, "count": count}
-                logger.info(f"Bucket {i}: resolution {reso}, count: {count}")
-                
-        if len(img_ar_errors) > 0:
-            mean_img_ar_error = np.mean(np.abs(img_ar_errors))
-            self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
-            logger.info(f"Mean aspect ratio error: {mean_img_ar_error}")
-            
-        # Create bucket indices for batch sampling
-        self.buckets_indices = []
-        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
-            batch_count = int(math.ceil(len(bucket) / self.batch_size))
-            for batch_index in range(batch_count):
-                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
-                
-        self.shuffle_buckets()
-        self._length = len(self.buckets_indices)
-        logger.info(f"Created {len(self.bucket_manager.buckets)} buckets with {self._length} batches")
-        
-    def shuffle_buckets(self):
-        """Shuffle the buckets and images within buckets"""
-        # Set random seed for this epoch
-        random.seed(self.seed + self.current_epoch)
-        
-        # Shuffle the bucket indices
-        random.shuffle(self.buckets_indices)
-        # Shuffle images within each bucket
-        self.bucket_manager.shuffle()
-        
-    def __len__(self):
-        return self._length
-        
-    def __getitem__(self, index):
-        """Get a batch from the specified bucket"""
-        bucket_index = self.buckets_indices[index].bucket_index
-        bucket = self.bucket_manager.buckets[bucket_index]
-        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
-        batch_index = self.buckets_indices[index].batch_index
-        
-        # Get the image keys for this batch
-        start_idx = batch_index * bucket_batch_size
-        end_idx = min(start_idx + bucket_batch_size, len(bucket))
-        unique_keys = bucket[start_idx:end_idx]
-        
-        # Collect individual items from the appropriate datasets
-        items = []
-        for unique_key in unique_keys:
-            dataset_index, image_key = unique_key.split("_", 1)
-            dataset_index = int(dataset_index)
-            items.append(self.datasets[dataset_index].get_item_by_key(image_key))
-        
-        # Combine items into a batch
-        batch = self._collate_items(items)
-        
-        # Add debug info
-        debug_enabled = any(ds.debug_dataset for ds in self.datasets)
-        if debug_enabled:
-            batch["batch_bucket_index"] = bucket_index
-            batch["unique_keys"] = unique_keys
-            
-        return batch
-    
-    def _collate_items(self, items):
-        """Combine multiple dataset items into a batch"""
-        # Implementation same as in BucketDataset._collate_items
-        batch = {}
-        first_item = items[0]
-        
-        for key in first_item.keys():
-            values = [item[key] for item in items if key in item]
-            
-            if not values:
-                continue
-                
-            if isinstance(first_item[key], torch.Tensor):
-                try:
-                    batch[key] = torch.stack(values)
-                except:
-                    batch[key] = values
             elif isinstance(first_item[key], list):
                 batch[key] = [val for item_val in values for val in item_val]
             else:
@@ -1187,7 +996,521 @@ class ControlNetSubset(BaseSubset):
         return self.image_dir == other.image_dir and self.conditioning_data_dir == other.conditioning_data_dir
 
 
-class BaseDataset(torch.utils.data.Dataset):
+class CacheableDataset:
+    def __init__(self) -> None:
+        self.subsets: list[BaseSubset] = []
+        self.image_data: dict[str, ImageInfo] = {}
+        self.image_to_subset: dict[str, BaseSubset] = {}
+
+        self.caching_mode = ""
+
+        self.tokenizers: list[T5Tokenizer] = []
+        self.tokenizer_max_length = -1
+        self.max_token_length = self.tokenizer_max_length
+
+        self.tokenize_strategy: TokenizeStrategy = TokenizeStrategy.get_strategy()
+        self.text_encoder_output_caching_strategy: TextEncoderOutputsCachingStrategy = TextEncoderOutputsCachingStrategy.get_strategy()
+        self.latents_caching_strategy: LatentsCachingStrategy = LatentsCachingStrategy.get_strategy()
+        self.text_encoding_strategy: TextEncodingStrategy = TextEncodingStrategy.get_strategy()
+
+        # Assert that we have the strategies
+        assert self.text_encoder_output_caching_strategy is not None, "Text encoder output caching strategy singleton is not available"
+        assert self.text_encoding_strategy is not None, "Text encoding strategy singleton is not available"
+        assert self.tokenize_strategy is not None, "Tokenize strategy singleton is not available"
+        assert self.latents_caching_strategy is not None, "Latents caching strategy singleton is not available"
+
+        self.batch_size = 0
+
+    def get_input_ids(self, caption, tokenizer=None):
+        if tokenizer is None:
+            tokenizer = self.tokenizers[0]
+
+        input_ids = tokenizer(
+            caption, padding="max_length", truncation=True, max_length=self.tokenizer_max_length, return_tensors="pt"
+        ).input_ids
+
+        if self.tokenizer_max_length > tokenizer.model_max_length:
+            input_ids = input_ids.squeeze(0)
+            iids_list = []
+            if tokenizer.pad_token_id == tokenizer.eos_token_id:
+                # v1
+                # 77以上の時は "<BOS> .... <EOS> <EOS> <EOS>" でトータル227とかになっているので、"<BOS>...<EOS>"の三連に変換する
+                # 1111氏のやつは , で区切る、とかしているようだが　とりあえず単純に
+                for i in range(
+                    1, self.tokenizer_max_length - tokenizer.model_max_length + 2, tokenizer.model_max_length - 2
+                ):  # (1, 152, 75)
+                    ids_chunk = (
+                        input_ids[0].unsqueeze(0),
+                        input_ids[i : i + tokenizer.model_max_length - 2],
+                        input_ids[-1].unsqueeze(0),
+                    )
+                    ids_chunk = torch.cat(ids_chunk)
+                    iids_list.append(ids_chunk)
+            else:
+                # v2 or SDXL
+                # 77以上の時は "<BOS> .... <EOS> <PAD> <PAD>..." でトータル227とかになっているので、"<BOS>...<EOS> <PAD> <PAD> ..."の三連に変換する
+                for i in range(1, self.tokenizer_max_length - tokenizer.model_max_length + 2, tokenizer.model_max_length - 2):
+                    ids_chunk = (
+                        input_ids[0].unsqueeze(0),  # BOS
+                        input_ids[i : i + tokenizer.model_max_length - 2],
+                        input_ids[-1].unsqueeze(0),
+                    )  # PAD or EOS
+                    ids_chunk = torch.cat(ids_chunk)
+
+                    # 末尾が <EOS> <PAD> または <PAD> <PAD> の場合は、何もしなくてよい
+                    # 末尾が x <PAD/EOS> の場合は末尾を <EOS> に変える（x <EOS> なら結果的に変化なし）
+                    if ids_chunk[-2] != tokenizer.eos_token_id and ids_chunk[-2] != tokenizer.pad_token_id:
+                        ids_chunk[-1] = tokenizer.eos_token_id
+                    # 先頭が <BOS> <PAD> ... の場合は <BOS> <EOS> <PAD> ... に変える
+                    if ids_chunk[1] == tokenizer.pad_token_id:
+                        ids_chunk[1] = tokenizer.eos_token_id
+
+                    iids_list.append(ids_chunk)
+
+            input_ids = torch.stack(iids_list)  # 3,77
+        return input_ids
+
+    def is_latent_cacheable(self):
+        return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
+
+    def is_text_encoder_output_cacheable(self):
+        return all(
+            [
+                not (
+                    subset.caption_dropout_rate > 0
+                    or subset.shuffle_caption
+                    or subset.token_warmup_step > 0
+                    or subset.caption_tag_dropout_rate > 0
+                )
+                for subset in self.subsets
+            ]
+        )
+
+    def new_cache_latents(self, model: Any, accelerator: Accelerator):
+        r"""
+        a brand new method to cache latents. This method caches latents with caching strategy.
+        normal cache_latents method is used by default, but this method is used when caching strategy is specified.
+        """
+        logger.info("caching latents with caching strategy.")
+        image_infos = list(self.image_data.values())
+
+        # sort by resolution
+        image_infos.sort(key=lambda info: info.image_size[0] * info.image_size[1])
+
+        # split by resolution and some conditions
+        class Condition:
+            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
+                self.reso = reso
+                self.flip_aug = flip_aug
+                self.alpha_mask = alpha_mask
+                self.random_crop = random_crop
+
+            def __eq__(self, other):
+                return (
+                    self.reso == other.reso
+                    and self.flip_aug == other.flip_aug
+                    and self.alpha_mask == other.alpha_mask
+                    and self.random_crop == other.random_crop
+                )
+
+        batch: List[ImageInfo] = []
+        current_condition = None
+
+        # support multiple-gpus
+        num_processes = accelerator.num_processes
+        process_index = accelerator.process_index
+
+        # define a function to submit a batch to cache
+        def submit_batch(batch, cond):
+            for info in batch:
+                if info.image is not None and isinstance(info.image, Future):
+                    info.image = info.image.result()  # future to image
+            self.latents_caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop)
+
+            # remove image from memory
+            for info in batch:
+                info.image = None
+
+        # define ThreadPoolExecutor to load images in parallel
+        max_workers = min(os.cpu_count(), len(image_infos))
+        max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
+        max_workers = min(max_workers, self.latents_caching_strategy.batch_size)  # max_workers should be less than batch_size
+        executor = ThreadPoolExecutor(max_workers)
+
+        try:
+            # iterate images
+            logger.info("caching latents...")
+            for i, info in enumerate(tqdm(image_infos)):
+                subset = self.image_to_subset[info.image_key]
+
+                if info.latents_npz is not None:  # fine tuning dataset
+                    continue
+
+                # check disk cache exists and size of latents
+                if self.latents_caching_strategy.cache_to_disk:
+                    # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
+                    info.latents_npz = self.latents_caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
+
+                    # if the modulo of num_processes is not equal to process_index, skip caching
+                    # this makes each process cache different latents
+                    if i % num_processes != process_index:
+                        continue
+
+                    # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
+
+                    cache_available = self.latents_caching_strategy.is_disk_cached_latents_expected(
+                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                    )
+                    if cache_available:  # do not add to batch
+                        continue
+
+                # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
+                condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+                if len(batch) > 0 and current_condition != condition:
+                    submit_batch(batch, current_condition)
+                    batch = []
+
+                if info.image is None:
+                    # load image in parallel
+                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
+
+                batch.append(info)
+                current_condition = condition
+
+                # if number of data in batch is enough, flush the batch
+                if len(batch) >= self.latents_caching_strategy.batch_size:
+                    submit_batch(batch, current_condition)
+                    batch = []
+                    current_condition = None
+
+            if len(batch) > 0:
+                submit_batch(batch, current_condition)
+
+        finally:
+            executor.shutdown()
+
+    def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
+        # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
+        logger.info("caching latents.")
+
+        image_infos = list(self.image_data.values())
+
+        # sort by resolution
+        image_infos.sort(key=lambda info: info.image_size[0] * info.image_size[1])
+
+        # split by resolution and some conditions
+        class Condition:
+            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
+                self.reso = reso
+                self.flip_aug = flip_aug
+                self.alpha_mask = alpha_mask
+                self.random_crop = random_crop
+
+            def __eq__(self, other):
+                return (
+                    self.reso == other.reso
+                    and self.flip_aug == other.flip_aug
+                    and self.alpha_mask == other.alpha_mask
+                    and self.random_crop == other.random_crop
+                )
+
+        batches: List[Tuple[Condition, List[ImageInfo]]] = []
+        batch: List[ImageInfo] = []
+        current_condition = None
+
+        logger.info("checking cache validity...")
+        for info in tqdm(image_infos):
+            subset = self.image_to_subset[info.image_key]
+
+            if info.latents_npz is not None:  # fine tuning dataset
+                continue
+
+            # check disk cache exists and size of latents
+            if cache_to_disk:
+                info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
+                if not is_main_process:  # store to info only
+                    continue
+
+                cache_available = is_disk_cached_latents_is_expected(
+                    info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
+                )
+
+                if cache_available:  # do not add to batch
+                    continue
+
+            # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
+            condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+            if len(batch) > 0 and current_condition != condition:
+                batches.append((current_condition, batch))
+                batch = []
+
+            batch.append(info)
+            current_condition = condition
+
+            # if number of data in batch is enough, flush the batch
+            if len(batch) >= vae_batch_size:
+                batches.append((current_condition, batch))
+                batch = []
+                current_condition = None
+
+        if len(batch) > 0:
+            batches.append((current_condition, batch))
+
+        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
+            return
+
+        # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
+        logger.info("caching latents...")
+        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
+            cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
+
+    def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
+        r"""
+        a brand new method to cache text encoder outputs. This method caches text encoder outputs with caching strategy.
+        """
+        batch_size = self.latents_caching_strategy.batch_size or self.batch_size
+
+        logger.info("caching Text Encoder outputs with caching strategy.")
+        image_infos = list(self.image_data.values())
+
+        # split by resolution
+        batches = []
+        batch = []
+
+        # support multiple-gpus
+        num_processes = accelerator.num_processes
+        process_index = accelerator.process_index
+
+        logger.info("checking cache validity...")
+        for i, info in enumerate(tqdm(image_infos)):
+            # check disk cache exists and size of text encoder outputs
+            if self.latents_caching_strategy.cache_to_disk:
+                te_out_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(info.absolute_path)
+                info.text_encoder_outputs_npz = te_out_npz  # set npz filename regardless of cache availability
+
+                # if the modulo of num_processes is not equal to process_index, skip caching
+                # this makes each process cache different text encoder outputs
+                if i % num_processes != process_index:
+                    continue
+
+                cache_available = self.text_encoder_output_caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                if cache_available:  # do not add to batch
+                    continue
+
+            batch.append(info)
+
+            # if number of data in batch is enough, flush the batch
+            if len(batch) >= batch_size:
+                batches.append(batch)
+                batch = []
+
+        if len(batch) > 0:
+            batches.append(batch)
+
+        if len(batches) == 0:
+            logger.info("no Text Encoder outputs to cache")
+            return
+
+        # iterate batches
+        logger.info("caching Text Encoder outputs...")
+        for batch in tqdm(batches, smoothing=1, total=len(batches)):
+            # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+            self.text_encoder_output_caching_strategy.cache_batch_outputs(self.tokenize_strategy, models, self.text_encoding_strategy, batch)
+
+    # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
+    # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
+    # to support SD1/2, it needs a flag for v2, but it is postponed
+    def cache_text_encoder_outputs(
+        self, tokenizers, text_encoders, device, output_dtype, cache_to_disk=False, is_main_process=True
+    ):
+        assert len(tokenizers) == 2, "only support SDXL"
+        return self.cache_text_encoder_outputs_common(
+            tokenizers, text_encoders, [device, device], output_dtype, [output_dtype], cache_to_disk, is_main_process
+        )
+
+    # same as above, but for SD3
+    def cache_text_encoder_outputs_sd3(
+        self, tokenizer, text_encoders, devices, output_dtype, te_dtypes, cache_to_disk=False, is_main_process=True, batch_size=None
+    ):
+        return self.cache_text_encoder_outputs_common(
+            [tokenizer],
+            text_encoders,
+            devices,
+            output_dtype,
+            te_dtypes,
+            cache_to_disk,
+            is_main_process,
+            TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX_SD3,
+            batch_size,
+        )
+
+    def cache_text_encoder_outputs_common(
+        self,
+        tokenizers,
+        text_encoders,
+        devices,
+        output_dtype,
+        te_dtypes,
+        cache_to_disk=False,
+        is_main_process=True,
+        file_suffix=TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX,
+        batch_size=None,
+    ):
+        # latentsのキャッシュと同様に、ディスクへのキャッシュに対応する
+        # またマルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
+        logger.info("caching text encoder outputs.")
+
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        image_infos = list(self.image_data.values())
+
+        logger.info("checking cache existence...")
+        image_infos_to_cache = []
+        for info in tqdm(image_infos):
+            # subset = self.image_to_subset[info.image_key]
+            if cache_to_disk:
+                te_out_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
+                info.text_encoder_outputs_npz = te_out_npz
+
+                if not is_main_process:  # store to info only
+                    continue
+
+                if os.path.exists(te_out_npz):
+                    # TODO check varidity of cache here
+                    continue
+
+            image_infos_to_cache.append(info)
+
+        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
+            return
+
+        # prepare tokenizers and text encoders
+        for text_encoder, device, te_dtype in zip(text_encoders, devices, te_dtypes):
+            text_encoder.to(device)
+            if te_dtype is not None:
+                text_encoder.to(dtype=te_dtype)
+
+        # create batch
+        is_sd3 = len(tokenizers) == 1
+        batch = []
+        batches = []
+        for info in image_infos_to_cache:
+            if not is_sd3:
+                input_ids1 = self.get_input_ids(info.caption, tokenizers[0])
+                input_ids2 = self.get_input_ids(info.caption, tokenizers[1])
+                batch.append((info, input_ids1, input_ids2))
+            else:
+                l_tokens, g_tokens, t5_tokens = self.tokenize_strategy.tokenize(info.caption)
+                batch.append((info, l_tokens, g_tokens, t5_tokens))
+
+            if len(batch) >= batch_size:
+                batches.append(batch)
+                batch = []
+
+        if len(batch) > 0:
+            batches.append(batch)
+
+        # iterate batches: call text encoder and cache outputs for memory or disk
+        logger.info("caching text encoder outputs...")
+        if not is_sd3:
+            for batch in tqdm(batches):
+                infos, input_ids1, input_ids2 = zip(*batch)
+                input_ids1 = torch.stack(input_ids1, dim=0)
+                input_ids2 = torch.stack(input_ids2, dim=0)
+                cache_batch_text_encoder_outputs(
+                    infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, output_dtype
+                )
+        else:
+            for batch in tqdm(batches):
+                infos, l_tokens, g_tokens, t5_tokens = zip(*batch)
+
+                # stack tokens
+                # l_tokens = [tokens[0] for tokens in l_tokens]
+                # g_tokens = [tokens[0] for tokens in g_tokens]
+                # t5_tokens = [tokens[0] for tokens in t5_tokens]
+
+                cache_batch_text_encoder_outputs_sd3(
+                    infos,
+                    tokenizers[0],
+                    text_encoders,
+                    self.max_token_length,
+                    cache_to_disk,
+                    (l_tokens, g_tokens, t5_tokens),
+                    output_dtype,
+                )
+
+    # def set_caching_mode(self, caching_mode: str):
+    #     self.caching_mode = caching_mode
+
+    # def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
+    #     captions = []
+    #     images = []
+    #     input_ids1_list = []
+    #     input_ids2_list = []
+    #     absolute_paths = []
+    #     resized_sizes = []
+    #     bucket_reso = None
+    #     flip_aug = None
+    #     alpha_mask = None
+    #     random_crop = None
+    #
+    #     for image_key in bucket[image_index : image_index + bucket_batch_size]:
+    #         image_info = self.image_data[image_key]
+    #         subset = self.image_to_subset[image_key]
+    #
+    #         if flip_aug is None:
+    #             flip_aug = subset.flip_aug
+    #             alpha_mask = subset.alpha_mask
+    #             random_crop = subset.random_crop
+    #             bucket_reso = image_info.bucket_reso
+    #         else:
+    #             # TODO そもそも混在してても動くようにしたほうがいい
+    #             assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
+    #             assert alpha_mask == subset.alpha_mask, "alpha_mask must be same in a batch"
+    #             assert random_crop == subset.random_crop, "random_crop must be same in a batch"
+    #             assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
+    #
+    #         caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
+    #
+    #         if self.caching_mode == "latents":
+    #             image = load_image(image_info.absolute_path)
+    #         else:
+    #             image = None
+    #
+    #         if self.caching_mode == "text":
+    #             input_ids1 = self.get_input_ids(caption, self.tokenizers[0])
+    #             input_ids2 = self.get_input_ids(caption, self.tokenizers[1])
+    #         else:
+    #             input_ids1 = None
+    #             input_ids2 = None
+    #
+    #         captions.append(caption)
+    #         images.append(image)
+    #         input_ids1_list.append(input_ids1)
+    #         input_ids2_list.append(input_ids2)
+    #         absolute_paths.append(image_info.absolute_path)
+    #         resized_sizes.append(image_info.resized_size)
+    #
+    #     example = {}
+    #
+    #     if images[0] is None:
+    #         images = None
+    #     example["images"] = images
+    #
+    #     example["captions"] = captions
+    #     example["input_ids1_list"] = input_ids1_list
+    #     example["input_ids2_list"] = input_ids2_list
+    #     example["absolute_paths"] = absolute_paths
+    #     example["resized_sizes"] = resized_sizes
+    #     example["flip_aug"] = flip_aug
+    #     example["alpha_mask"] = alpha_mask
+    #     example["random_crop"] = random_crop
+    #     example["bucket_reso"] = bucket_reso
+    #     return example
+
+
+class BaseDataset(torch.utils.data.Dataset, CacheableDataset):
     def __init__(
         self,
         resolution: Optional[Tuple[int, int]],
@@ -1207,12 +1530,6 @@ class BaseDataset(torch.utils.data.Dataset):
         self.subsets = []
         self.image_data: dict[str, ImageInfo] = {}  # Holds ImageInfo or ImageSetInfo objects
         self.image_to_subset = {}
-        
-        # State tracking
-        self.current_epoch = 0
-        self.current_step = 0
-        self.max_train_steps = 0
-        self.seed = 0
         
         # Processing utilities
         self.aug_helper = AugHelper()
@@ -1262,15 +1579,10 @@ class BaseDataset(torch.utils.data.Dataset):
                 self._indices.append(image_key)
         
         # Shuffle indices for training
-        self.shuffle_dataset()
         self._length = len(self._indices)
         logger.info(f"Dataset prepared with {self._length} items")
     
-    def shuffle_dataset(self):
-        """Shuffle the dataset indices"""
-        random.seed(self.seed + self.current_epoch)
-        random.shuffle(self._indices)
-    
+   
     def get_item_by_key(self, image_key):
         """Get a dataset item by its key instead of index"""
         image_info = self.image_data[image_key]
@@ -1605,7 +1917,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return caption
 
-    def apply_transforms(self, image, subset, flipped=False):
+    def apply_transforms(self, image, subset, flipped=False) -> tuple[Tensor, Optional[Tensor]]:
         """Apply transformations to the loaded image"""
         # Apply color augmentation if enabled
         aug = self.aug_helper.get_augmentor(subset.color_aug)
@@ -1646,31 +1958,6 @@ class BaseDataset(torch.utils.data.Dataset):
         self.text_encoder_output_caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         self.latents_caching_strategy = LatentsCachingStrategy.get_strategy()
 
-    def set_seed(self, seed):
-        self.seed = seed
-
-    def set_caching_mode(self, mode: str):
-        """caching mode: 'text' or 'latents'"""
-        self.caching_mode = mode
-
-    def set_current_epoch(self, epoch: int):
-        if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
-            if epoch > self.current_epoch:
-                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
-                num_epochs = epoch - self.current_epoch
-                for _ in range(num_epochs):
-                    self.current_epoch += 1
-                # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
-            else:
-                logger.warning("epoch is not incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
-                self.current_epoch = epoch
-
-    def set_current_step(self, step: int):
-        self.current_step = step
-
-    def set_max_train_steps(self, max_train_steps: int):
-        self.max_train_steps = max_train_steps
-
     def set_tag_frequency(self, dir_name, captions):
         frequency_for_dir = self.tag_frequency.get(dir_name, {})
         self.tag_frequency[dir_name] = frequency_for_dir
@@ -1692,442 +1979,22 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
-    def get_input_ids(self, caption, tokenizer=None):
-        if tokenizer is None:
-            tokenizer = self.tokenizers[0]
-
-        input_ids = tokenizer(
-            caption, padding="max_length", truncation=True, max_length=self.tokenizer_max_length, return_tensors="pt"
-        ).input_ids
-
-        if self.tokenizer_max_length > tokenizer.model_max_length:
-            input_ids = input_ids.squeeze(0)
-            iids_list = []
-            if tokenizer.pad_token_id == tokenizer.eos_token_id:
-                # v1
-                # 77以上の時は "<BOS> .... <EOS> <EOS> <EOS>" でトータル227とかになっているので、"<BOS>...<EOS>"の三連に変換する
-                # 1111氏のやつは , で区切る、とかしているようだが　とりあえず単純に
-                for i in range(
-                    1, self.tokenizer_max_length - tokenizer.model_max_length + 2, tokenizer.model_max_length - 2
-                ):  # (1, 152, 75)
-                    ids_chunk = (
-                        input_ids[0].unsqueeze(0),
-                        input_ids[i : i + tokenizer.model_max_length - 2],
-                        input_ids[-1].unsqueeze(0),
-                    )
-                    ids_chunk = torch.cat(ids_chunk)
-                    iids_list.append(ids_chunk)
-            else:
-                # v2 or SDXL
-                # 77以上の時は "<BOS> .... <EOS> <PAD> <PAD>..." でトータル227とかになっているので、"<BOS>...<EOS> <PAD> <PAD> ..."の三連に変換する
-                for i in range(1, self.tokenizer_max_length - tokenizer.model_max_length + 2, tokenizer.model_max_length - 2):
-                    ids_chunk = (
-                        input_ids[0].unsqueeze(0),  # BOS
-                        input_ids[i : i + tokenizer.model_max_length - 2],
-                        input_ids[-1].unsqueeze(0),
-                    )  # PAD or EOS
-                    ids_chunk = torch.cat(ids_chunk)
-
-                    # 末尾が <EOS> <PAD> または <PAD> <PAD> の場合は、何もしなくてよい
-                    # 末尾が x <PAD/EOS> の場合は末尾を <EOS> に変える（x <EOS> なら結果的に変化なし）
-                    if ids_chunk[-2] != tokenizer.eos_token_id and ids_chunk[-2] != tokenizer.pad_token_id:
-                        ids_chunk[-1] = tokenizer.eos_token_id
-                    # 先頭が <BOS> <PAD> ... の場合は <BOS> <EOS> <PAD> ... に変える
-                    if ids_chunk[1] == tokenizer.pad_token_id:
-                        ids_chunk[1] = tokenizer.eos_token_id
-
-                    iids_list.append(ids_chunk)
-
-            input_ids = torch.stack(iids_list)  # 3,77
-        return input_ids
-
     def register_image(self, info: ImageInfo, subset: BaseSubset):
         self.image_data[info.image_key] = info
         self.image_to_subset[info.image_key] = subset
 
-    def register_image_set(self, image_set: ImageSet, subset: BaseSubset):
-        for info in image_set.items:
-            self.image_to_set[info.image_key] = info.image_key
-            self.image_data[info.image_key] = info
-            self.image_to_subset[info.image_key] = subset
-
-    def is_latent_cacheable(self):
-        return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
-
-    def is_text_encoder_output_cacheable(self):
-        return all(
-            [
-                not (
-                    subset.caption_dropout_rate > 0
-                    or subset.shuffle_caption
-                    or subset.token_warmup_step > 0
-                    or subset.caption_tag_dropout_rate > 0
-                )
-                for subset in self.subsets
-            ]
-        )
-
-    def new_cache_latents(self, model: Any, accelerator: Accelerator):
-        r"""
-        a brand new method to cache latents. This method caches latents with caching strategy.
-        normal cache_latents method is used by default, but this method is used when caching strategy is specified.
+    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False) -> tuple[np.ndarray, int, int, int, int]:
         """
-        logger.info("caching latents with caching strategy.")
-        caching_strategy = LatentsCachingStrategy.get_strategy()
-        image_infos = list(self.image_data.values())
+        Load image with face info
 
-        # sort by resolution
-        image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
-
-        # split by resolution and some conditions
-        class Condition:
-            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
-                self.reso = reso
-                self.flip_aug = flip_aug
-                self.alpha_mask = alpha_mask
-                self.random_crop = random_crop
-
-            def __eq__(self, other):
-                return (
-                    self.reso == other.reso
-                    and self.flip_aug == other.flip_aug
-                    and self.alpha_mask == other.alpha_mask
-                    and self.random_crop == other.random_crop
-                )
-
-        batch: List[ImageInfo] = []
-        current_condition = None
-
-        # support multiple-gpus
-        num_processes = accelerator.num_processes
-        process_index = accelerator.process_index
-
-        # define a function to submit a batch to cache
-        def submit_batch(batch, cond):
-            for info in batch:
-                if info.image is not None and isinstance(info.image, Future):
-                    info.image = info.image.result()  # future to image
-            caching_strategy.cache_batch_latents(model, batch, cond.flip_aug, cond.alpha_mask, cond.random_crop)
-
-            # remove image from memory
-            for info in batch:
-                info.image = None
-
-        # define ThreadPoolExecutor to load images in parallel
-        max_workers = min(os.cpu_count(), len(image_infos))
-        max_workers = max(1, max_workers // num_processes)  # consider multi-gpu
-        max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
-        executor = ThreadPoolExecutor(max_workers)
-
-        try:
-            # iterate images
-            logger.info("caching latents...")
-            for i, info in enumerate(tqdm(image_infos)):
-                subset = self.image_to_subset[info.image_key]
-
-                if info.latents_npz is not None:  # fine tuning dataset
-                    continue
-
-                # check disk cache exists and size of latents
-                if caching_strategy.cache_to_disk:
-                    # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
-
-                    # if the modulo of num_processes is not equal to process_index, skip caching
-                    # this makes each process cache different latents
-                    if i % num_processes != process_index:
-                        continue
-
-                    # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
-
-                    cache_available = caching_strategy.is_disk_cached_latents_expected(
-                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
-                    )
-                    if cache_available:  # do not add to batch
-                        continue
-
-                # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-                condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-                if len(batch) > 0 and current_condition != condition:
-                    submit_batch(batch, current_condition)
-                    batch = []
-
-                if info.image is None:
-                    # load image in parallel
-                    info.image = executor.submit(load_image, info.absolute_path, condition.alpha_mask)
-
-                batch.append(info)
-                current_condition = condition
-
-                # if number of data in batch is enough, flush the batch
-                if len(batch) >= caching_strategy.batch_size:
-                    submit_batch(batch, current_condition)
-                    batch = []
-                    current_condition = None
-
-            if len(batch) > 0:
-                submit_batch(batch, current_condition)
-
-        finally:
-            executor.shutdown()
-
-    def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
-        # マルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
-        logger.info("caching latents.")
-
-        image_infos = list(self.image_data.values())
-
-        # sort by resolution
-        image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
-
-        # split by resolution and some conditions
-        class Condition:
-            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
-                self.reso = reso
-                self.flip_aug = flip_aug
-                self.alpha_mask = alpha_mask
-                self.random_crop = random_crop
-
-            def __eq__(self, other):
-                return (
-                    self.reso == other.reso
-                    and self.flip_aug == other.flip_aug
-                    and self.alpha_mask == other.alpha_mask
-                    and self.random_crop == other.random_crop
-                )
-
-        batches: List[Tuple[Condition, List[ImageInfo]]] = []
-        batch: List[ImageInfo] = []
-        current_condition = None
-
-        logger.info("checking cache validity...")
-        for info in tqdm(image_infos):
-            subset = self.image_to_subset[info.image_key]
-
-            if info.latents_npz is not None:  # fine tuning dataset
-                continue
-
-            # check disk cache exists and size of latents
-            if cache_to_disk:
-                info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                if not is_main_process:  # store to info only
-                    continue
-
-                cache_available = is_disk_cached_latents_is_expected(
-                    info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
-                )
-
-                if cache_available:  # do not add to batch
-                    continue
-
-            # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-            condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            if len(batch) > 0 and current_condition != condition:
-                batches.append((current_condition, batch))
-                batch = []
-
-            batch.append(info)
-            current_condition = condition
-
-            # if number of data in batch is enough, flush the batch
-            if len(batch) >= vae_batch_size:
-                batches.append((current_condition, batch))
-                batch = []
-                current_condition = None
-
-        if len(batch) > 0:
-            batches.append((current_condition, batch))
-
-        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
-            return
-
-        # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
-        logger.info("caching latents...")
-        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
-
-    def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
-        r"""
-        a brand new method to cache text encoder outputs. This method caches text encoder outputs with caching strategy.
+        Returns: 
+            tuple
+                img: np.ndarray
+                face_cx: int
+                face_cy: int
+                face_w: int
+                face_h: int
         """
-        tokenize_strategy = TokenizeStrategy.get_strategy()
-        text_encoding_strategy = TextEncodingStrategy.get_strategy()
-        caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
-        batch_size = caching_strategy.batch_size or self.batch_size
-
-        logger.info("caching Text Encoder outputs with caching strategy.")
-        image_infos = list(self.image_data.values())
-
-        # split by resolution
-        batches = []
-        batch = []
-
-        # support multiple-gpus
-        num_processes = accelerator.num_processes
-        process_index = accelerator.process_index
-
-        logger.info("checking cache validity...")
-        for i, info in enumerate(tqdm(image_infos)):
-            # check disk cache exists and size of text encoder outputs
-            if caching_strategy.cache_to_disk:
-                te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
-                info.text_encoder_outputs_npz = te_out_npz  # set npz filename regardless of cache availability
-
-                # if the modulo of num_processes is not equal to process_index, skip caching
-                # this makes each process cache different text encoder outputs
-                if i % num_processes != process_index:
-                    continue
-
-                cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
-                if cache_available:  # do not add to batch
-                    continue
-
-            batch.append(info)
-
-            # if number of data in batch is enough, flush the batch
-            if len(batch) >= batch_size:
-                batches.append(batch)
-                batch = []
-
-        if len(batch) > 0:
-            batches.append(batch)
-
-        if len(batches) == 0:
-            logger.info("no Text Encoder outputs to cache")
-            return
-
-        # iterate batches
-        logger.info("caching Text Encoder outputs...")
-        for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
-
-    # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
-    # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
-    # to support SD1/2, it needs a flag for v2, but it is postponed
-    def cache_text_encoder_outputs(
-        self, tokenizers, text_encoders, device, output_dtype, cache_to_disk=False, is_main_process=True
-    ):
-        assert len(tokenizers) == 2, "only support SDXL"
-        return self.cache_text_encoder_outputs_common(
-            tokenizers, text_encoders, [device, device], output_dtype, [output_dtype], cache_to_disk, is_main_process
-        )
-
-    # same as above, but for SD3
-    def cache_text_encoder_outputs_sd3(
-        self, tokenizer, text_encoders, devices, output_dtype, te_dtypes, cache_to_disk=False, is_main_process=True, batch_size=None
-    ):
-        return self.cache_text_encoder_outputs_common(
-            [tokenizer],
-            text_encoders,
-            devices,
-            output_dtype,
-            te_dtypes,
-            cache_to_disk,
-            is_main_process,
-            TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX_SD3,
-            batch_size,
-        )
-
-    def cache_text_encoder_outputs_common(
-        self,
-        tokenizers,
-        text_encoders,
-        devices,
-        output_dtype,
-        te_dtypes,
-        cache_to_disk=False,
-        is_main_process=True,
-        file_suffix=TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX,
-        batch_size=None,
-    ):
-        # latentsのキャッシュと同様に、ディスクへのキャッシュに対応する
-        # またマルチGPUには対応していないので、そちらはtools/cache_latents.pyを使うこと
-        logger.info("caching text encoder outputs.")
-
-        tokenize_strategy = TokenizeStrategy.get_strategy()
-
-        if batch_size is None:
-            batch_size = self.batch_size
-
-        image_infos = list(self.image_data.values())
-
-        logger.info("checking cache existence...")
-        image_infos_to_cache = []
-        for info in tqdm(image_infos):
-            # subset = self.image_to_subset[info.image_key]
-            if cache_to_disk:
-                te_out_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                info.text_encoder_outputs_npz = te_out_npz
-
-                if not is_main_process:  # store to info only
-                    continue
-
-                if os.path.exists(te_out_npz):
-                    # TODO check varidity of cache here
-                    continue
-
-            image_infos_to_cache.append(info)
-
-        if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
-            return
-
-        # prepare tokenizers and text encoders
-        for text_encoder, device, te_dtype in zip(text_encoders, devices, te_dtypes):
-            text_encoder.to(device)
-            if te_dtype is not None:
-                text_encoder.to(dtype=te_dtype)
-
-        # create batch
-        is_sd3 = len(tokenizers) == 1
-        batch = []
-        batches = []
-        for info in image_infos_to_cache:
-            if not is_sd3:
-                input_ids1 = self.get_input_ids(info.caption, tokenizers[0])
-                input_ids2 = self.get_input_ids(info.caption, tokenizers[1])
-                batch.append((info, input_ids1, input_ids2))
-            else:
-                l_tokens, g_tokens, t5_tokens = tokenize_strategy.tokenize(info.caption)
-                batch.append((info, l_tokens, g_tokens, t5_tokens))
-
-            if len(batch) >= batch_size:
-                batches.append(batch)
-                batch = []
-
-        if len(batch) > 0:
-            batches.append(batch)
-
-        # iterate batches: call text encoder and cache outputs for memory or disk
-        logger.info("caching text encoder outputs...")
-        if not is_sd3:
-            for batch in tqdm(batches):
-                infos, input_ids1, input_ids2 = zip(*batch)
-                input_ids1 = torch.stack(input_ids1, dim=0)
-                input_ids2 = torch.stack(input_ids2, dim=0)
-                cache_batch_text_encoder_outputs(
-                    infos, tokenizers, text_encoders, self.max_token_length, cache_to_disk, input_ids1, input_ids2, output_dtype
-                )
-        else:
-            for batch in tqdm(batches):
-                infos, l_tokens, g_tokens, t5_tokens = zip(*batch)
-
-                # stack tokens
-                # l_tokens = [tokens[0] for tokens in l_tokens]
-                # g_tokens = [tokens[0] for tokens in g_tokens]
-                # t5_tokens = [tokens[0] for tokens in t5_tokens]
-
-                cache_batch_text_encoder_outputs_sd3(
-                    infos,
-                    tokenizers[0],
-                    text_encoders,
-                    self.max_token_length,
-                    cache_to_disk,
-                    (l_tokens, g_tokens, t5_tokens),
-                    output_dtype,
-                )
-
-    def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False):
         img = load_image(image_path, alpha_mask)
 
         face_cx = face_cy = face_w = face_h = 0
@@ -2189,71 +2056,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         return image
 
-    def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
-        captions = []
-        images = []
-        input_ids1_list = []
-        input_ids2_list = []
-        absolute_paths = []
-        resized_sizes = []
-        bucket_reso = None
-        flip_aug = None
-        alpha_mask = None
-        random_crop = None
 
-        for image_key in bucket[image_index : image_index + bucket_batch_size]:
-            image_info = self.image_data[image_key]
-            subset = self.image_to_subset[image_key]
-
-            if flip_aug is None:
-                flip_aug = subset.flip_aug
-                alpha_mask = subset.alpha_mask
-                random_crop = subset.random_crop
-                bucket_reso = image_info.bucket_reso
-            else:
-                # TODO そもそも混在してても動くようにしたほうがいい
-                assert flip_aug == subset.flip_aug, "flip_aug must be same in a batch"
-                assert alpha_mask == subset.alpha_mask, "alpha_mask must be same in a batch"
-                assert random_crop == subset.random_crop, "random_crop must be same in a batch"
-                assert bucket_reso == image_info.bucket_reso, "bucket_reso must be same in a batch"
-
-            caption = image_info.caption  # TODO cache some patterns of dropping, shuffling, etc.
-
-            if self.caching_mode == "latents":
-                image = load_image(image_info.absolute_path)
-            else:
-                image = None
-
-            if self.caching_mode == "text":
-                input_ids1 = self.get_input_ids(caption, self.tokenizers[0])
-                input_ids2 = self.get_input_ids(caption, self.tokenizers[1])
-            else:
-                input_ids1 = None
-                input_ids2 = None
-
-            captions.append(caption)
-            images.append(image)
-            input_ids1_list.append(input_ids1)
-            input_ids2_list.append(input_ids2)
-            absolute_paths.append(image_info.absolute_path)
-            resized_sizes.append(image_info.resized_size)
-
-        example = {}
-
-        if images[0] is None:
-            images = None
-        example["images"] = images
-
-        example["captions"] = captions
-        example["input_ids1_list"] = input_ids1_list
-        example["input_ids2_list"] = input_ids2_list
-        example["absolute_paths"] = absolute_paths
-        example["resized_sizes"] = resized_sizes
-        example["flip_aug"] = flip_aug
-        example["alpha_mask"] = alpha_mask
-        example["random_crop"] = random_crop
-        example["bucket_reso"] = bucket_reso
-        return example
 
 class PreferenceHandler:
     def __init__(self, caption_prefix=None, caption_suffix=None, 
@@ -2318,11 +2121,6 @@ class DreamBoothDataset(BaseDataset):
         batch_size: int,
         resolution,
         network_multiplier: float,
-        enable_bucket: bool,
-        min_bucket_reso: int,
-        max_bucket_reso: int,
-        bucket_reso_steps: int,
-        bucket_no_upscale: bool,
         prior_loss_weight: float,
         debug_dataset: bool,
         validation_split: float,
@@ -2337,35 +2135,12 @@ class DreamBoothDataset(BaseDataset):
         self.batch_size = batch_size
         self.size = min(self.width, self.height)
         self.prior_loss_weight = prior_loss_weight
-        self.latents_cache = None
         self.is_training_dataset = is_training_dataset
         self.validation_split = validation_split
         self.validation_seed = validation_seed
 
-        # Configure bucketing settings
-        self._configure_buckets(enable_bucket, min_bucket_reso, max_bucket_reso, 
-                               bucket_reso_steps, bucket_no_upscale, resolution)
-
         # Process all subsets
         self._process_subsets(subsets)
-
-    def _configure_buckets(self, enable_bucket, min_bucket_reso, max_bucket_reso, 
-                           bucket_reso_steps, bucket_no_upscale, resolution):
-        """Configure resolution bucket settings"""
-        self.enable_bucket = enable_bucket
-        if self.enable_bucket:
-            min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
-                resolution, min_bucket_reso, max_bucket_reso, bucket_reso_steps
-            )
-            self.min_bucket_reso = min_bucket_reso
-            self.max_bucket_reso = max_bucket_reso
-            self.bucket_reso_steps = bucket_reso_steps
-            self.bucket_no_upscale = bucket_no_upscale
-        else:
-            self.min_bucket_reso = None
-            self.max_bucket_reso = None
-            self.bucket_reso_steps = None  # This info isn't used
-            self.bucket_no_upscale = False
 
     def _process_subsets(self, subsets):
         """Process all subsets to load images and captions"""
@@ -2503,7 +2278,7 @@ class DreamBoothDataset(BaseDataset):
         if use_cached_info:
             logger.info(f"Using cached image info for subset: {info_cache_file}")
             if not os.path.isfile(info_cache_file):
-                logger.warning(f"Image info cache not found. Ignoring this warning if this is first run.")
+                logger.warning("Image info cache not found. Ignoring this warning if this is first run.")
                 use_cached_info = False
 
         # Load image paths and sizes based on the scenario
@@ -2675,6 +2450,7 @@ class DreamBoothDataset(BaseDataset):
             json.dump(metadata, f, ensure_ascii=False, indent=2)
             
         logger.info(f"Image info cache created: {cache_file}")
+
 
 class FineTuningDataset(BaseDataset):
     def __init__(
@@ -2929,6 +2705,7 @@ class ControlNetDataset(BaseDataset):
             assert (
                 not subset.random_crop
             ), "random_crop is not supported in ControlNetDataset / random_cropはControlNetDatasetではサポートされていません"
+            assert subset.image_dir is not None, "Invalid image directory for subset"
             db_subset = DreamBoothSubset(
                 subset.image_dir,
                 False,
@@ -2972,11 +2749,6 @@ class ControlNetDataset(BaseDataset):
             batch_size,
             resolution,
             network_multiplier,
-            enable_bucket,
-            min_bucket_reso,
-            max_bucket_reso,
-            bucket_reso_steps,
-            bucket_no_upscale,
             1.0,
             debug_dataset,
             validation_split,
@@ -3038,19 +2810,19 @@ class ControlNetDataset(BaseDataset):
     def set_current_strategies(self):
         return self.dreambooth_dataset_delegate.set_current_strategies()
 
-    def make_buckets(self):
-        self.dreambooth_dataset_delegate.make_buckets()
-        self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
-        self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
+    # def make_buckets(self):
+    #     self.dreambooth_dataset_delegate.make_buckets()
+    #     self.bucket_manager = self.dreambooth_dataset_delegate.bucket_manager
+    #     self.buckets_indices = self.dreambooth_dataset_delegate.buckets_indices
 
-    def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True):
-        return self.dreambooth_dataset_delegate.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process)
+    def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
+        return self.dreambooth_dataset_delegate.cache_latents(vae, vae_batch_size, cache_to_disk, is_main_process, file_suffix)
 
     def new_cache_latents(self, model: Any, accelerator: Accelerator):
         return self.dreambooth_dataset_delegate.new_cache_latents(model, accelerator)
 
-    def new_cache_text_encoder_outputs(self, models: List[Any], is_main_process: bool):
-        return self.dreambooth_dataset_delegate.new_cache_text_encoder_outputs(models, is_main_process)
+    def new_cache_text_encoder_outputs(self, models: List[Any], accelerator: Accelerator):
+        return self.dreambooth_dataset_delegate.new_cache_text_encoder_outputs(models, accelerator)
 
     def __len__(self):
         return self.dreambooth_dataset_delegate.__len__()
@@ -3106,44 +2878,9 @@ class ControlNetDataset(BaseDataset):
 
         return example
 
-
-# behave as Dataset mock
-class DatasetGroup(torch.utils.data.ConcatDataset):
-    def __init__(self, datasets: Sequence[Union[DreamBoothDataset, FineTuningDataset]]):
-        self.datasets: List[Union[DreamBoothDataset, FineTuningDataset]]
-
-        super().__init__(datasets)
-
-        self.image_data = {}
-        self.num_train_images = 0
-        self.num_reg_images = 0
-
-        # simply concat together
-        # TODO: handling image_data key duplication among dataset
-        #   In practical, this is not the big issue because image_data is accessed from outside of dataset only for debug_dataset.
-        for dataset in datasets:
-            self.image_data.update(dataset.image_data)
-            self.num_train_images += dataset.num_train_images
-            self.num_reg_images += dataset.num_reg_images
-
-    def add_replacement(self, str_from, str_to):
-        for dataset in self.datasets:
-            dataset.add_replacement(str_from, str_to)
-
-    # def make_buckets(self):
-    #   for dataset in self.datasets:
-    #     dataset.make_buckets()
-
-    def set_text_encoder_output_caching_strategy(self, strategy: TextEncoderOutputsCachingStrategy):
-        """
-        DataLoader is run in multiple processes, so we need to set the strategy manually.
-        """
-        for dataset in self.datasets:
-            dataset.set_text_encoder_output_caching_strategy(strategy)
-
-    def enable_XTI(self, *args, **kwargs):
-        for dataset in self.datasets:
-            dataset.enable_XTI(*args, **kwargs)
+class CacheableDatasetGroup:
+    def __init__(self, datasets: Sequence[Union[DreamBoothDataset, FineTuningDataset]]) -> None:
+        self.datasets = datasets
 
     def cache_latents(self, vae, vae_batch_size=1, cache_to_disk=False, is_main_process=True, file_suffix=".npz"):
         for i, dataset in enumerate(self.datasets):
@@ -3178,9 +2915,47 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.new_cache_text_encoder_outputs(models, accelerator)
         accelerator.wait_for_everyone()
 
-    def set_caching_mode(self, caching_mode):
+# behave as Dataset mock
+class DatasetGroup(torch.utils.data.ConcatDataset, CacheableDatasetGroup):
+    def __init__(self, datasets: Sequence[Union[DreamBoothDataset, FineTuningDataset]]):
+        self.datasets: List[Union[DreamBoothDataset, FineTuningDataset]] = []
+
+        super().__init__(datasets)
+
+        self.image_data = {}
+        self.num_train_images = 0
+        self.num_reg_images = 0
+
+        # simply concat together
+        # TODO: handling image_data key duplication among dataset
+        #   In practical, this is not the big issue because image_data is accessed from outside of dataset only for debug_dataset.
+        for dataset in datasets:
+            self.image_data.update(dataset.image_data)
+            self.num_train_images += dataset.num_train_images
+            self.num_reg_images += dataset.num_reg_images
+
+    def add_replacement(self, str_from, str_to):
         for dataset in self.datasets:
-            dataset.set_caching_mode(caching_mode)
+            dataset.add_replacement(str_from, str_to)
+
+    # def make_buckets(self):
+    #   for dataset in self.datasets:
+    #     dataset.make_buckets()
+
+    def set_text_encoder_output_caching_strategy(self, strategy: TextEncoderOutputsCachingStrategy):
+        """
+        DataLoader is run in multiple processes, so we need to set the strategy manually.
+        """
+        for dataset in self.datasets:
+            dataset.set_text_encoder_output_caching_strategy(strategy)
+
+    def enable_XTI(self, *args, **kwargs):
+        for dataset in self.datasets:
+            dataset.enable_XTI(*args, **kwargs)
+
+    # def set_caching_mode(self, caching_mode):
+    #     for dataset in self.datasets:
+    #         dataset.set_caching_mode(caching_mode)
 
     def verify_bucket_reso_steps(self, min_steps: int):
         for dataset in self.datasets:
@@ -3248,6 +3023,200 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alph
         raise e
 
     return True
+
+class MultiBucketDataset(torch.utils.data.Dataset):
+    """
+    A dataset that combines multiple datasets under a single bucketing system.
+    """
+    def __init__(
+        self,
+        datasets: list[DatasetGroup],
+        batch_size: int,
+        min_bucket_reso: int,
+        max_bucket_reso: int,
+        bucket_no_upscale=False,
+        bucket_reso_steps=64
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.batch_size = batch_size
+        
+        # Bucket settings
+        self.bucket_no_upscale = bucket_no_upscale
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
+        self.bucket_reso_steps = bucket_reso_steps
+        
+        # Bucket data structures
+        self.bucket_manager: Optional[BucketManager] = None
+        self.buckets_indices = []
+        self.bucket_info: dict[str, Any] = {}
+        
+        # Dataset mapping - keep track of which dataset each image belongs to
+        self.dataset_map = {}  # image_key -> dataset_index
+        
+        # Track current state - we'll sync this to all datasets
+        self.current_epoch = 0
+        self.current_step = 0
+        self.max_train_steps = 0
+        self.seed = 0
+    
+    def set_current_epoch(self, epoch):
+        """Set current epoch for all datasets"""
+        self.current_epoch = epoch
+        for ds in self.datasets:
+            ds.set_current_epoch(epoch)
+    
+    def set_current_step(self, step):
+        """Set current step for all datasets"""
+        self.current_step = step
+        for ds in self.datasets:
+            ds.set_current_step(step)
+    
+    def set_max_train_steps(self, max_train_steps):
+        """Set max train steps for all datasets"""
+        self.max_train_steps = max_train_steps
+        for ds in self.datasets:
+            ds.set_max_train_steps(max_train_steps)
+    
+    def set_seed(self, seed):
+        """Set seed for all datasets"""
+        self.seed = seed
+        for ds in self.datasets:
+            ds.set_seed(seed)
+    
+    def prepare_buckets(self):
+        """Initialize bucket manager and assign images from all datasets to buckets"""
+        # Create bucket manager
+        width, height = self.datasets[0].width, self.datasets[0].height
+        self.bucket_manager = BucketManager(
+            self.bucket_no_upscale,
+            (width, height),
+            self.min_bucket_reso,
+            self.max_bucket_reso,
+            self.bucket_reso_steps,
+        )
+        
+        if not self.bucket_no_upscale:
+            self.bucket_manager.make_buckets()
+        else:
+            logger.warning("bucket_no_upscale is set - min/max bucket resolution ignored")
+            
+        # Assign images from all datasets to buckets
+        logger.info("Assigning images to buckets from multiple datasets")
+        img_ar_errors = []
+        
+        for dataset_index, dataset in enumerate(self.datasets):
+            for image_key, image_info in dataset.image_data.items():
+                # Create a unique key for this image across all datasets
+                unique_key = f"{dataset_index}_{image_key}"
+                self.dataset_map[unique_key] = dataset_index
+                
+                image_width, image_height = image_info.image_size
+                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                    image_width, image_height
+                )
+                img_ar_errors.append(abs(ar_error))
+                
+                # Add image to bucket (with repeats)
+                for _ in range(image_info.num_repeats):
+                    self.bucket_manager.add_image(image_info.bucket_reso, unique_key)
+                    
+        # Sort buckets
+        self.bucket_manager.sort()
+        
+        # Log bucket information
+        self.bucket_info = {"buckets": {}}
+        logger.info("Number of images per bucket (including repeats):")
+        for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
+            count = len(bucket)
+            if count > 0:
+                self.bucket_info["buckets"][i] = {"resolution": reso, "count": count}
+                logger.info(f"Bucket {i}: resolution {reso}, count: {count}")
+                
+        if len(img_ar_errors) > 0:
+            mean_img_ar_error = np.mean(np.abs(img_ar_errors))
+            self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
+            logger.info(f"Mean aspect ratio error: {mean_img_ar_error}")
+            
+        # Create bucket indices for batch sampling
+        self.buckets_indices = []
+        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
+            batch_count = int(math.ceil(len(bucket) / self.batch_size))
+            for batch_index in range(batch_count):
+                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
+                
+        self.shuffle_buckets()
+        self._length = len(self.buckets_indices)
+        logger.info(f"Created {len(self.bucket_manager.buckets)} buckets with {self._length} batches")
+        
+    def shuffle_buckets(self):
+        """Shuffle the buckets and images within buckets"""
+        # Set random seed for this epoch
+        random.seed(self.seed + self.current_epoch)
+        
+        # Shuffle the bucket indices
+        random.shuffle(self.buckets_indices)
+        # Shuffle images within each bucket
+        self.bucket_manager.shuffle()
+        
+    def __len__(self):
+        return self._length
+        
+    def __getitem__(self, index):
+        """Get a batch from the specified bucket"""
+        bucket_index = self.buckets_indices[index].bucket_index
+        bucket = self.bucket_manager.buckets[bucket_index]
+        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
+        batch_index = self.buckets_indices[index].batch_index
+        
+        # Get the image keys for this batch
+        start_idx = batch_index * bucket_batch_size
+        end_idx = min(start_idx + bucket_batch_size, len(bucket))
+        unique_keys = bucket[start_idx:end_idx]
+        
+        # Collect individual items from the appropriate datasets
+        items = []
+        for unique_key in unique_keys:
+            dataset_index, image_key = unique_key.split("_", 1)
+            dataset_index = int(dataset_index)
+            items.append(self.datasets[dataset_index].get_item_by_key(image_key))
+        
+        # Combine items into a batch
+        batch = self._collate_items(items)
+        
+        # Add debug info
+        debug_enabled = any(ds.debug_dataset for ds in self.datasets)
+        if debug_enabled:
+            batch["batch_bucket_index"] = bucket_index
+            batch["unique_keys"] = unique_keys
+            
+        return batch
+    
+    def _collate_items(self, items):
+        """Combine multiple dataset items into a batch"""
+        # Implementation same as in BucketDataset._collate_items
+        batch = {}
+        first_item = items[0]
+        
+        for key in first_item.keys():
+            values = [item[key] for item in items if key in item]
+            
+            if not values:
+                continue
+                
+            if isinstance(first_item[key], torch.Tensor):
+                try:
+                    batch[key] = torch.stack(values)
+                except:
+                    batch[key] = values
+            elif isinstance(first_item[key], list):
+                batch[key] = [val for item_val in values for val in item_val]
+            else:
+                batch[key] = values
+        
+        return batch
+
 
 
 # 戻り値は、latents_tensor, (original_size width, original_size height), (crop left, crop top)
@@ -3422,10 +3391,6 @@ class MinimalDataset(BaseDataset):
     def __len__(self):
         raise NotImplementedError
 
-    # override to avoid shuffling buckets
-    def set_current_epoch(self, epoch):
-        self.current_epoch = epoch
-
     def __getitem__(self, idx):
         r"""
         The subclass may have image_data for debug_dataset, which is a dict of ImageInfo objects.
@@ -3473,7 +3438,7 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
     return train_dataset_group
 
 
-def load_image(image_path, alpha=False):
+def load_image(image_path, alpha=False) -> np.ndarray:
     try:
         with Image.open(image_path) as image:
             if alpha:
