@@ -516,7 +516,7 @@ class LatentsCachingStrategy:
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[tuple[int, int]], Optional[tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
         """
         for SD/SDXL
         """
@@ -524,7 +524,7 @@ class LatentsCachingStrategy:
 
     def _default_load_latents_from_disk(
         self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[tuple[int, int]], Optional[tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
         if latents_stride is None:
             key_reso_suffix = ""
         else:
@@ -536,8 +536,8 @@ class LatentsCachingStrategy:
             raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
 
         latents = npz["latents" + key_reso_suffix]
-        original_size = npz["original_size" + key_reso_suffix].tolist()
-        crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
+        original_size = npz["original_size" + key_reso_suffix].totuple()
+        crop_ltrb = npz["crop_ltrb" + key_reso_suffix].totuple()
         flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
         alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
         return latents, original_size, crop_ltrb, flipped_latents, alpha_mask

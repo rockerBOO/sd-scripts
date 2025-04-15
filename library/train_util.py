@@ -7,22 +7,28 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import datetime
 import importlib
 import json
+from dataclasses import dataclass
 import logging
 import pathlib
-import re
 import shutil
 import time
-import typing
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union
+)
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState, DataLoaderConfiguration
 import glob
 import math
 import os
 import random
-import hashlib
-import subprocess
 from io import BytesIO
-import toml
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -35,6 +41,7 @@ from library.strategy_base import LatentsCachingStrategy, TokenizeStrategy, Text
 
 init_ipex()
 
+from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
@@ -179,20 +186,23 @@ def split_train_val(
 
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str, role="image") -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
         self.is_reg: bool = is_reg
         self.absolute_path: str = absolute_path
-        self.image_size: Tuple[int, int] = None
-        self.resized_size: Tuple[int, int] = None
-        self.bucket_reso: Tuple[int, int] = None
+        self.role = role  # What this image represents in the set (e.g., "image", "mask", "preferred", "non-preferred")
+        self.image_size: Optional[Tuple[int, int]] = None
+        self.resized_size: Optional[Tuple[int, int]] = None
+        self.bucket_reso: Optional[Tuple[int, int]] = None
+
+        # Latents
         self.latents: Optional[torch.Tensor] = None
         self.latents_flipped: Optional[torch.Tensor] = None
         self.latents_npz: Optional[str] = None  # set in cache_latents
         self.latents_original_size: Optional[Tuple[int, int]] = None  # original image size, not latents size
-        self.latents_crop_ltrb: Optional[Tuple[int, int]] = (
+        self.latents_crop_ltrb: Optional[Tuple[int, int, int, int]] = (
             None  # crop left top right bottom in original pixel size, not latents size
         )
         self.cond_img_path: Optional[str] = None
@@ -223,9 +233,452 @@ class ImageSetInfo(ImageInfo):
         self.captions.append(caption)
         self.image_sizes.append(size)
 
+class ImageSet:
+    """A collection of related images that should be processed together"""
+    def __init__(self):
+        self.items: list[ImageInfo] = []
+    
+    def add_image(self, image_info: ImageInfo):
+        """Add an image to this set"""
+        self.items.append(image_info)
+    
+    def get_image_count(self):
+        """Return the number of images in this set"""
+        return len(self.items)
+    
+    def get_image_by_role(self, role: str):
+        """Get an image by its role in the set"""
+        for item in self.items:
+            if item.role == role:
+                return item
+        return None
+    
+    def get_image_by_index(self, index: int) -> Optional[ImageInfo]:
+        """Get an image by its position in the set"""
+        if 0 <= index < len(self.items):
+            return self.items[index]
+        return None
+
+    @property
+    def set_type(self) -> str:
+        """Infer the type of set based on its contents"""
+        # Check for preference pair
+        if self.get_image_count() >= 2:
+            preferred = self.get_image_by_role("preferred")
+            non_preferred = self.get_image_by_role("non_preferred")
+            if preferred and non_preferred:
+                return "preference_pair"
+            
+        # Default case: single image or unknown combination
+        return "single"
+    
+    @property
+    def is_preference_pair(self) -> bool:
+        """Convenience method to check if this is a preference pair"""
+        return self.set_type == "preference_pair"
+    
+    @property
+    def is_image_mask_pair(self) -> bool:
+        """Convenience method to check if this is an image+mask pair"""
+        return self.set_type == "image_mask"
+
+    # Factory methods for specific types of image sets
+    @classmethod
+    def create_single(cls, image_info: ImageInfo) -> 'ImageSet':
+        """Create a set with a single image"""
+        image_set = cls()
+        image_set.add_image(image_info)
+        return image_set
+    
+    @classmethod
+    def create_preference_pair(cls, preferred: ImageInfo, non_preferred: ImageInfo) -> 'ImageSet':
+        """Create a preference pair set"""
+        # Make sure roles are set correctly
+        preferred.role = "preferred" 
+        non_preferred.role = "non_preferred"
+        
+        image_set = cls()
+        image_set.add_image(preferred)
+        image_set.add_image(non_preferred)
+        return image_set
+    
+    @classmethod
+    def create_image_mask_pair(cls, img: ImageInfo, mask: ImageInfo) -> 'ImageSet':
+        """Create an image+mask pair set"""
+        # Make sure roles are set correctly
+        img.role = "image" 
+        mask.role = "mask"
+
+        image_set = cls()
+        image_set.add_image(img)
+        image_set.add_image(mask)
+        return image_set
+
+@dataclass
+class BucketBatchIndex:
+    idx: int
+    batch_size: int
+    batch_idx: int
+
+class BucketDataset(torch.utils.data.Dataset):
+    """
+    A dataset wrapper that implements bucketing on top of any dataset.
+    It groups dataset items into buckets based on resolution and samples
+    from these buckets during training.
+    """
+    def __init__(
+        self,
+        base_dataset,
+        batch_size,
+        min_bucket_reso: int,
+        max_bucket_reso: int,
+        bucket_no_upscale=False,
+        bucket_reso_steps=64
+    ):
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.batch_size = batch_size
+        
+        # Bucket settings
+        self.bucket_no_upscale = bucket_no_upscale
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
+        self.bucket_reso_steps = bucket_reso_steps
+        
+        # Bucket data structures
+        self.bucket_manager = None
+        self.buckets_indices = []
+        self.bucket_info: dict[str, Any] = {}
+        
+        # Delegate some methods to base dataset
+        self.set_current_epoch = self.base_dataset.set_current_epoch
+        self.set_current_step = self.base_dataset.set_current_step
+        self.set_max_train_steps = self.base_dataset.set_max_train_steps
+        self.set_seed = self.base_dataset.set_seed
+    
+    def prepare_buckets(self):
+        """Initialize bucket manager and assign images to buckets"""
+        # Create bucket manager
+        width, height = self.base_dataset.width, self.base_dataset.height
+        self.bucket_manager = BucketManager(
+            self.bucket_no_upscale,
+            (width, height),
+            self.min_bucket_reso,
+            self.max_bucket_reso,
+            self.bucket_reso_steps,
+        )
+        
+        if not self.bucket_no_upscale:
+            self.bucket_manager.make_buckets()
+        else:
+            logger.warning("bucket_no_upscale is set - min/max bucket resolution ignored")
+            
+        # Assign images to buckets
+        logger.info("Assigning images to buckets")
+        img_ar_errors = []
+        
+        for image_key, image_info in tqdm(self.base_dataset.image_data.items()):
+            image_width, image_height = image_info.image_size
+            image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                image_width, image_height
+            )
+            img_ar_errors.append(abs(ar_error))
+            
+            # Add image to bucket (with repeats)
+            for _ in range(image_info.num_repeats):
+                self.bucket_manager.add_image(image_info.bucket_reso, image_key)
+                
+        # Sort buckets
+        self.bucket_manager.sort()
+        
+        # Log bucket information
+        self.bucket_info = {"buckets": {}}
+        logger.info("Number of images per bucket (including repeats):")
+        for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
+            count = len(bucket)
+            if count > 0:
+                self.bucket_info["buckets"][i] = {"resolution": reso, "count": count}
+                logger.info(f"Bucket {i}: resolution {reso}, count: {count}")
+                
+        if img_ar_errors:
+            mean_img_ar_error = np.mean(np.abs(img_ar_errors))
+            self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
+            logger.info(f"Mean aspect ratio error: {mean_img_ar_error}")
+            
+        # Create bucket indices for batch sampling
+        self.buckets_indices = []
+        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
+            batch_count = int(math.ceil(len(bucket) / self.batch_size))
+            for batch_index in range(batch_count):
+                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
+                
+        self.shuffle_buckets()
+        self._length = len(self.buckets_indices)
+        logger.info(f"Created {len(self.bucket_manager.buckets)} buckets with {self._length} batches")
+        
+    def shuffle_buckets(self):
+        """Shuffle the buckets and images within buckets"""
+        # Set random seed for this epoch
+        random.seed(self.base_dataset.seed + self.base_dataset.current_epoch)
+        
+        # Shuffle the bucket indices
+        random.shuffle(self.buckets_indices)
+        # Shuffle images within each bucket
+        self.bucket_manager.shuffle()
+        
+    def __len__(self):
+        return self._length
+        
+    def __getitem__(self, index):
+        """Get a batch from the specified bucket"""
+        bucket_index = self.buckets_indices[index].bucket_index
+        bucket = self.bucket_manager.buckets[bucket_index]
+        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
+        batch_index = self.buckets_indices[index].batch_index
+        
+        # Get the image keys for this batch
+        start_idx = batch_index * bucket_batch_size
+        end_idx = min(start_idx + bucket_batch_size, len(bucket))
+        image_keys = bucket[start_idx:end_idx]
+        
+        # Collect individual items from the base dataset
+        items = [self.base_dataset.get_item_by_key(key) for key in image_keys]
+        
+        # Combine items into a batch
+        batch = self._collate_items(items)
+        
+        if self.base_dataset.debug_dataset:
+            batch["batch_bucket_index"] = bucket_index
+            batch["image_keys"] = image_keys
+            
+        return batch
+    
+    def _collate_items(self, items):
+        """Combine multiple dataset items into a batch"""
+        # Start with the first item's keys
+        batch = {}
+        first_item = items[0]
+        
+        # For each key in the first item
+        for key in first_item.keys():
+            values = [item[key] for item in items if key in item]
+            
+            # Skip if no values
+            if not values:
+                continue
+                
+            # Handle tensors
+            if isinstance(first_item[key], torch.Tensor):
+                # Try to stack tensors
+                try:
+                    batch[key] = torch.stack(values)
+                except:
+                    # If tensors have different shapes, keep as list
+                    batch[key] = values
+            # Handle lists and other types
+            elif isinstance(first_item[key], list):
+                batch[key] = [val for item_val in values for val in item_val]
+            else:
+                batch[key] = values
+        
+        return batch
+
+class MultiBucketDataset(torch.utils.data.Dataset):
+    """
+    A dataset that combines multiple datasets under a single bucketing system.
+    """
+    def __init__(
+        self,
+        datasets,
+        batch_size,
+        min_bucket_reso: int,
+        max_bucket_reso: int,
+        bucket_no_upscale=False,
+        bucket_reso_steps=64
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.batch_size = batch_size
+        
+        # Bucket settings
+        self.bucket_no_upscale = bucket_no_upscale
+        self.min_bucket_reso = min_bucket_reso
+        self.max_bucket_reso = max_bucket_reso
+        self.bucket_reso_steps = bucket_reso_steps
+        
+        # Bucket data structures
+        self.bucket_manager: Optional[BucketManager] = None
+        self.buckets_indices = []
+        self.bucket_info: dict[str, Any] = {}
+        
+        # Dataset mapping - keep track of which dataset each image belongs to
+        self.dataset_map = {}  # image_key -> dataset_index
+        
+        # Track current state - we'll sync this to all datasets
+        self.current_epoch = 0
+        self.current_step = 0
+        self.max_train_steps = 0
+        self.seed = 0
+    
+    def set_current_epoch(self, epoch):
+        """Set current epoch for all datasets"""
+        self.current_epoch = epoch
+        for ds in self.datasets:
+            ds.set_current_epoch(epoch)
+    
+    def set_current_step(self, step):
+        """Set current step for all datasets"""
+        self.current_step = step
+        for ds in self.datasets:
+            ds.set_current_step(step)
+    
+    def set_max_train_steps(self, max_train_steps):
+        """Set max train steps for all datasets"""
+        self.max_train_steps = max_train_steps
+        for ds in self.datasets:
+            ds.set_max_train_steps(max_train_steps)
+    
+    def set_seed(self, seed):
+        """Set seed for all datasets"""
+        self.seed = seed
+        for ds in self.datasets:
+            ds.set_seed(seed)
+    
+    def prepare_buckets(self):
+        """Initialize bucket manager and assign images from all datasets to buckets"""
+        # Create bucket manager
+        width, height = self.datasets[0].width, self.datasets[0].height
+        self.bucket_manager = BucketManager(
+            self.bucket_no_upscale,
+            (width, height),
+            self.min_bucket_reso,
+            self.max_bucket_reso,
+            self.bucket_reso_steps,
+        )
+        
+        if not self.bucket_no_upscale:
+            self.bucket_manager.make_buckets()
+        else:
+            logger.warning("bucket_no_upscale is set - min/max bucket resolution ignored")
+            
+        # Assign images from all datasets to buckets
+        logger.info("Assigning images to buckets from multiple datasets")
+        img_ar_errors = []
+        
+        for dataset_index, dataset in enumerate(self.datasets):
+            for image_key, image_info in dataset.image_data.items():
+                # Create a unique key for this image across all datasets
+                unique_key = f"{dataset_index}_{image_key}"
+                self.dataset_map[unique_key] = dataset_index
+                
+                image_width, image_height = image_info.image_size
+                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+                    image_width, image_height
+                )
+                img_ar_errors.append(abs(ar_error))
+                
+                # Add image to bucket (with repeats)
+                for _ in range(image_info.num_repeats):
+                    self.bucket_manager.add_image(image_info.bucket_reso, unique_key)
+                    
+        # Sort buckets
+        self.bucket_manager.sort()
+        
+        # Log bucket information
+        self.bucket_info = {"buckets": {}}
+        logger.info("Number of images per bucket (including repeats):")
+        for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
+            count = len(bucket)
+            if count > 0:
+                self.bucket_info["buckets"][i] = {"resolution": reso, "count": count}
+                logger.info(f"Bucket {i}: resolution {reso}, count: {count}")
+                
+        if len(img_ar_errors) > 0:
+            mean_img_ar_error = np.mean(np.abs(img_ar_errors))
+            self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
+            logger.info(f"Mean aspect ratio error: {mean_img_ar_error}")
+            
+        # Create bucket indices for batch sampling
+        self.buckets_indices = []
+        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
+            batch_count = int(math.ceil(len(bucket) / self.batch_size))
+            for batch_index in range(batch_count):
+                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
+                
+        self.shuffle_buckets()
+        self._length = len(self.buckets_indices)
+        logger.info(f"Created {len(self.bucket_manager.buckets)} buckets with {self._length} batches")
+        
+    def shuffle_buckets(self):
+        """Shuffle the buckets and images within buckets"""
+        # Set random seed for this epoch
+        random.seed(self.seed + self.current_epoch)
+        
+        # Shuffle the bucket indices
+        random.shuffle(self.buckets_indices)
+        # Shuffle images within each bucket
+        self.bucket_manager.shuffle()
+        
+    def __len__(self):
+        return self._length
+        
+    def __getitem__(self, index):
+        """Get a batch from the specified bucket"""
+        bucket_index = self.buckets_indices[index].bucket_index
+        bucket = self.bucket_manager.buckets[bucket_index]
+        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
+        batch_index = self.buckets_indices[index].batch_index
+        
+        # Get the image keys for this batch
+        start_idx = batch_index * bucket_batch_size
+        end_idx = min(start_idx + bucket_batch_size, len(bucket))
+        unique_keys = bucket[start_idx:end_idx]
+        
+        # Collect individual items from the appropriate datasets
+        items = []
+        for unique_key in unique_keys:
+            dataset_index, image_key = unique_key.split("_", 1)
+            dataset_index = int(dataset_index)
+            items.append(self.datasets[dataset_index].get_item_by_key(image_key))
+        
+        # Combine items into a batch
+        batch = self._collate_items(items)
+        
+        # Add debug info
+        debug_enabled = any(ds.debug_dataset for ds in self.datasets)
+        if debug_enabled:
+            batch["batch_bucket_index"] = bucket_index
+            batch["unique_keys"] = unique_keys
+            
+        return batch
+    
+    def _collate_items(self, items):
+        """Combine multiple dataset items into a batch"""
+        # Implementation same as in BucketDataset._collate_items
+        batch = {}
+        first_item = items[0]
+        
+        for key in first_item.keys():
+            values = [item[key] for item in items if key in item]
+            
+            if not values:
+                continue
+                
+            if isinstance(first_item[key], torch.Tensor):
+                try:
+                    batch[key] = torch.stack(values)
+                except:
+                    batch[key] = values
+            elif isinstance(first_item[key], list):
+                batch[key] = [val for item_val in values for val in item_val]
+            else:
+                batch[key] = values
+        
+        return batch
+
 
 class BucketManager:
-    def __init__(self, no_upscale, max_reso, min_size, max_size, reso_steps) -> None:
+    def __init__(self, no_upscale: Optional[bool], max_reso: Optional[tuple[int, int]], min_size: int, max_size: int, reso_steps: int) -> None:
         if max_size is not None:
             if max_reso is not None:
                 assert max_size >= max_reso[0], "the max_size should be larger than the width of max_reso"
@@ -274,6 +727,7 @@ class BucketManager:
 
     def make_buckets(self):
         resos = model_util.make_bucket_resolutions(self.max_reso, self.min_size, self.max_size, self.reso_steps)
+        print(resos)
         self.set_predefined_resos(resos)
 
     def set_predefined_resos(self, resos):
@@ -294,7 +748,15 @@ class BucketManager:
         x = int(x + 0.5)
         return x - x % self.reso_steps
 
-    def select_bucket(self, image_width, image_height):
+    def select_bucket(self, image_width: int, image_height: int) -> tuple[tuple[int, int], tuple[int, int], float]:
+        """
+        Returns:
+            (
+                reso: tuple[int, int]
+                resized_size: tuple[int, int]
+                ar_error
+            )
+        """
         aspect_ratio = image_width / image_height
         if not self.no_upscale:
             # 拡大および縮小を行う
@@ -376,11 +838,6 @@ class BucketManager:
         crop_bottom = crop_top + resized_height
         return crop_left, crop_top, crop_right, crop_bottom
 
-
-class BucketBatchIndex(NamedTuple):
-    bucket_index: int
-    bucket_batch_size: int
-    batch_index: int
 
 
 class AugHelper:
@@ -568,6 +1025,15 @@ class DreamBoothSubset(BaseSubset):
             self.caption_extension = "." + self.caption_extension
         self.cache_info = cache_info
 
+        self.preference_handler = None
+        if preference:
+            self.preference_handler = PreferenceHandler(
+            caption_prefix=preference_caption_prefix,
+            caption_suffix=preference_caption_suffix,
+            non_preference_caption_prefix=non_preference_caption_prefix,
+            non_preference_caption_suffix=non_preference_caption_suffix,
+        )
+
     def __eq__(self, other) -> bool:
         if not isinstance(other, DreamBoothSubset):
             return NotImplemented
@@ -731,109 +1197,478 @@ class BaseDataset(torch.utils.data.Dataset):
     ) -> None:
         super().__init__()
 
-        # width/height is used when enable_bucket==False
+        # Basic configuration
         self.width, self.height = (None, None) if resolution is None else resolution
         self.network_multiplier = network_multiplier
         self.debug_dataset = debug_dataset
+        self.resize_interpolation = resize_interpolation if resize_interpolation is not None and validate_interpolation_fn(resize_interpolation) else None
 
-        self.subsets: List[Union[DreamBoothSubset, FineTuningSubset]] = []
+        # Data containers
+        self.subsets = []
+        self.image_data: dict[str, ImageInfo] = {}  # Holds ImageInfo or ImageSetInfo objects
+        self.image_to_subset = {}
+        
+        # State tracking
+        self.current_epoch = 0
+        self.current_step = 0
+        self.max_train_steps = 0
+        self.seed = 0
+        
+        # Processing utilities
+        self.aug_helper = AugHelper()
+        self.image_transforms = IMAGE_TRANSFORMS
+        self.tokenize_strategy: TokenizeStrategy = TokenizeStrategy.get_strategy()
+        self.text_encoder_output_caching_strategy: TextEncoderOutputsCachingStrategy = TextEncoderOutputsCachingStrategy.get_strategy()
+        self.latents_caching_strategy: LatentsCachingStrategy = LatentsCachingStrategy.get_strategy()
 
+        # Assert that we have the strategies
+        assert self.text_encoder_output_caching_strategy is not None, "Text encoder output caching strategy singleton is not available"
+        assert self.tokenize_strategy is not None, "Tokenize strategy singleton is not available"
+        assert self.latents_caching_strategy is not None, "Latents caching strategy singleton is not available"
+        
+        # Misc settings
         self.token_padding_disabled = False
         self.tag_frequency = {}
         self.XTI_layers = None
         self.token_strings = None
-
-        self.enable_bucket = False
-        self.bucket_manager: BucketManager = None  # not initialized
-        self.min_bucket_reso = None
-        self.max_bucket_reso = None
-        self.bucket_reso_steps = None
-        self.bucket_no_upscale = None
-        self.bucket_info = None  # for metadata
-
-        self.current_epoch: int = 0  # インスタンスがepochごとに新しく作られるようなので外側から渡さないとダメ
-
-        self.current_step: int = 0
-        self.max_train_steps: int = 0
-        self.seed: int = 0
-
-        # augmentation
-        self.aug_helper = AugHelper()
-
-        self.image_transforms = IMAGE_TRANSFORMS
-
-        if resize_interpolation is not None:
-            assert validate_interpolation_fn(resize_interpolation), f"Resize interpolation \"{resize_interpolation}\" is not a valid interpolation"
-        self.resize_interpolation = resize_interpolation
-
-        self.image_data: Dict[str, ImageInfo] = {}
-        self.image_to_subset: Dict[str, Union[DreamBoothSubset, FineTuningSubset]] = {}
-
         self.replacements = {}
+        
+        # Simple sampling
+        self._indices = []
+        self._length = 0
+        
+    def register_item(self, info, subset):
+        """Register a single image or image set"""
+        self.image_data[info.image_key] = info
+        self.image_to_subset[info.image_key] = subset
+        
+    def prepare_dataset(self):
+        """Prepare the dataset for training"""
+        logger.info("Preparing dataset")
+        
+        # Load image sizes
+        for info in tqdm(self.image_data.values(), desc="Loading image sizes"):
+            if info.image_size is None:
+                if isinstance(info, ImageSet):
+                    # For image sets, load size of first image
+                    info.image_size = self.get_image_size(info.absolute_paths[0])
+                else:
+                    info.image_size = self.get_image_size(info.absolute_path)
+        
+        # Create flat list of all image keys with repeats
+        self._indices = []
+        for image_key, info in self.image_data.items():
+            for _ in range(info.num_repeats):
+                self._indices.append(image_key)
+        
+        # Shuffle indices for training
+        self.shuffle_dataset()
+        self._length = len(self._indices)
+        logger.info(f"Dataset prepared with {self._length} items")
+    
+    def shuffle_dataset(self):
+        """Shuffle the dataset indices"""
+        random.seed(self.seed + self.current_epoch)
+        random.shuffle(self._indices)
+    
+    def get_item_by_key(self, image_key):
+        """Get a dataset item by its key instead of index"""
+        image_info = self.image_data[image_key]
+        subset = self.image_to_subset[image_key]
+        
+        # Determine if image should be flipped
+        flipped = subset.flip_aug and random.random() < 0.5
+        
+        # Process the item and return it
+        return self._process_item(image_info, subset, flipped)
+    
+    def _process_item(self, image_info: Union[ImageInfo, ImageSet], subset: BaseSubset, flipped: bool):
+        """Process a dataset item (image/image set and its caption)"""
+        # Process images
+        processed_images: list[ImageInfo] = []
+        processed_captions = []
+        processed_text_encoder_outputs = []
+        
+        # Handle image set (multiple images)
+        if isinstance(image_info, ImageSet):
+            for info in image_info.items:
+                processed = self.process_single_image(info, subset, flipped)
+                processed_images.append(processed)
+                processed_captions.append(self.process_caption(subset, info.caption))
+        # Handle single image
+        else:
+            processed = self.process_single_image(image_info, subset, flipped)
+            processed_images.append(processed)
+            processed_captions.append(self.process_caption(subset, image_info.caption))
 
-        # caching
-        self.caching_mode = None  # None, 'latents', 'text'
+            text_encoder_outputs = None
+            if hasattr(image_info, 'text_encoder_outputs') and image_info.text_encoder_outputs is not None:
+                text_encoder_outputs = image_info.text_encoder_outputs
+            elif hasattr(image_info, 'text_encoder_outputs_npz') and image_info.text_encoder_outputs_npz is not None:
+                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
+                    image_info.text_encoder_outputs_npz
+                )
 
-        self.tokenize_strategy = None
-        self.text_encoder_output_caching_strategy = None
-        self.latents_caching_strategy = None
+
+        # Get text encoder outputs if available
+        # text_encoder_outputs = None
+        # if hasattr(image_info, 'text_encoder_outputs') and image_info.text_encoder_outputs is not None:
+        # elif hasattr(image_info, 'text_encoder_outputs_npz') and image_info.text_encoder_outputs_npz is not None:
+            
+        # Tokenize caption if needed
+        input_ids = None
+        if text_encoder_outputs is None or (
+                self.text_encoder_output_caching_strategy is not None 
+                and self.text_encoder_output_caching_strategy.is_partial
+            ):
+            assert self.tokenize_strategy, "Tokenize strategy is not set"
+            input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]
+            
+        
+        for proc in processed_images:
+            images.append(proc['image'])
+            latents.append(proc['latents'])
+            alpha_masks.append(proc['alpha_mask'])
+            original_sizes.append((proc['original_size'][1], proc['original_size'][0]))  # HW format
+            crop_top_lefts.append((proc['crop_left_top'][1], proc['crop_left_top'][0]))  # HW format
+            target_sizes.append((proc['target_size'][1], proc['target_size'][0]))  # HW format
+            
+        # Build example dictionary
+        example = {
+            "custom_attributes": subset.custom_attributes,
+            "loss_weight": torch.FloatTensor([1.0]),  # Simplified loss weight
+            "network_multiplier": torch.FloatTensor([self.network_multiplier]),
+            "caption": caption,
+            "flipped": flipped
+        }
+        
+        # Add text encoder outputs if available
+        if text_encoder_outputs is not None:
+            example["text_encoder_outputs"] = text_encoder_outputs
+            
+        # Add input IDs if available
+        if input_ids is not None:
+            example["input_ids"] = input_ids
+            
+        # Process images/latents
+        if images[0] is not None:
+            valid_images = [img for img in images if img is not None]
+            if valid_images:
+                example["images"] = torch.stack(valid_images).to(memory_format=torch.contiguous_format).float()
+        
+        if latents[0] is not None:
+            valid_latents = [lat for lat in latents if lat is not None]
+            if valid_latents:
+                example["latents"] = torch.stack(valid_latents)
+                
+        # Process alpha masks
+        if any(mask is not None for mask in alpha_masks):
+            # Create masks for images without alpha
+            for i in range(len(alpha_masks)):
+                if alpha_masks[i] is None:
+                    if images[i] is not None:
+                        alpha_masks[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
+                    elif latents[i] is not None:
+                        alpha_masks[i] = torch.ones((latents[i].shape[1] * 8, latents[i].shape[2] * 8), dtype=torch.float32)
+            
+            valid_masks = [mask for mask in alpha_masks if mask is not None]
+            if valid_masks:
+                example["alpha_masks"] = torch.stack(valid_masks)
+                
+        # Add positional information
+        example["original_sizes"] = torch.stack([torch.LongTensor(size) for size in original_sizes])
+        example["crop_top_lefts"] = torch.stack([torch.LongTensor(pos) for pos in crop_top_lefts])
+        example["target_sizes"] = torch.stack([torch.LongTensor(size) for size in target_sizes])
+        
+        # Add debug info if needed
+        if self.debug_dataset:
+            example["image_key"] = image_info.image_key
+            
+        return example
+
+    def load_image(self, path, use_alpha_mask=False):
+        """Load image from path with alpha mask if specified"""
+        return load_image(path, use_alpha_mask)
+        
+    def get_image_size(self, image_path) -> tuple[int, int]:
+        """Get the size of an image from its path"""
+        if image_path.endswith(('.jxl', '.JXL')):
+            return get_jxl_size(image_path)
+            
+        image_size = imagesize.get(image_path)
+        if image_size[0] <= 0:
+            # Fall back to PIL for problematic images
+            try:
+                with Image.open(image_path) as img:
+                    image_size = img.size
+            except Exception as e:
+                logger.warning(f"Failed to get image size: {image_path}, error: {e}")
+                image_size = (0, 0)
+                
+        return int(image_size[0]), int(image_size[1])
+    
+    def process_single_image(self, image_info: ImageInfo, subset: BaseSubset, flipped=False):
+        """Process a single image"""
+        crop_ltrb: Optional[tuple[int, int, int, int]] = None
+        crop_left_top: Optional[tuple[int, int]] = None
+
+        image: Optional[Image.Image] = None
+        latents: Optional[Tensor] = None
+
+        # Check for cached latents
+        if image_info.latents is not None:
+            if not flipped:
+                latents = image_info.latents
+                alpha_mask = image_info.alpha_mask
+            else:
+                latents = image_info.latents_flipped
+                alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
+                
+            original_size = image_info.latents_original_size
+            crop_ltrb = image_info.latents_crop_ltrb
+        
+        # Check for disk-cached latents
+        elif image_info.latents_npz is not None:
+            bucket_reso = image_info.bucket_reso if hasattr(image_info, 'bucket_reso') else None
+            assert bucket_reso is not None, "Invalid bucket reso"
+            np_latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
+                self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, bucket_reso)
+            )
+            
+            if flipped:
+                latents = torch.from_numpy(flipped_latents)
+                if alpha_mask is not None:
+                    alpha_mask = alpha_mask[:, ::-1].copy()
+                del flipped_latents
+            else:
+                latents = torch.from_numpy(np_latents)
+                
+            if alpha_mask is not None:
+                alpha_mask = torch.from_numpy(alpha_mask)
+        
+        # Load and process image
+        else:
+            # Load image
+            img = self.load_image(image_info.absolute_path, subset.alpha_mask)
+            h, w = img.shape[:2]
+            
+            # Resize if needed
+            if hasattr(image_info, 'target_size') and image_info.target_size:
+                target_w, target_h = image_info.target_size
+                if w != target_w or h != target_h:
+                    img = resize_image(img, w, h, target_w, target_h, self.resize_interpolation)
+            elif (self.width is not None and self.height is not None) and (w != self.width or h != self.height):
+                img = resize_image(img, w, h, self.width, self.height, self.resize_interpolation)
+                
+            # Apply transformations
+            image, alpha_mask = self.apply_transforms(img, subset, flipped)
+            
+            original_size = [w, h]
+            crop_ltrb = (0, 0, 0, 0)
+            
+        # Determine target size
+        if image is not None:
+            target_size = (image.shape[2], image.shape[1])
+        elif latents is not None:
+            target_size = (latents.shape[2] * 8, latents.shape[1] * 8)
+        else:
+            target_size = (0, 0)
+            
+        if crop_ltrb is not None:
+            # Calculate crop coordinates
+            if not flipped:
+                crop_left_top = (crop_ltrb[0], crop_ltrb[1])
+            else:
+                crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
+
+
+        @dataclass
+        class ProcessedImage:
+            image_or_latent: Union[ImageInfo, Tensor]
+            alpha_mask: Optional[Tensor]
+            original_size: tuple[int, int]
+            crop_left_top: Optional[tuple[int, int, int, int]]
+            target_size: tuple[int, int]
+
+        assert image is not None or latents is not None, "Image could not be loaded"
+
+        return ProcessedImage(image or latents, alpha_mask, original_size, crop_left_top, target_size)
+        
+    def process_caption(self, subset: BaseSubset, caption: str) -> str:
+        """Process a caption with a subset's configuration"""
+        # Add prefix/suffix
+        if subset.caption_prefix:
+            caption = subset.caption_prefix + " " + caption
+        if subset.caption_suffix:
+            caption = caption + " " + subset.caption_suffix
+
+        # Determine if caption should be dropped out
+        is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
+        is_drop_out = (
+            is_drop_out or
+            (subset.caption_dropout_every_n_epochs > 0 and 
+             self.current_epoch % subset.caption_dropout_every_n_epochs == 0)
+        )
+
+        if is_drop_out:
+            return ""
+            
+        # Process wildcards
+        if subset.enable_wildcard:
+            # Handle multiline captions
+            if "\n" in caption:
+                caption = random.choice(caption.split("\n"))
+
+            # Escape curly braces
+            replacer1, replacer2 = "⦅", "⦆"
+            while replacer1 in caption or replacer2 in caption:
+                replacer1 += "⦅"
+                replacer2 += "⦆"
+            caption = caption.replace("{{", replacer1).replace("}}", replacer2)
+
+            # Replace wildcards
+            def replace_wildcard(match):
+                return random.choice(match.group(1).split("|"))
+            caption = re.sub(r"\{([^}]+)\}", replace_wildcard, caption)
+
+            # Unescape curly braces
+            caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+        else:
+            # Use first line if caption is multiline
+            caption = caption.split("\n")[0]
+
+        # Handle token operations (shuffling, warmup, dropout)
+        if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            fixed_tokens = []
+            flex_tokens = []
+            fixed_suffix_tokens = []
+            
+            # Split by token separator if specified
+            if (hasattr(subset, "keep_tokens_separator") and 
+                subset.keep_tokens_separator and 
+                subset.keep_tokens_separator in caption):
+                
+                fixed_part, flex_part = caption.split(subset.keep_tokens_separator, 1)
+                
+                if subset.keep_tokens_separator in flex_part:
+                    flex_part, fixed_suffix_part = flex_part.split(subset.keep_tokens_separator, 1)
+                    fixed_suffix_tokens = [t.strip() for t in fixed_suffix_part.split(subset.caption_separator) if t.strip()]
+                
+                fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
+                flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
+            else:
+                tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
+                flex_tokens = tokens[:]
+                
+                if subset.keep_tokens > 0:
+                    fixed_tokens = flex_tokens[:subset.keep_tokens]
+                    flex_tokens = tokens[subset.keep_tokens:]
+
+            # Token warmup
+            if subset.token_warmup_step < 1:
+                subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
+                
+            if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
+                tokens_len = (
+                    math.floor(
+                        (self.current_step) * 
+                        ((len(flex_tokens) - subset.token_warmup_min) / subset.token_warmup_step)
+                    ) + subset.token_warmup_min
+                )
+                flex_tokens = flex_tokens[:tokens_len]
+
+            # Tag dropout
+            if subset.caption_tag_dropout_rate > 0:
+                flex_tokens = [token for token in flex_tokens 
+                              if random.random() >= subset.caption_tag_dropout_rate]
+
+            # Shuffle caption if enabled
+            if subset.shuffle_caption:
+                random.shuffle(flex_tokens)
+
+            caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
+
+        # Process secondary separator
+        if hasattr(subset, "secondary_separator") and subset.secondary_separator:
+            caption = caption.replace(subset.secondary_separator, subset.caption_separator)
+
+        # Process text replacements
+        for str_from, str_to in self.replacements.items():
+            if str_from == "":
+                # Replace all
+                if isinstance(str_to, list):
+                    caption = random.choice(str_to)
+                else:
+                    caption = str_to
+            else:
+                caption = caption.replace(str_from, str_to)
+
+        return caption
+
+    def apply_transforms(self, image, subset, flipped=False):
+        """Apply transformations to the loaded image"""
+        # Apply color augmentation if enabled
+        aug = self.aug_helper.get_augmentor(subset.color_aug)
+        if aug is not None and image.shape[2] >= 3:
+            img_rgb = image[:, :, :3]
+            img_rgb = aug(image=img_rgb)["image"]
+            image[:, :, :3] = img_rgb
+            
+        # Flip image if requested
+        if flipped:
+            image = image[:, ::-1, :].copy()
+            
+        # Handle alpha channel
+        alpha_mask = None
+        if subset.alpha_mask and image.shape[2] == 4:
+            alpha_mask = image[:, :, 3]
+            alpha_mask = alpha_mask.astype(np.float32) / 255.0
+            alpha_mask = torch.FloatTensor(alpha_mask)
+            image = image[:, :, :3]  # Remove alpha channel
+        elif subset.alpha_mask:
+            alpha_mask = torch.ones((image.shape[0], image.shape[1]), dtype=torch.float32)
+            
+        # Convert to tensor
+        image_tensor = self.image_transforms(image)
+        
+        return image_tensor, alpha_mask
+        
+    def __len__(self):
+        return self._length
+        
+    def __getitem__(self, index):
+        """Get dataset item by index"""
+        image_key = self._indices[index]
+        return self.get_item_by_key(image_key)
 
     def set_current_strategies(self):
         self.tokenize_strategy = TokenizeStrategy.get_strategy()
         self.text_encoder_output_caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         self.latents_caching_strategy = LatentsCachingStrategy.get_strategy()
 
-    def adjust_min_max_bucket_reso_by_steps(
-        self, resolution: Tuple[int, int], min_bucket_reso: int, max_bucket_reso: int, bucket_reso_steps: int
-    ) -> Tuple[int, int]:
-        # make min/max bucket reso to be multiple of bucket_reso_steps
-        if min_bucket_reso % bucket_reso_steps != 0:
-            adjusted_min_bucket_reso = min_bucket_reso - min_bucket_reso % bucket_reso_steps
-            logger.warning(
-                f"min_bucket_reso is adjusted to be multiple of bucket_reso_steps"
-                f" / min_bucket_resoがbucket_reso_stepsの倍数になるように調整されました: {min_bucket_reso} -> {adjusted_min_bucket_reso}"
-            )
-            min_bucket_reso = adjusted_min_bucket_reso
-        if max_bucket_reso % bucket_reso_steps != 0:
-            adjusted_max_bucket_reso = max_bucket_reso + bucket_reso_steps - max_bucket_reso % bucket_reso_steps
-            logger.warning(
-                f"max_bucket_reso is adjusted to be multiple of bucket_reso_steps"
-                f" / max_bucket_resoがbucket_reso_stepsの倍数になるように調整されました: {max_bucket_reso} -> {adjusted_max_bucket_reso}"
-            )
-            max_bucket_reso = adjusted_max_bucket_reso
-
-        assert (
-            min(resolution) >= min_bucket_reso
-        ), f"min_bucket_reso must be equal or less than resolution / min_bucket_resoは最小解像度より大きくできません。解像度を大きくするかmin_bucket_resoを小さくしてください"
-        assert (
-            max(resolution) <= max_bucket_reso
-        ), f"max_bucket_reso must be equal or greater than resolution / max_bucket_resoは最大解像度より小さくできません。解像度を小さくするかmin_bucket_resoを大きくしてください"
-
-        return min_bucket_reso, max_bucket_reso
-
     def set_seed(self, seed):
         self.seed = seed
 
-    def set_caching_mode(self, mode):
+    def set_caching_mode(self, mode: str):
+        """caching mode: 'text' or 'latents'"""
         self.caching_mode = mode
 
-    def set_current_epoch(self, epoch):
+    def set_current_epoch(self, epoch: int):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
                 logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 num_epochs = epoch - self.current_epoch
                 for _ in range(num_epochs):
                     self.current_epoch += 1
-                    self.shuffle_buckets()
                 # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
             else:
                 logger.warning("epoch is not incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 self.current_epoch = epoch
 
-    def set_current_step(self, step):
+    def set_current_step(self, step: int):
         self.current_step = step
 
-    def set_max_train_steps(self, max_train_steps):
+    def set_max_train_steps(self, max_train_steps: int):
         self.max_train_steps = max_train_steps
 
     def set_tag_frequency(self, dir_name, captions):
@@ -856,119 +1691,6 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
-
-    def process_caption(self, subset: BaseSubset, caption):
-        # caption に prefix/suffix を付ける
-        if subset.caption_prefix:
-            caption = subset.caption_prefix + " " + caption
-        if subset.caption_suffix:
-            caption = caption + " " + subset.caption_suffix
-
-        # dropoutの決定：tag dropがこのメソッド内にあるのでここで行うのが良い
-        is_drop_out = subset.caption_dropout_rate > 0 and random.random() < subset.caption_dropout_rate
-        is_drop_out = (
-            is_drop_out
-            or subset.caption_dropout_every_n_epochs > 0
-            and self.current_epoch % subset.caption_dropout_every_n_epochs == 0
-        )
-
-        if is_drop_out:
-            caption = ""
-        else:
-            # process wildcards
-            if subset.enable_wildcard:
-                # if caption is multiline, random choice one line
-                if "\n" in caption:
-                    caption = random.choice(caption.split("\n"))
-
-                # wildcard is like '{aaa|bbb|ccc...}'
-                # escape the curly braces like {{ or }}
-                replacer1 = "⦅"
-                replacer2 = "⦆"
-                while replacer1 in caption or replacer2 in caption:
-                    replacer1 += "⦅"
-                    replacer2 += "⦆"
-
-                caption = caption.replace("{{", replacer1).replace("}}", replacer2)
-
-                # replace the wildcard
-                def replace_wildcard(match):
-                    return random.choice(match.group(1).split("|"))
-
-                caption = re.sub(r"\{([^}]+)\}", replace_wildcard, caption)
-
-                # unescape the curly braces
-                caption = caption.replace(replacer1, "{").replace(replacer2, "}")
-            else:
-                # if caption is multiline, use the first line
-                caption = caption.split("\n")[0]
-
-            if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
-                fixed_tokens = []
-                flex_tokens = []
-                fixed_suffix_tokens = []
-                if (
-                    hasattr(subset, "keep_tokens_separator")
-                    and subset.keep_tokens_separator
-                    and subset.keep_tokens_separator in caption
-                ):
-                    fixed_part, flex_part = caption.split(subset.keep_tokens_separator, 1)
-                    if subset.keep_tokens_separator in flex_part:
-                        flex_part, fixed_suffix_part = flex_part.split(subset.keep_tokens_separator, 1)
-                        fixed_suffix_tokens = [t.strip() for t in fixed_suffix_part.split(subset.caption_separator) if t.strip()]
-
-                    fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
-                    flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
-                else:
-                    tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
-                    flex_tokens = tokens[:]
-                    if subset.keep_tokens > 0:
-                        fixed_tokens = flex_tokens[: subset.keep_tokens]
-                        flex_tokens = tokens[subset.keep_tokens :]
-
-                if subset.token_warmup_step < 1:  # 初回に上書きする
-                    subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
-                if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
-                    tokens_len = (
-                        math.floor(
-                            (self.current_step) * ((len(flex_tokens) - subset.token_warmup_min) / (subset.token_warmup_step))
-                        )
-                        + subset.token_warmup_min
-                    )
-                    flex_tokens = flex_tokens[:tokens_len]
-
-                def dropout_tags(tokens):
-                    if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
-                    for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
-
-                if subset.shuffle_caption:
-                    random.shuffle(flex_tokens)
-
-                flex_tokens = dropout_tags(flex_tokens)
-
-                caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
-
-            # process secondary separator
-            if subset.secondary_separator:
-                caption = caption.replace(subset.secondary_separator, subset.caption_separator)
-
-            # textual inversion対応
-            for str_from, str_to in self.replacements.items():
-                if str_from == "":
-                    # replace all
-                    if type(str_to) == list:
-                        caption = random.choice(str_to)
-                    else:
-                        caption = str_to
-                else:
-                    caption = caption.replace(str_from, str_to)
-
-        return caption
 
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
@@ -1023,114 +1745,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_data[info.image_key] = info
         self.image_to_subset[info.image_key] = subset
 
-    def make_buckets(self):
-        """
-        bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
-        min_size and max_size are ignored when enable_bucket is False
-        """
-        logger.info("loading image sizes.")
-        for info in tqdm(self.image_data.values()):
-            if info.image_size is None:
-                info.image_size = self.get_image_size(info.absolute_path)
-
-        # # run in parallel
-        # max_workers = min(os.cpu_count(), len(self.image_data))  # TODO consider multi-gpu (processes)
-        # with ThreadPoolExecutor(max_workers) as executor:
-        #     futures = []
-        #     for info in tqdm(self.image_data.values(), desc="loading image sizes"):
-        #         if info.image_size is None:
-        #             def get_and_set_image_size(info):
-        #                 info.image_size = self.get_image_size(info.absolute_path)
-        #             futures.append(executor.submit(get_and_set_image_size, info))
-        #             # consume futures to reduce memory usage and prevent Ctrl-C hang
-        #             if len(futures) >= max_workers:
-        #                 for future in futures:
-        #                     future.result()
-        #                 futures = []
-        #     for future in futures:
-        #         future.result()
-
-        if self.enable_bucket:
-            logger.info("make buckets")
-        else:
-            logger.info("prepare dataset")
-
-        # bucketを作成し、画像をbucketに振り分ける
-        if self.enable_bucket:
-            if self.bucket_manager is None:  # fine tuningの場合でmetadataに定義がある場合は、すでに初期化済み
-                self.bucket_manager = BucketManager(
-                    self.bucket_no_upscale,
-                    (self.width, self.height),
-                    self.min_bucket_reso,
-                    self.max_bucket_reso,
-                    self.bucket_reso_steps,
-                )
-                if not self.bucket_no_upscale:
-                    self.bucket_manager.make_buckets()
-                else:
-                    logger.warning(
-                        "min_bucket_reso and max_bucket_reso are ignored if bucket_no_upscale is set, because bucket reso is defined by image size automatically / bucket_no_upscaleが指定された場合は、bucketの解像度は画像サイズから自動計算されるため、min_bucket_resoとmax_bucket_resoは無視されます"
-                    )
-
-            img_ar_errors = []
-            for image_info in self.image_data.values():
-                image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
-                    image_width, image_height
-                )
-
-                # logger.info(image_info.image_key, image_info.bucket_reso)
-                img_ar_errors.append(abs(ar_error))
-
-            self.bucket_manager.sort()
-        else:
-            self.bucket_manager = BucketManager(False, (self.width, self.height), None, None, None)
-            self.bucket_manager.set_predefined_resos([(self.width, self.height)])  # ひとつの固定サイズbucketのみ
-            for image_info in self.image_data.values():
-                image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
-
-        for image_info in self.image_data.values():
-            for _ in range(image_info.num_repeats):
-                self.bucket_manager.add_image(image_info.bucket_reso, image_info.image_key)
-
-        # bucket情報を表示、格納する
-        if self.enable_bucket:
-            self.bucket_info = {"buckets": {}}
-            logger.info("number of images (including repeats) / 各bucketの画像枚数（繰り返し回数を含む）")
-            for i, (reso, bucket) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
-                count = len(bucket)
-                if count > 0:
-                    self.bucket_info["buckets"][i] = {"resolution": reso, "count": len(bucket)}
-                    logger.info(f"bucket {i}: resolution {reso}, count: {len(bucket)}")
-
-            img_ar_errors = np.array(img_ar_errors)
-            mean_img_ar_error = np.mean(np.abs(img_ar_errors))
-            self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
-            logger.info(f"mean ar error (without repeats): {mean_img_ar_error}")
-
-        # データ参照用indexを作る。このindexはdatasetのshuffleに用いられる
-        self.buckets_indices: List[BucketBatchIndex] = []
-        for bucket_index, bucket in enumerate(self.bucket_manager.buckets):
-            batch_count = int(math.ceil(len(bucket) / self.batch_size))
-            for batch_index in range(batch_count):
-                self.buckets_indices.append(BucketBatchIndex(bucket_index, self.batch_size, batch_index))
-
-        self.shuffle_buckets()
-        self._length = len(self.buckets_indices)
-
-    def shuffle_buckets(self):
-        # set random seed for this epoch
-        random.seed(self.seed + self.current_epoch)
-
-        random.shuffle(self.buckets_indices)
-        self.bucket_manager.shuffle()
-
-    def verify_bucket_reso_steps(self, min_steps: int):
-        assert self.bucket_reso_steps is None or self.bucket_reso_steps % min_steps == 0, (
-            f"bucket_reso_steps is {self.bucket_reso_steps}. it must be divisible by {min_steps}.\n"
-            + f"bucket_reso_stepsが{self.bucket_reso_steps}です。{min_steps}で割り切れる必要があります"
-        )
+    def register_image_set(self, image_set: ImageSet, subset: BaseSubset):
+        for info in image_set.items:
+            self.image_to_set[info.image_key] = info.image_key
+            self.image_data[info.image_key] = info
+            self.image_to_subset[info.image_key] = subset
 
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
@@ -1508,90 +2127,6 @@ class BaseDataset(torch.utils.data.Dataset):
                     output_dtype,
                 )
 
-    def get_image_size(self, image_path):
-        if image_path.endswith(".jxl") or image_path.endswith(".JXL"):
-            return get_jxl_size(image_path)
-        # return imagesize.get(image_path)
-        image_size = imagesize.get(image_path)
-        if image_size[0] <= 0:
-            # imagesize doesn't work for some images, so use PIL as a fallback
-            try:
-                with Image.open(image_path) as img:
-                    image_size = img.size
-            except Exception as e:
-                logger.warning(f"failed to get image size: {image_path}, error: {e}")
-                image_size = (0, 0)
-        return image_size
-
-    def load_and_transform_image(self, subset, image_info, absolute_path, flipped):
-        # 画像を読み込み、必要ならcropする
-
-        img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
-            subset, absolute_path, subset.alpha_mask
-        )
-        im_h, im_w = img.shape[0:2]
-
-        if self.enable_bucket:
-            img, original_size, crop_ltrb = trim_and_resize_if_required(
-                subset.random_crop, img, image_info.bucket_reso, image_info.resized_size
-            )
-        else:
-            if face_cx > 0:  # 顔位置情報あり
-                img = self.crop_target(subset, img, face_cx, face_cy, face_w, face_h)
-            elif im_h > self.height or im_w > self.width:
-                assert (
-                    subset.random_crop
-                ), f"image too large, but cropping and bucketing are disabled / 画像サイズが大きいのでface_crop_aug_rangeかrandom_crop、またはbucketを有効にしてください: {image_info.absolute_path}"
-                if im_h > self.height:
-                    p = random.randint(0, im_h - self.height)
-                    img = img[p : p + self.height]
-                if im_w > self.width:
-                    p = random.randint(0, im_w - self.width)
-                    img = img[:, p : p + self.width]
-
-            im_h, im_w = img.shape[0:2]
-            assert (
-                im_h == self.height and im_w == self.width
-            ), f"image size is small / 画像サイズが小さいようです: {absolute_path}"
-
-            original_size = [im_w, im_h]
-            crop_ltrb = (0, 0, 0, 0)
-
-        # augmentation
-        aug = self.aug_helper.get_augmentor(subset.color_aug)
-        if aug is not None:
-            # augment RGB channels only
-            img_rgb = img[:, :, :3]
-            img_rgb = aug(image=img_rgb)["image"]
-            img[:, :, :3] = img_rgb
-
-        if flipped:
-            img = img[:, ::-1, :].copy()  # copy to avoid negative stride problem
-
-        if subset.alpha_mask:
-            if img.shape[2] == 4:
-                alpha_mask = img[:, :, 3]  # [H,W]
-                alpha_mask = alpha_mask.astype(np.float32) / 255.0  # 0.0~1.0
-                alpha_mask = torch.FloatTensor(alpha_mask)
-            else:
-                alpha_mask = torch.ones((img.shape[0], img.shape[1]), dtype=torch.float32)
-        else:
-            alpha_mask = None
-
-        img = img[:, :, :3]  # remove alpha channel
-
-        image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
-
-        target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
-
-        if not flipped:
-            crop_left_top = (crop_ltrb[0], crop_ltrb[1])
-        else:
-            # crop_ltrb[2] is right, so target_size[0] - crop_ltrb[2] is left in flipped image
-            crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
-
-        return image, original_size, crop_left_top, alpha_mask
-
     def load_image_with_face_info(self, subset: BaseSubset, image_path: str, alpha_mask=False):
         img = load_image(image_path, alpha_mask)
 
@@ -1653,221 +2188,6 @@ class BaseDataset(torch.utils.data.Dataset):
                 image = image[:, p1 : p1 + target_size]
 
         return image
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
-        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
-        image_index = self.buckets_indices[index].batch_index * bucket_batch_size
-
-        if self.caching_mode is not None:  # return batch for latents/text encoder outputs caching
-            return self.get_item_for_caching(bucket, bucket_batch_size, image_index)
-
-        loss_weights = []
-        captions = []
-        input_ids_list = []
-        latents_list = []
-        alpha_mask_list = []
-        images = []
-        original_sizes_hw = []
-        crop_top_lefts = []
-        target_sizes_hw = []
-        flippeds = []  # 変数名が微妙
-        text_encoder_outputs_list = []
-        custom_attributes = []
-
-        for image_key in bucket[image_index : image_index + bucket_batch_size]:
-            image_info = self.image_data[image_key]
-            subset = self.image_to_subset[image_key]
-
-            custom_attributes.append(subset.custom_attributes)
-
-            # in case of fine tuning, is_reg is always False
-            loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
-
-            flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
-
-            # image/latentsを処理する
-            if image_info.latents is not None:  # cache_latents=Trueの場合
-                original_size = image_info.latents_original_size
-                crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
-                if not flipped:
-                    latents = image_info.latents
-                    alpha_mask = image_info.alpha_mask
-                else:
-                    latents = image_info.latents_flipped
-                    alpha_mask = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, [1])
-
-                image = None
-
-                images.append(image)
-                latents_list.append(latents)
-            elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = (
-                    self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
-                )
-                if flipped:
-                    latents = flipped_latents
-                    alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
-                    del flipped_latents
-                latents = torch.FloatTensor(latents)
-                if alpha_mask is not None:
-                    alpha_mask = torch.FloatTensor(alpha_mask)
-
-                image = None
-
-                images.append(image)
-                latents_list.append(latents)
-                alpha_mask_list.append(alpha_mask)
-            else:
-                if isinstance(image_info, ImageSetInfo):
-                    for absolute_path in image_info.absolute_paths:
-                        image, original_size, crop_ltrb, alpha_mask = self.load_and_transform_image(subset, image_info, absolute_path, flipped)
-                        images.append(image)
-                        latents_list.append(None)
-                        alpha_mask_list.append(alpha_mask)
-
-                        target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
-
-                        if not flipped:
-                            crop_left_top = (crop_ltrb[0], crop_ltrb[1])
-                        else:
-                            # crop_ltrb[2] is right, so target_size[0] - crop_ltrb[2] is left in flipped image
-                            crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
-
-                        original_sizes_hw.append((int(original_size[1]), int(original_size[0])))
-                        crop_top_lefts.append((int(crop_left_top[1]), int(crop_left_top[0])))
-                        target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
-                        flippeds.append(flipped)
-                if self.enable_bucket:
-                    img, original_size, crop_ltrb = trim_and_resize_if_required(
-                        subset.random_crop, img, image_info.bucket_reso, image_info.resized_size, resize_interpolation=image_info.resize_interpolation
-                    )
-                else:
-                    image, original_size, crop_ltrb, alpha_mask = self.load_and_transform_image(subset, image_info, image_info.absolute_path, flipped)
-                    images.append(image)
-                    latents_list.append(None)
-                    alpha_mask_list.append(alpha_mask)
-
-                    target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
-
-                    if not flipped:
-                        crop_left_top = (crop_ltrb[0], crop_ltrb[1])
-                    else:
-                        # crop_ltrb[2] is right, so target_size[0] - crop_ltrb[2] is left in flipped image
-                        crop_left_top = (target_size[0] - crop_ltrb[2], crop_ltrb[1])
-
-                    original_sizes_hw.append((int(original_size[1]), int(original_size[0])))
-                    crop_top_lefts.append((int(crop_left_top[1]), int(crop_left_top[0])))
-                    target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
-                    flippeds.append(flipped)
-
-
-            # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
-
-            tokenization_required = (
-                self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
-            )
-            text_encoder_outputs = None
-            input_ids = None
-
-            if image_info.text_encoder_outputs is not None:
-                # cached
-                text_encoder_outputs = image_info.text_encoder_outputs
-            elif image_info.text_encoder_outputs_npz is not None:
-                # on disk
-                text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
-                    image_info.text_encoder_outputs_npz
-                )
-            else:
-                tokenization_required = True
-            text_encoder_outputs_list.append(text_encoder_outputs)
-
-            if tokenization_required:
-                caption = self.process_caption(subset, image_info.caption)
-                input_ids = [ids[0] for ids in self.tokenize_strategy.tokenize(caption)]  # remove batch dimension
-                # if self.XTI_layers:
-                #     caption_layer = []
-                #     for layer in self.XTI_layers:
-                #         token_strings_from = " ".join(self.token_strings)
-                #         token_strings_to = " ".join([f"{x}_{layer}" for x in self.token_strings])
-                #         caption_ = caption.replace(token_strings_from, token_strings_to)
-                #         caption_layer.append(caption_)
-                #     captions.append(caption_layer)
-                # else:
-                #     captions.append(caption)
-
-                # if not self.token_padding_disabled:  # this option might be omitted in future
-                #     # TODO get_input_ids must support SD3
-                #     if self.XTI_layers:
-                #         token_caption = self.get_input_ids(caption_layer, self.tokenizers[0])
-                #     else:
-                #         token_caption = self.get_input_ids(caption, self.tokenizers[0])
-                #     input_ids_list.append(token_caption)
-
-                #     if len(self.tokenizers) > 1:
-                #         if self.XTI_layers:
-                #             token_caption2 = self.get_input_ids(caption_layer, self.tokenizers[1])
-                #         else:
-                #             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
-                #         input_ids2_list.append(token_caption2)
-
-            input_ids_list.append(input_ids)
-            captions.append(caption)
-
-        def none_or_stack_elements(tensors_list, converter):
-            # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
-            if len(tensors_list) == 0 or tensors_list[0] == None or len(tensors_list[0]) == 0 or tensors_list[0][0] is None:
-                return None
-            return [torch.stack([converter(x[i]) for x in tensors_list]) for i in range(len(tensors_list[0]))]
-
-        # set example
-        example = {}
-        example["custom_attributes"] = custom_attributes  # may be list of empty dict
-        example["loss_weights"] = torch.FloatTensor(loss_weights)
-        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
-        example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
-
-        # if one of alpha_masks is not None, we need to replace None with ones
-        none_or_not = [x is None for x in alpha_mask_list]
-        if all(none_or_not):
-            example["alpha_masks"] = None
-        elif any(none_or_not):
-            for i in range(len(alpha_mask_list)):
-                if alpha_mask_list[i] is None:
-                    if images[i] is not None:
-                        alpha_mask_list[i] = torch.ones((images[i].shape[1], images[i].shape[2]), dtype=torch.float32)
-                    else:
-                        alpha_mask_list[i] = torch.ones(
-                            (latents_list[i].shape[1] * 8, latents_list[i].shape[2] * 8), dtype=torch.float32
-                        )
-            example["alpha_masks"] = torch.stack(alpha_mask_list)
-        else:
-            example["alpha_masks"] = torch.stack(alpha_mask_list)
-
-        if images[0] is not None:
-            images = torch.stack(images)
-            images = images.to(memory_format=torch.contiguous_format).float()
-        else:
-            images = None
-        example["images"] = images
-
-        example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
-        example["captions"] = captions
-
-        example["original_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in original_sizes_hw])
-        example["crop_top_lefts"] = torch.stack([torch.LongTensor(x) for x in crop_top_lefts])
-        example["target_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in target_sizes_hw])
-        example["flippeds"] = flippeds
-
-        example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
-
-        if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
-        return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
         captions = []
@@ -1935,13 +2255,62 @@ class BaseDataset(torch.utils.data.Dataset):
         example["bucket_reso"] = bucket_reso
         return example
 
+class PreferenceHandler:
+    def __init__(self, caption_prefix=None, caption_suffix=None, 
+                 non_preference_caption_prefix=None, non_preference_caption_suffix=None):
+        self.caption_prefix = caption_prefix
+        self.caption_suffix = caption_suffix
+        self.non_preference_caption_prefix = non_preference_caption_prefix
+        self.non_preference_caption_suffix = non_preference_caption_suffix
+    
+    def create_image_set(self, img_path: str, caption: str, size, subset: DreamBoothSubset, read_caption_func) -> ImageSet:
+        """Creates a complete ImageSet for a preference pair"""
+        # Add the preferred image
+        preferred_caption = self._apply_prefix_suffix(caption, self.caption_prefix, self.caption_suffix)
+        preferred_info = ImageInfo(
+            img_path, subset.num_repeats, preferred_caption, subset.is_reg, img_path, role="preferred"
+        )
+        if size is not None:
+            preferred_info.image_size = size
+        
+        # Add the non-preferred image
+        non_preferred_img_path = self._get_non_preferred_path(img_path)
+        non_preferred_caption = read_caption_func(non_preferred_img_path, subset.caption_extension, subset.enable_wildcard)
+        non_preferred_caption = self._apply_prefix_suffix(
+            non_preferred_caption, 
+            self.non_preference_caption_prefix, 
+            self.non_preference_caption_suffix
+        )
+        
+        non_preferred_info = ImageInfo(
+            non_preferred_img_path, subset.num_repeats, non_preferred_caption, 
+            subset.is_reg, non_preferred_img_path, role="non_preferred"
+        )
+        if size is not None:
+            non_preferred_info.image_size = size
+
+        image_set = ImageSet.create_preference_pair(preferred_info, non_preferred_info)
+        return image_set
+    
+    def _get_non_preferred_path(self, img_path: str) -> str:
+        """Convert a preferred image path to its non-preferred counterpart"""
+        head, file = os.path.split(img_path)
+        head, tail = os.path.split(head)
+        new_tail = tail.replace('w', 'l')
+        return os.path.join(head, new_tail, file)
+    
+    def _apply_prefix_suffix(self, caption, prefix, suffix):
+        if caption is None:
+            caption = ""
+        if prefix:
+            caption = prefix + " " + caption
+        if suffix:
+            caption = caption + " " + suffix
+        return caption
 
 class DreamBoothDataset(BaseDataset):
     IMAGE_INFO_CACHE_FILE = "metadata_cache.json"
 
-    # The is_training_dataset defines the type of dataset, training or validation
-    # if is_training_dataset is True -> training dataset
-    # if is_training_dataset is False -> validation dataset
     def __init__(
         self,
         subsets: Sequence[DreamBoothSubset],
@@ -1962,16 +2331,27 @@ class DreamBoothDataset(BaseDataset):
     ) -> None:
         super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
-        assert resolution is not None, f"resolution is required / resolution（解像度）指定は必須です"
+        assert resolution is not None, "resolution is required / resolution（解像度）指定は必須です"
 
+        # Store basic parameters
         self.batch_size = batch_size
-        self.size = min(self.width, self.height)  # 短いほう
+        self.size = min(self.width, self.height)
         self.prior_loss_weight = prior_loss_weight
         self.latents_cache = None
         self.is_training_dataset = is_training_dataset
-        self.validation_seed = validation_seed
         self.validation_split = validation_split
+        self.validation_seed = validation_seed
 
+        # Configure bucketing settings
+        self._configure_buckets(enable_bucket, min_bucket_reso, max_bucket_reso, 
+                               bucket_reso_steps, bucket_no_upscale, resolution)
+
+        # Process all subsets
+        self._process_subsets(subsets)
+
+    def _configure_buckets(self, enable_bucket, min_bucket_reso, max_bucket_reso, 
+                           bucket_reso_steps, bucket_no_upscale, resolution):
+        """Configure resolution bucket settings"""
         self.enable_bucket = enable_bucket
         if self.enable_bucket:
             min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
@@ -1984,285 +2364,317 @@ class DreamBoothDataset(BaseDataset):
         else:
             self.min_bucket_reso = None
             self.max_bucket_reso = None
-            self.bucket_reso_steps = None  # この情報は使われない
+            self.bucket_reso_steps = None  # This info isn't used
             self.bucket_no_upscale = False
 
-        def read_caption(img_path, caption_extension, enable_wildcard):
-            # captionの候補ファイル名を作る
-            base_name = os.path.splitext(img_path)[0]
-            base_name_face_det = base_name
-            tokens = base_name.split("_")
-            if len(tokens) >= 5:
-                base_name_face_det = "_".join(tokens[:-4])
-            cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
-
-            caption = None
-            for cap_path in cap_paths:
-                if os.path.isfile(cap_path):
-                    with open(cap_path, "rt", encoding="utf-8") as f:
-                        try:
-                            lines = f.readlines()
-                        except UnicodeDecodeError as e:
-                            logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
-                            raise e
-                        assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
-                        else:
-                            caption = lines[0].strip()
-                    break
-            return caption
-
-        def load_dreambooth_dir(subset: DreamBoothSubset):
-            if not os.path.isdir(subset.image_dir):
-                logger.warning(f"not directory: {subset.image_dir}")
-                return [], [], []
-
-            info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
-            use_cached_info_for_subset = subset.cache_info
-            if use_cached_info_for_subset:
-                logger.info(
-                    f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
-                )
-                if not os.path.isfile(info_cache_file):
-                    logger.warning(
-                        f"image info file not found. You can ignore this warning if this is the first time to use this subset"
-                        + " / キャッシュファイルが見つかりませんでした。初回実行時はこの警告を無視してください: {metadata_file}"
-                    )
-                    use_cached_info_for_subset = False
-
-            if use_cached_info_for_subset:
-                # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
-                with open(info_cache_file, "r", encoding="utf-8") as f:
-                    metas = json.load(f)
-                img_paths = list(metas.keys())
-                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
-
-            elif subset.preference:
-                # We assume a image_dir path pattern for winner/loser
-                winner_path = str(pathlib.Path(subset.image_dir) / "w")
-                img_paths = glob_images(winner_path, "*")
-                sizes = [None] * len(img_paths)
-                # we may need to check image size and existence of image files, but it takes time, so user should check it before training
-            else:
-                img_paths = glob_images(subset.image_dir, "*")
-                sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
-
-                # new caching: get image size from cache files
-                strategy = LatentsCachingStrategy.get_strategy()
-                if strategy is not None:
-                    logger.info("get image size from name of cache files")
-
-                    # make image path to npz path mapping
-                    npz_paths = glob.glob(os.path.join(subset.image_dir, "*" + strategy.cache_suffix))
-                    npz_paths.sort(
-                        key=lambda item: item.rsplit("_", maxsplit=2)[0]
-                    )  # sort by name excluding resolution and cache_suffix
-                    npz_path_index = 0
-
-                    size_set_count = 0
-                    for i, img_path in enumerate(tqdm(img_paths)):
-                        l = len(os.path.splitext(img_path)[0])  # remove extension
-                        found = False
-                        while npz_path_index < len(npz_paths):  # until found or end of npz_paths
-                            # npz_paths are sorted, so if npz_path > img_path, img_path is not found
-                            if npz_paths[npz_path_index][:l] > img_path[:l]:
-                                break
-                            if npz_paths[npz_path_index][:l] == img_path[:l]:  # found
-                                found = True
-                                break
-                            npz_path_index += 1  # next npz_path
-
-                        if found:
-                            w, h = strategy.get_image_size_from_disk_cache_path(img_path, npz_paths[npz_path_index])
-                        else:
-                            w, h = None, None
-
-                        if w is not None and h is not None:
-                            sizes[i] = (w, h)
-                            size_set_count += 1
-                    logger.info(f"set image size from cache files: {size_set_count}/{len(img_paths)}")
-
-            # We want to create a training and validation split. This should be improved in the future
-            # to allow a clearer distinction between training and validation. This can be seen as a
-            # short-term solution to limit what is necessary to implement validation datasets
-            #
-            # We split the dataset for the subset based on if we are doing a validation split
-            # The self.is_training_dataset defines the type of dataset, training or validation
-            # if self.is_training_dataset is True -> training dataset
-            # if self.is_training_dataset is False -> validation dataset
-            if self.validation_split > 0.0:
-                # For regularization images we do not want to split this dataset.
-                if subset.is_reg is True:
-                    # Skip any validation dataset for regularization images
-                    if self.is_training_dataset is False:
-                        img_paths = []
-                        sizes = []
-                    # Otherwise the img_paths remain as original img_paths and no split
-                    # required for training images dataset of regularization images
-                else:
-                    img_paths, sizes = split_train_val(
-                        img_paths, sizes, self.is_training_dataset, self.validation_split, self.validation_seed
-                    )
-
-            logger.info(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
-
-            if use_cached_info_for_subset:
-                captions = [meta["caption"] for meta in metas.values()]
-                missing_captions = [img_path for img_path, caption in zip(img_paths, captions) if caption is None or caption == ""]
-            else:
-                # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
-                captions = []
-                missing_captions = []
-                for img_path in tqdm(img_paths, desc="read caption"):
-                    cap_for_img = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
-                    if cap_for_img is None and subset.class_tokens is None:
-                        logger.warning(
-                            f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
-                        )
-                        captions.append("")
-                        missing_captions.append(img_path)
-                    else:
-                        if cap_for_img is None:
-                            captions.append(subset.class_tokens)
-                            missing_captions.append(img_path)
-                        else:
-                            captions.append(cap_for_img)
-
-            self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
-
-            if missing_captions:
-                number_of_missing_captions = len(missing_captions)
-                number_of_missing_captions_to_show = 5
-                remaining_missing_captions = number_of_missing_captions - number_of_missing_captions_to_show
-
-                logger.warning(
-                    f"No caption file found for {number_of_missing_captions} images. Training will continue without captions for these images. If class token exists, it will be used. / {number_of_missing_captions}枚の画像にキャプションファイルが見つかりませんでした。これらの画像についてはキャプションなしで学習を続行します。class tokenが存在する場合はそれを使います。"
-                )
-                for i, missing_caption in enumerate(missing_captions):
-                    if i >= number_of_missing_captions_to_show:
-                        logger.warning(missing_caption + f"... and {remaining_missing_captions} more")
-                        break
-                    logger.warning(missing_caption)
-
-            if not use_cached_info_for_subset and subset.cache_info:
-                logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
-                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size")]
-                matas = {}
-                for img_path, caption, size in zip(img_paths, captions, sizes):
-                    matas[img_path] = {"caption": caption, "resolution": list(size)}
-                with open(info_cache_file, "w", encoding="utf-8") as f:
-                    json.dump(matas, f, ensure_ascii=False, indent=2)
-                logger.info(f"cache image info done for / 画像情報を出力しました : {info_cache_file}")
-
-            # if sizes are not set, image size will be read in make_buckets
-            return img_paths, captions, sizes
-
-        logger.info("prepare images.")
+    def _process_subsets(self, subsets):
+        """Process all subsets to load images and captions"""
+        logger.info("Preparing images...")
         num_train_images = 0
         num_reg_images = 0
-        reg_infos: List[Tuple[ImageInfo, DreamBoothSubset]] = []
+        reg_infos = []
+
         for subset in subsets:
+            # Skip invalid subsets
             num_repeats = subset.num_repeats if self.is_training_dataset else 1
             if num_repeats < 1:
-                logger.warning(
-                    f"ignore subset with image_dir='{subset.image_dir}': num_repeats is less than 1 / num_repeatsが1を下回っているためサブセットを無視します: {num_repeats}"
-                )
+                logger.warning(f"Ignoring subset with image_dir='{subset.image_dir}': num_repeats is less than 1")
                 continue
 
             if subset in self.subsets:
-                logger.warning(
-                    f"ignore duplicated subset with image_dir='{subset.image_dir}': use the first one / 既にサブセットが登録されているため、重複した後発のサブセットを無視します"
-                )
+                logger.warning(f"Ignoring duplicated subset with image_dir='{subset.image_dir}': using the first one")
                 continue
 
-            img_paths, captions, sizes = load_dreambooth_dir(subset)
+            # Load images from directory
+            img_paths, captions, sizes = self._load_dreambooth_dir(subset)
             if len(img_paths) < 1:
-                logger.warning(
-                    f"ignore subset with image_dir='{subset.image_dir}': no images found / 画像が見つからないためサブセットを無視します"
-                )
+                logger.warning(f"Ignoring subset with image_dir='{subset.image_dir}': no images found")
                 continue
 
+            # Count images
             if subset.is_reg:
                 num_reg_images += num_repeats * len(img_paths)
             else:
                 num_train_images += num_repeats * len(img_paths)
 
-            for img_path, caption, size in zip(img_paths, captions, sizes):
-                if subset.preference:
-                    def get_non_preferred_pair_info(img_path, subset):
-                        head, file = os.path.split(img_path)
-                        head, tail = os.path.split(head)
-                        new_tail = tail.replace('w', 'l')
-                        loser_img_path = os.path.join(head, new_tail, file)
-
-                        caption = read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
-
-                        if subset.non_preference_caption_prefix:
-                            caption = subset.non_preference_caption_prefix + " " + caption
-                        if subset.non_preference_caption_suffix:
-                            caption = caption + " " + subset.non_preference_caption_suffix
-
-                        image_size = self.get_image_size(img_path) if size is not None else None
-
-                        return loser_img_path, caption, image_size
-
-                    if subset.preference_caption_prefix:
-                        caption = subset.preference_caption_prefix + " " + caption
-                    if subset.preference_caption_suffix:
-                        caption = caption + " " + subset.preference_caption_suffix
-
-                    info = ImageSetInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path)
-                    info.resize_interpolation = subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
-                    if size is not None:
-                        info.image_size = size
-                        info.image_sizes = [size]
-                    else:
-                        info.image_sizes = [None]
-                    info.add(*get_non_preferred_pair_info(img_path, subset))
-                else:
-                    info = ImageInfo(img_path, num_repeats, caption, subset.is_reg, img_path)
-                    info.resize_interpolation = subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
-                    if size is not None:
-                        info.image_size = size
-
-                if subset.is_reg:
-                    reg_infos.append((info, subset))
-                else:
-                    self.register_image(info, subset)
-
+            # Process each image in the subset
+            self._process_images_in_subset(img_paths, captions, sizes, subset, reg_infos)
+            
+            # Register the subset
             subset.img_count = len(img_paths)
             self.subsets.append(subset)
 
-        images_split_name = "train" if self.is_training_dataset else "validation"
-        logger.info(f"{num_train_images} {images_split_name} images with repeats.")
-
+        # Log statistics and balance regularization images
+        dataset_type = "train" if self.is_training_dataset else "validation"
+        logger.info(f"{num_train_images} {dataset_type} images with repeats.")
+        logger.info(f"{num_reg_images} regularization images with repeats.")
+        
         self.num_train_images = num_train_images
-
-        logger.info(f"{num_reg_images} reg images with repeats.")
-        if num_train_images < num_reg_images:
-            logger.warning("some of reg images are not used / 正則化画像の数が多いので、一部使用されない正則化画像があります")
-
-        if num_reg_images == 0:
-            logger.warning("no regularization images / 正則化画像が見つかりませんでした")
-        else:
-            # num_repeatsを計算する：どうせ大した数ではないのでループで処理する
-            n = 0
-            first_loop = True
-            while n < num_train_images:
-                for info, subset in reg_infos:
-                    if first_loop:
-                        self.register_image(info, subset)
-                        n += info.num_repeats
-                    else:
-                        info.num_repeats += 1  # rewrite registered info
-                        n += 1
-                    if n >= num_train_images:
-                        break
-                first_loop = False
-
+        self._balance_regularization_images(num_train_images, num_reg_images, reg_infos)
         self.num_reg_images = num_reg_images
 
+    def _process_images_in_subset(self, img_paths, captions, sizes, subset, reg_infos):
+        """Process each image in a subset"""
+        for img_path, caption, size in zip(img_paths, captions, sizes):
+            resize_interpolation = subset.resize_interpolation or self.resize_interpolation
+            
+            if subset.preference and subset.preference_handler:
+                # Get preference pair
+                image_set = subset.preference_handler.create_image_set(
+                    img_path, caption, size, subset,
+                    read_caption_func=lambda img_path, ext, wildcard: self._read_caption(img_path, ext, wildcard)
+                )
+                for info in image_set.items:
+                    info.resize_interpolation = resize_interpolation
+            else:
+                info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path)
+                info.resize_interpolation = resize_interpolation
+
+            if subset.is_reg:
+                reg_infos.append((info, subset))
+            else:
+                self.register_image(info, subset)
+                self.register_image_set(info, subset)
+
+    def _balance_regularization_images(self, num_train_images, num_reg_images, reg_infos):
+        """Balance regularization images to match training images count"""
+        if num_reg_images == 0:
+            logger.warning("No regularization images found")
+            return
+            
+        if num_train_images < num_reg_images:
+            logger.warning("Some regularization images will not be used (more reg than training images)")
+            
+        # Calculate num_repeats to match training image count
+        n = 0
+        first_loop = True
+        while n < num_train_images:
+            for info, subset in reg_infos:
+                if first_loop:
+                    self.register_image(info, subset)
+                    n += info.num_repeats
+                else:
+                    info.num_repeats += 1  # Update repeat count on registered info
+                    n += 1
+                if n >= num_train_images:
+                    break
+            first_loop = False
+
+    def _read_caption(self, img_path, caption_extension, enable_wildcard):
+        """Read caption from a file with the same base name as the image"""
+        # Generate candidate caption file names
+        base_name = os.path.splitext(img_path)[0]
+        base_name_face_det = base_name
+        tokens = base_name.split("_")
+        if len(tokens) >= 5:
+            base_name_face_det = "_".join(tokens[:-4])
+        cap_paths = [base_name + caption_extension, base_name_face_det + caption_extension]
+
+        # Try to read caption from each candidate path
+        for cap_path in cap_paths:
+            if os.path.isfile(cap_path):
+                try:
+                    with open(cap_path, "rt", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        if not lines:
+                            raise ValueError(f"Caption file is empty: {cap_path}")
+                            
+                        if enable_wildcard:
+                            # Join non-empty lines with newlines
+                            return "\n".join([line.strip() for line in lines if line.strip()])
+                        else:
+                            return lines[0].strip()
+                except UnicodeDecodeError as e:
+                    logger.error(f"Illegal character in file (not UTF-8): {cap_path}")
+                    raise e
+                    
+        return None
+
+    def _load_dreambooth_dir(self, subset):
+        """Load images, captions, and sizes from a directory"""
+        if not os.path.isdir(subset.image_dir):
+            logger.warning(f"Not a directory: {subset.image_dir}")
+            return [], [], []
+
+        # Try to use cached image info if available
+        info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
+        use_cached_info = subset.cache_info
+        
+        if use_cached_info:
+            logger.info(f"Using cached image info for subset: {info_cache_file}")
+            if not os.path.isfile(info_cache_file):
+                logger.warning(f"Image info cache not found. Ignoring this warning if this is first run.")
+                use_cached_info = False
+
+        # Load image paths and sizes based on the scenario
+        img_paths, sizes = self._get_image_paths_and_sizes(subset, use_cached_info, info_cache_file)
+            
+        # Split for training/validation if needed
+        if self.validation_split > 0.0:
+            img_paths, sizes = self._apply_validation_split(subset, img_paths, sizes)
+            
+        logger.info(f"Found directory {subset.image_dir} containing {len(img_paths)} image files")
+
+        # Load or generate captions
+        captions = self._get_captions(subset, img_paths, use_cached_info, info_cache_file)
+        
+        # Record tag frequency for this subset
+        self.set_tag_frequency(os.path.basename(subset.image_dir), captions)
+
+        # Create or update cache if needed
+        if not use_cached_info and subset.cache_info:
+            self._create_image_info_cache(img_paths, captions, sizes, info_cache_file)
+
+        return img_paths, captions, sizes
+
+    def _get_image_paths_and_sizes(self, subset, use_cached_info, info_cache_file):
+        """Get image paths and sizes, either from cache or by scanning directory"""
+        if use_cached_info:
+            # Load from cache
+            with open(info_cache_file, "r", encoding="utf-8") as f:
+                metas = json.load(f)
+            img_paths = list(metas.keys())
+            sizes = [meta["resolution"] for meta in metas.values()]
+        elif subset.preference:
+            # For preference datasets, use winner path
+            winner_path = str(pathlib.Path(subset.image_dir) / "w")
+            img_paths = glob_images(winner_path, "*")
+            sizes = [None] * len(img_paths)
+        else:
+            # Regular image directory
+            img_paths = glob_images(subset.image_dir, "*")
+            sizes = [None] * len(img_paths)
+            
+            # Try to get image sizes from latent cache files if available
+            sizes = self._try_get_sizes_from_cache(subset, img_paths, sizes)
+            
+        return img_paths, sizes
+    
+    def _try_get_sizes_from_cache(self, subset, img_paths, sizes):
+        """Try to get image sizes from latent cache files"""
+        strategy = LatentsCachingStrategy.get_strategy()
+        if strategy is None:
+            return sizes
+            
+        logger.info("Getting image sizes from cache files")
+        
+        # Make image path to npz path mapping
+        npz_paths = glob.glob(os.path.join(subset.image_dir, "*" + strategy.cache_suffix))
+        npz_paths.sort(key=lambda item: item.rsplit("_", maxsplit=2)[0])
+        npz_path_index = 0
+        
+        size_set_count = 0
+        for i, img_path in enumerate(tqdm(img_paths)):
+            l = len(os.path.splitext(img_path)[0])  # Remove extension
+            found = False
+            
+            # Find matching cache file
+            while npz_path_index < len(npz_paths):
+                if npz_paths[npz_path_index][:l] > img_path[:l]:
+                    break
+                if npz_paths[npz_path_index][:l] == img_path[:l]:
+                    found = True
+                    break
+                npz_path_index += 1
+                
+            if found:
+                w, h = strategy.get_image_size_from_disk_cache_path(img_path, npz_paths[npz_path_index])
+                if w is not None and h is not None:
+                    sizes[i] = (w, h)
+                    size_set_count += 1
+                    
+        logger.info(f"Set image sizes from cache files: {size_set_count}/{len(img_paths)}")
+        return sizes
+    
+    def _apply_validation_split(self, subset, img_paths, sizes):
+        """Apply validation split if needed"""
+        if self.validation_split <= 0.0:
+            return img_paths, sizes
+            
+        # For regularization images, special handling
+        if subset.is_reg:
+            # Skip validation dataset for regularization images
+            if not self.is_training_dataset:
+                return [], []
+            # Otherwise keep as is for training
+            return img_paths, sizes
+            
+        # For normal images, split based on validation percentage
+        return split_train_val(
+            img_paths, sizes, self.is_training_dataset, 
+            self.validation_split, self.validation_seed
+        )
+    
+    def _get_captions(self, subset, img_paths, use_cached_info, info_cache_file):
+        """Get captions for images, either from cache or from caption files"""
+        if use_cached_info:
+            with open(info_cache_file, "r", encoding="utf-8") as f:
+                metas = json.load(f)
+            captions = [meta["caption"] for meta in metas.values()]
+            missing_captions = [img_path for img_path, caption in zip(img_paths, captions) 
+                               if caption is None or caption == ""]
+        else:
+            # Load captions from files
+            captions = []
+            missing_captions = []
+            
+            for img_path in tqdm(img_paths, desc="Reading captions"):
+                caption = self._read_caption(img_path, subset.caption_extension, subset.enable_wildcard)
+                
+                if caption is None and subset.class_tokens is None:
+                    logger.warning(f"Neither caption file nor class tokens found. Using empty caption for: {img_path}")
+                    captions.append("")
+                    missing_captions.append(img_path)
+                else:
+                    if caption is None:
+                        captions.append(subset.class_tokens)
+                        missing_captions.append(img_path)
+                    else:
+                        captions.append(caption)
+                        
+        # Report missing captions
+        self._report_missing_captions(missing_captions)
+        
+        return captions
+    
+    def _report_missing_captions(self, missing_captions):
+        """Report missing captions with a reasonable limit on output"""
+        if not missing_captions:
+            return
+            
+        count = len(missing_captions)
+        max_to_show = 5
+        remaining = count - max_to_show
+        
+        logger.warning(
+            f"No caption files found for {count} images. Training will continue without captions "
+            f"for these images. If class tokens exist, they will be used instead."
+        )
+        
+        for i, path in enumerate(missing_captions):
+            if i >= max_to_show:
+                logger.warning(f"{path}... and {remaining} more")
+                break
+            logger.warning(path)
+    
+    def _create_image_info_cache(self, img_paths, captions, sizes, cache_file):
+        """Create a cache file with image information"""
+        logger.info(f"Caching image info to: {cache_file}")
+        
+        # Get image sizes if not already known
+        if any(size is None for size in sizes):
+            sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="Getting image sizes")]
+            
+        # Create metadata dictionary
+        metadata = {}
+        for img_path, caption, size in zip(img_paths, captions, sizes):
+            metadata[img_path] = {"caption": caption, "resolution": list(size)}
+            
+        # Write to file
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+        logger.info(f"Image info cache created: {cache_file}")
 
 class FineTuningDataset(BaseDataset):
     def __init__(
@@ -2542,7 +2954,10 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
-                resize_interpolation=subset.resize_interpolation,
+                subset.custom_attributes,
+                subset.validation_seed,
+                subset.validation_split,
+                subset.resize_interpolation,
                 subset.preference,
                 subset.preference_caption_prefix,
                 subset.preference_caption_suffix,
