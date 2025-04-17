@@ -365,7 +365,7 @@ class TextEncoderOutputsCachingStrategy:
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray[Any, np.dtype[np.floating[Any]]]]:
         raise NotImplementedError
 
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
@@ -516,7 +516,13 @@ class LatentsCachingStrategy:
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[tuple[int, int]], Optional[tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[
+        np.ndarray[tuple[int], np.dtype[np.floating[Any]]], 
+        tuple[int, int], 
+        tuple[int, int, int, int], 
+        Optional[np.ndarray[tuple[int], np.dtype[np.floating[Any]]]], 
+        Optional[np.ndarray[tuple[int], np.dtype[np.floating[Any]]]],
+    ]:
         """
         for SD/SDXL
         """
@@ -524,7 +530,13 @@ class LatentsCachingStrategy:
 
     def _default_load_latents_from_disk(
         self, latents_stride: Optional[int], npz_path: str, bucket_reso: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], Optional[tuple[int, int]], Optional[tuple[int, int, int, int]], Optional[np.ndarray], Optional[np.ndarray]]:
+    ) -> Tuple[
+        np.ndarray[tuple[int], np.dtype[np.float32]], 
+        tuple[int, int], 
+        tuple[int, int, int, int], 
+        Optional[np.ndarray[tuple[int], np.dtype[np.float32]]], 
+        Optional[np.ndarray[tuple[int], np.dtype[np.float32]]],
+    ]:
         if latents_stride is None:
             key_reso_suffix = ""
         else:
@@ -535,11 +547,11 @@ class LatentsCachingStrategy:
         if "latents" + key_reso_suffix not in npz:
             raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
 
-        latents = npz["latents" + key_reso_suffix]
-        original_size = npz["original_size" + key_reso_suffix].totuple()
-        crop_ltrb = npz["crop_ltrb" + key_reso_suffix].totuple()
-        flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
-        alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
+        latents: np.ndarray[tuple[int], np.dtype[np.float32]] = npz["latents" + key_reso_suffix]
+        original_size: tuple[int, int] = npz["original_size" + key_reso_suffix].totuple()
+        crop_ltrb: tuple[int, int, int, int] = npz["crop_ltrb" + key_reso_suffix].totuple()
+        flipped_latents: np.ndarray[tuple[int], np.dtype[np.float32]] | None = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
+        alpha_mask: np.ndarray[tuple[int], np.dtype[np.float32]] | None = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
         return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
     def save_latents_to_disk(

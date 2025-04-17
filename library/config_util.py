@@ -1,19 +1,23 @@
 import argparse
+import functools
+import json
+import os
+import random
+import typing
 from dataclasses import (
     asdict,
     dataclass,
+    fields
 )
-import functools
-import random
-from textwrap import dedent, indent
-import json
 from pathlib import Path
+from textwrap import dedent, indent
 
 # from toolz import curry
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import toml
 import voluptuous
+from transformers import CLIPTokenizer
 from voluptuous import (
     Any,
     ExactSequence,
@@ -22,17 +26,16 @@ from voluptuous import (
     Required,
     Schema,
 )
-from transformers import CLIPTokenizer
 
 from . import train_util
 from .train_util import (
-    DreamBoothSubset,
-    FineTuningSubset,
-    ControlNetSubset,
-    DreamBoothDataset,
-    FineTuningDataset,
     ControlNetDataset,
+    ControlNetSubset,
     DatasetGroup,
+    DreamBoothDataset,
+    DreamBoothSubset,
+    FineTuningDataset,
+    FineTuningSubset,
 )
 from .utils import setup_logging
 
@@ -52,8 +55,17 @@ def add_config_arguments(parser: argparse.ArgumentParser):
 
 
 @dataclass
-class BaseSubsetParams:
-    image_dir: Optional[str] = None
+class PreferenceSubsetParams:
+    preference: bool = False
+    preference_caption_prefix: Optional[str] = None
+    preference_caption_suffix: Optional[str] = None
+    non_preference_caption_prefix: Optional[str] = None
+    non_preference_caption_suffix: Optional[str] = None
+
+
+@dataclass
+class BaseSubsetParams(PreferenceSubsetParams):
+    image_dir: Optional[str | os.PathLike[str]] = None
     num_repeats: int = 1
     shuffle_caption: bool = False
     caption_separator: str = (",",)
@@ -76,11 +88,6 @@ class BaseSubsetParams:
     validation_seed: int = 0
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
-    preference: bool = False
-    preference_caption_prefix: Optional[str] = None
-    preference_caption_suffix: Optional[str] = None
-    non_preference_caption_prefix: Optional[str] = None
-    non_preference_caption_suffix: Optional[str] = None
 
 
 @dataclass
@@ -91,69 +98,78 @@ class DreamBoothSubsetParams(BaseSubsetParams):
     cache_info: bool = False
     alpha_mask: bool = False
 
+    def __post_init__(self):
+        if self.caption_extension[0] != ".":
+            self.caption_extension = f".{self.caption_extension}"
+
 
 @dataclass
 class FineTuningSubsetParams(BaseSubsetParams):
     metadata_file: Optional[str] = None
     alpha_mask: bool = False
+    class_tokens: Optional[str] = None
 
 
 @dataclass
 class ControlNetSubsetParams(BaseSubsetParams):
-    conditioning_data_dir: str = None
+    conditioning_data_dir: str | os.PathLike[str] = ""
+    is_reg: bool = False
+    class_tokens: Optional[str] = None
     caption_extension: str = ".caption"
     cache_info: bool = False
+    alpha_mask: bool = False
+
+    def __post_init__(self):
+        if self.caption_extension[0] != ".":
+            self.caption_extension = f".{self.caption_extension}"
+
+@dataclass
+class BucketDatasetParams:
+    enable_bucket: bool = False
+    min_bucket_reso: int = 256
+    max_bucket_reso: int = 1024
+    bucket_reso_steps: int = 64
+    bucket_no_upscale: bool = False
 
 
 @dataclass
 class BaseDatasetParams:
-    resolution: Optional[Tuple[int, int]] = None
+    resolution: Tuple[int, int] = (512, 512)
     network_multiplier: float = 1.0
     debug_dataset: bool = False
     validation_seed: Optional[int] = None
     validation_split: float = 0.0
     resize_interpolation: Optional[str] = None
 
+
 @dataclass
 class DreamBoothDatasetParams(BaseDatasetParams):
     batch_size: int = 1
-    enable_bucket: bool = False
-    min_bucket_reso: int = 256
-    max_bucket_reso: int = 1024
-    bucket_reso_steps: int = 64
-    bucket_no_upscale: bool = False
     prior_loss_weight: float = 1.0
-    
+    is_training_dataset: bool = True
+
+
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
     batch_size: int = 1
-    enable_bucket: bool = False
-    min_bucket_reso: int = 256
-    max_bucket_reso: int = 1024
-    bucket_reso_steps: int = 64
-    bucket_no_upscale: bool = False
 
 
 @dataclass
 class ControlNetDatasetParams(BaseDatasetParams):
     batch_size: int = 1
-    enable_bucket: bool = False
-    min_bucket_reso: int = 256
-    max_bucket_reso: int = 1024
-    bucket_reso_steps: int = 64
-    bucket_no_upscale: bool = False
 
 
 @dataclass
 class SubsetBlueprint:
-    params: Union[DreamBoothSubsetParams, FineTuningSubsetParams]
+    params: Union[DreamBoothSubsetParams, FineTuningSubsetParams, ControlNetSubsetParams]
 
 
 @dataclass
 class DatasetBlueprint:
     is_dreambooth: bool
     is_controlnet: bool
-    params: Union[DreamBoothDatasetParams, FineTuningDatasetParams]
+    bucket: BucketDatasetParams
+    params: Union[DreamBoothDatasetParams, FineTuningDatasetParams, ControlNetDatasetParams]
     subsets: Sequence[SubsetBlueprint]
 
 
@@ -167,27 +183,27 @@ class Blueprint:
     dataset_group: DatasetGroupBlueprint
 
 
+# @curry
+def validate_and_convert_twodim(klass, value: Sequence) -> Tuple:
+    Schema(ExactSequence([klass, klass]))(value)
+    return tuple(value)
+
+
+# @curry
+def validate_and_convert_scalar_or_twodim(klass, value: Union[float, Sequence]) -> Tuple:
+    Schema(Any(klass, ExactSequence([klass, klass])))(value)
+    try:
+        Schema(klass)(value)
+        return (value, value)
+    except:
+        return validate_and_convert_twodim(klass, value)
+
+
 class ConfigSanitizer:
-    # @curry
-    @staticmethod
-    def __validate_and_convert_twodim(klass, value: Sequence) -> Tuple:
-        Schema(ExactSequence([klass, klass]))(value)
-        return tuple(value)
-
-    # @curry
-    @staticmethod
-    def __validate_and_convert_scalar_or_twodim(klass, value: Union[float, Sequence]) -> Tuple:
-        Schema(Any(klass, ExactSequence([klass, klass])))(value)
-        try:
-            Schema(klass)(value)
-            return (value, value)
-        except:
-            return ConfigSanitizer.__validate_and_convert_twodim(klass, value)
-
     # subset schema
     SUBSET_ASCENDABLE_SCHEMA = {
         "color_aug": bool,
-        "face_crop_aug_range": functools.partial(__validate_and_convert_twodim.__func__, float),
+        "face_crop_aug_range": functools.partial(validate_and_convert_twodim, float),
         "flip_aug": bool,
         "num_repeats": int,
         "random_crop": bool,
@@ -207,7 +223,7 @@ class ConfigSanitizer:
         "preference_caption_prefix": str,
         "preference_caption_suffix": str,
         "non_preference_caption_prefix": str,
-        "non_preference_caption_suffix": str
+        "non_preference_caption_suffix": str,
     }
     # DO means DropOut
     DO_SUBSET_ASCENDABLE_SCHEMA = {
@@ -244,16 +260,19 @@ class ConfigSanitizer:
     # datasets schema
     DATASET_ASCENDABLE_SCHEMA = {
         "batch_size": int,
-        "bucket_no_upscale": bool,
-        "bucket_reso_steps": int,
-        "enable_bucket": bool,
-        "max_bucket_reso": int,
-        "min_bucket_reso": int,
         "validation_seed": int,
         "validation_split": float,
-        "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
+        "resolution": functools.partial(validate_and_convert_scalar_or_twodim, int),
         "network_multiplier": float,
         "resize_interpolation": str,
+    }
+
+    BUCKET_ASCENDABLE_SCHEMA = {
+        "enable_bucket": bool,
+        "bucket_no_upscale": bool,
+        "bucket_reso_steps": int,
+        "max_bucket_reso": int,
+        "min_bucket_reso": int,
     }
 
     # options handled by argparse but not handled by user config
@@ -279,27 +298,28 @@ class ConfigSanitizer:
             + " / DreamBooth モードか fine tuning モードか controlnet モードのどれも指定されていません。1つ以上指定してください。"
         )
 
-        self.db_subset_schema = self.__merge_dict(
+        self.db_subset_schema = merge_dicts(
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.DB_SUBSET_DISTINCT_SCHEMA,
             self.DB_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
         )
 
-        self.ft_subset_schema = self.__merge_dict(
+        self.ft_subset_schema = merge_dicts(
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.FT_SUBSET_DISTINCT_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
         )
 
-        self.cn_subset_schema = self.__merge_dict(
+        self.cn_subset_schema = merge_dicts(
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.CN_SUBSET_DISTINCT_SCHEMA,
             self.CN_SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
         )
 
-        self.db_dataset_schema = self.__merge_dict(
+        self.db_dataset_schema = merge_dicts(
+            self.BUCKET_ASCENDABLE_SCHEMA,
             self.DATASET_ASCENDABLE_SCHEMA,
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.DB_SUBSET_ASCENDABLE_SCHEMA,
@@ -307,14 +327,16 @@ class ConfigSanitizer:
             {"subsets": [self.db_subset_schema]},
         )
 
-        self.ft_dataset_schema = self.__merge_dict(
+        self.ft_dataset_schema = merge_dicts(
+            self.BUCKET_ASCENDABLE_SCHEMA,
             self.DATASET_ASCENDABLE_SCHEMA,
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.DO_SUBSET_ASCENDABLE_SCHEMA if support_dropout else {},
             {"subsets": [self.ft_subset_schema]},
         )
 
-        self.cn_dataset_schema = self.__merge_dict(
+        self.cn_dataset_schema = merge_dicts(
+            self.BUCKET_ASCENDABLE_SCHEMA,
             self.DATASET_ASCENDABLE_SCHEMA,
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.CN_SUBSET_ASCENDABLE_SCHEMA,
@@ -353,7 +375,8 @@ class ConfigSanitizer:
         elif support_controlnet:
             self.dataset_schema = self.cn_dataset_schema
 
-        self.general_schema = self.__merge_dict(
+        self.general_schema = merge_dicts(
+            self.BUCKET_ASCENDABLE_SCHEMA,
             self.DATASET_ASCENDABLE_SCHEMA,
             self.SUBSET_ASCENDABLE_SCHEMA,
             self.DB_SUBSET_ASCENDABLE_SCHEMA if support_dreambooth else {},
@@ -368,7 +391,7 @@ class ConfigSanitizer:
             }
         )
 
-        self.argparse_schema = self.__merge_dict(
+        self.argparse_schema = merge_dicts(
             self.general_schema,
             self.ARGPARSE_SPECIFIC_SCHEMA,
             {optname: Any(None, self.general_schema[optname]) for optname in self.ARGPARSE_NULLABLE_OPTNAMES},
@@ -377,7 +400,7 @@ class ConfigSanitizer:
 
         self.argparse_config_validator = Schema(Object(self.argparse_schema), extra=voluptuous.ALLOW_EXTRA)
 
-    def sanitize_user_config(self, user_config: dict) -> dict:
+    def sanitize_user_config(self, user_config: dict) -> dict[str, Any]:
         try:
             return self.user_config_validator(user_config)
         except MultipleInvalid:
@@ -397,19 +420,20 @@ class ConfigSanitizer:
             )
             raise
 
-    # NOTE: value would be overwritten by latter dict if there is already the same key
-    @staticmethod
-    def __merge_dict(*dict_list: dict) -> dict:
-        merged = {}
-        for schema in dict_list:
-            # merged |= schema
-            for k, v in schema.items():
-                merged[k] = v
-        return merged
+
+# NOTE: value would be overwritten by latter dict if there is already the same key
+def merge_dicts(*args: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    merged = {}
+    for schema in args:
+        # merged |= schema
+        for k, v in schema.items():
+            merged[k] = v
+    return merged
 
 
 class BlueprintGenerator:
     BLUEPRINT_PARAM_NAME_TO_CONFIG_OPTNAME = {}
+    BLUEPRINT_BUCKET_NAME_TO_CONFIG_OPTNAME = {}
 
     def __init__(self, sanitizer: ConfigSanitizer):
         self.sanitizer = sanitizer
@@ -454,7 +478,8 @@ class BlueprintGenerator:
             params = self.generate_params_by_fallbacks(
                 dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
             )
-            dataset_blueprints.append(DatasetBlueprint(is_dreambooth, is_controlnet, params, subset_blueprints))
+            bucket = self.generate_bucket_by_fallbacks(BucketDatasetParams, [dataset_config])
+            dataset_blueprints.append(DatasetBlueprint(is_dreambooth, is_controlnet, bucket, params, subset_blueprints))
 
         dataset_group_blueprint = DatasetGroupBlueprint(dataset_blueprints)
 
@@ -464,12 +489,23 @@ class BlueprintGenerator:
     def generate_params_by_fallbacks(param_klass, fallbacks: Sequence[dict]):
         name_map = BlueprintGenerator.BLUEPRINT_PARAM_NAME_TO_CONFIG_OPTNAME
         search_value = BlueprintGenerator.search_value
-        default_params = asdict(param_klass())
-        param_names = default_params.keys()
+        default_params = vars(param_klass())
+        param_names = [field.name for field in fields(param_klass)]
 
         params = {name: search_value(name_map.get(name, name), fallbacks, default_params.get(name)) for name in param_names}
 
         return param_klass(**params)
+
+    @staticmethod
+    def generate_bucket_by_fallbacks(bucket_klass, fallbacks: Sequence[dict]):
+        name_map = BlueprintGenerator.BLUEPRINT_BUCKET_NAME_TO_CONFIG_OPTNAME
+        search_value = BlueprintGenerator.search_value
+        defaults = asdict(bucket_klass())
+        names = defaults.keys()
+
+        params = {name: search_value(name_map.get(name, name), fallbacks, defaults.get(name)) for name in names}
+
+        return bucket_klass(**params)
 
     @staticmethod
     def search_value(key: str, fallbacks: Sequence[dict], default_value=None):
@@ -480,32 +516,34 @@ class BlueprintGenerator:
 
         return default_value
 
-def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
+
+def generate_dataset_group_by_blueprint(
+    dataset_group_blueprint: DatasetGroupBlueprint,
+) -> Tuple[DatasetGroup, Optional[DatasetGroup]]:
     datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
 
     for dataset_blueprint in dataset_group_blueprint.datasets:
-        extra_dataset_params = {}
-
         if dataset_blueprint.is_controlnet:
             subset_klass = ControlNetSubset
             dataset_klass = ControlNetDataset
         elif dataset_blueprint.is_dreambooth:
             subset_klass = DreamBoothSubset
             dataset_klass = DreamBoothDataset
-            # DreamBooth datasets support splitting training and validation datasets
-            extra_dataset_params = {"is_training_dataset": True}
+            
         else:
             subset_klass = FineTuningSubset
             dataset_klass = FineTuningDataset
 
         subsets = [subset_klass(**asdict(subset_blueprint.params)) for subset_blueprint in dataset_blueprint.subsets]
-        dataset = dataset_klass(subsets=subsets, **asdict(dataset_blueprint.params), **extra_dataset_params)
+        dataset = dataset_klass(subsets=subsets, **asdict(dataset_blueprint.params))
         datasets.append(dataset)
 
     val_datasets: List[Union[DreamBoothDataset, FineTuningDataset, ControlNetDataset]] = []
     for dataset_blueprint in dataset_group_blueprint.datasets:
         if dataset_blueprint.params.validation_split < 0.0 or dataset_blueprint.params.validation_split > 1.0:
-            logging.warning(f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split...")
+            logging.warning(
+                f"Dataset param `validation_split` ({dataset_blueprint.params.validation_split}) is not a valid number between 0.0 and 1.0, skipping validation split..."
+            )
             continue
 
         # if the dataset isn't setting a validation split, there is no current validation dataset
@@ -519,8 +557,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         elif dataset_blueprint.is_dreambooth:
             subset_klass = DreamBoothSubset
             dataset_klass = DreamBoothDataset
-            # DreamBooth datasets support splitting training and validation datasets
-            extra_dataset_params = {"is_training_dataset": False}
+            if isinstance(dataset_blueprint.params, DreamBoothDatasetParams):
+                dataset_blueprint.params.is_training_dataset = False
         else:
             subset_klass = FineTuningSubset
             dataset_klass = FineTuningDataset
@@ -539,21 +577,11 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                   batch_size: {dataset.batch_size}
                   resolution: {(dataset.width, dataset.height)}
                   resize_interpolation: {dataset.resize_interpolation}
-                  enable_bucket: {dataset.enable_bucket}
             """)
 
-            if dataset.enable_bucket:
-                info += indent(dedent(f"""\
-                  min_bucket_reso: {dataset.min_bucket_reso}
-                  max_bucket_reso: {dataset.max_bucket_reso}
-                  bucket_reso_steps: {dataset.bucket_reso_steps}
-                  bucket_no_upscale: {dataset.bucket_no_upscale}
-                \n"""), "  ")
-            else:
-                info += "\n"
-
             for j, subset in enumerate(dataset.subsets):
-                info += indent(dedent(f"""\
+                info += indent(
+                    dedent(f"""\
                   [Subset {j} of {dataset_type} {i}]
                     image_dir: "{subset.image_dir}"
                     image_count: {subset.img_count}
@@ -574,18 +602,26 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     alpha_mask: {subset.alpha_mask}
                     resize_interpolation: {subset.resize_interpolation}
                     custom_attributes: {subset.custom_attributes}
-                """), "  ")
+                """),
+                    "  ",
+                )
 
                 if is_dreambooth:
-                    info += indent(dedent(f"""\
+                    info += indent(
+                        dedent(f"""\
                         is_reg: {subset.is_reg}
                         class_tokens: {subset.class_tokens}
                         caption_extension: {subset.caption_extension}
-                    \n"""), "    ")
+                    \n"""),
+                        "    ",
+                    )
                 elif not is_controlnet:
-                    info += indent(dedent(f"""\
+                    info += indent(
+                        dedent(f"""\
                         metadata_file: {subset.metadata_file}
-                    \n"""), "    ")
+                    \n"""),
+                        "    ",
+                    )
 
         logger.info(info)
 
@@ -594,24 +630,21 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
     if len(val_datasets) > 0:
         print_info(val_datasets, "Validation Dataset")
 
-    # make buckets first because it determines the length of dataset
-    # and set the same seed for all datasets
-    seed = random.randint(0, 2**31)  # actual seed is seed + epoch_no
+    # # make buckets first because it determines the length of dataset
+    # # and set the same seed for all datasets
+    # seed = random.randint(0, 2**31)  # actual seed is seed + epoch_no
+    #
+    # for i, dataset in enumerate(datasets):
+    #     logger.info(f"[Prepare dataset {i}]")
+    #     dataset.make_buckets()
+    #     dataset.set_seed(seed)
+    #
+    # for i, dataset in enumerate(val_datasets):
+    #     logger.info(f"[Prepare validation dataset {i}]")
+    #     dataset.make_buckets()
+    #     dataset.set_seed(seed)
 
-    for i, dataset in enumerate(datasets):
-        logger.info(f"[Prepare dataset {i}]")
-        dataset.make_buckets()
-        dataset.set_seed(seed)
-
-    for i, dataset in enumerate(val_datasets):
-        logger.info(f"[Prepare validation dataset {i}]")
-        dataset.make_buckets()
-        dataset.set_seed(seed)
-
-    return (
-        DatasetGroup(datasets),
-        DatasetGroup(val_datasets) if val_datasets else None
-    )
+    return (DatasetGroup(datasets), DatasetGroup(val_datasets) if val_datasets else None)
 
 
 def generate_dreambooth_subsets_config_by_subdirs(train_data_dir: Optional[str] = None, reg_data_dir: Optional[str] = None):

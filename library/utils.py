@@ -1,7 +1,7 @@
 import logging
 import sys
 import threading
-from typing import *
+from typing import Optional, Tuple, List, Any, Dict, Union
 import json
 import struct
 
@@ -398,7 +398,7 @@ def pil_resize(image, size, interpolation):
     return resized_cv2
 
 
-def resize_image(image: np.ndarray, width: int, height: int, resized_width: int, resized_height: int, resize_interpolation: Optional[str] = None):
+def resize_image(image: np.ndarray[Any, np.dtype[np.integer[Any] | np.floating[Any]]], width: int, height: int, resized_width: int, resized_height: int, resize_interpolation: Optional[str] = None) -> np.ndarray[Any, np.dtype[np.integer[Any] | np.floating[Any]]]:
     """
     Resize image with resize interpolation. Default interpolation to AREA if image is smaller, else LANCZOS.
 
@@ -436,6 +436,7 @@ def resize_image(image: np.ndarray, width: int, height: int, resized_width: int,
         logger.debug(f"resize image using {resize_interpolation} (PIL)")
     else:
         interpolation = get_cv2_interpolation(resize_interpolation)
+        assert interpolation is not None, f"Unsupported interpolation method: {resize_interpolation}"
         image = cv2.resize(image, resized_size, interpolation=interpolation)
         logger.debug(f"resize image using {resize_interpolation} (cv2)")
 
