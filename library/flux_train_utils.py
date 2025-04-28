@@ -253,7 +253,22 @@ def sample_image_inference(
         controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)
 
     with accelerator.autocast(), torch.no_grad():
-        x = denoise(flux, noise, img_ids, t5_out, txt_ids, l_pooled, timesteps=timesteps, guidance=emb_guidance_scale, t5_attn_mask=t5_attn_mask, controlnet=controlnet, controlnet_img=controlnet_image, proportional_attention=args.proportional_attention, ntk_factor=args.ntk_factor)
+        x = denoise(
+            flux,
+            noise,
+            img_ids,
+            t5_out,
+            txt_ids,
+            l_pooled,
+            timesteps=timesteps,
+            guidance=emb_guidance_scale,
+            t5_attn_mask=t5_attn_mask,
+            controlnet=controlnet,
+            controlnet_img=controlnet_image,
+            neg_cond=neg_cond,
+            proportional_attention=args.proportional_attention, 
+            ntk_factor=args.ntk_factor,
+        )
 
     x = flux_utils.unpack_latents(x, packed_latent_height, packed_latent_width)
 
@@ -331,6 +346,7 @@ def denoise(
     t5_attn_mask: Optional[torch.Tensor] = None,
     controlnet: Optional[flux_models.ControlNetFlux] = None,
     controlnet_img: Optional[torch.Tensor] = None,
+    neg_cond: Optional[Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     proportional_attention: Optional[bool] = None,
     ntk_factor = 1.0
 ):
@@ -357,20 +373,6 @@ def denoise(
         else:
             block_samples = None
             block_single_samples = None
-        pred = model(
-            img=img,
-            img_ids=img_ids,
-            txt=txt,
-            txt_ids=txt_ids,
-            y=vec,
-            block_controlnet_hidden_states=block_samples,
-            block_controlnet_single_hidden_states=block_single_samples,
-            timesteps=t_vec,
-            guidance=guidance_vec,
-            txt_attention_mask=t5_attn_mask,
-            proportional_attention=proportional_attention,
-            ntk_factor=ntk_factor,
-        )
 
         if not do_cfg:
             pred = model(
