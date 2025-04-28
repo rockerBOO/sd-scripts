@@ -45,7 +45,9 @@ from library.custom_train_functions import (
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
-    WaveletLoss
+    WaveletLoss,
+    diffusion_dpo_loss,
+    mapo_loss,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -77,9 +79,6 @@ class NetworkTrainer:
         mean_combined_norm=None,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
-
-        if avr_wav_loss is not None:
-            logs['loss/wavelet_average'] = avr_wav_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -272,18 +271,18 @@ class NetworkTrainer:
 
     def get_noise_pred_and_target(
         self,
-        args,
-        accelerator,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
         noise_scheduler,
-        latents,
-        batch,
+        latents: torch.FloatTensor,
+        batch: dict[str, torch.Tensor],
         text_encoder_conds,
         unet,
         network,
-        weight_dtype,
-        train_unet,
+        weight_dtype: torch.dtype,
+        train_unet: bool,
         is_train=True,
-    ):
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None]:
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
@@ -397,10 +396,12 @@ class NetworkTrainer:
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        multipliers=1.0,
+    ) -> tuple[torch.Tensor, dict[str, float | int]]:
         """
         Process a batch for the network
         """
+        metrics: dict[str, float | int] = {}
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
@@ -497,19 +498,53 @@ class NetworkTrainer:
             wav_loss, pred_combined_hf, target_combined_hf = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
             # Weight the losses as needed
             loss = loss + args.wavelet_loss_alpha * wav_loss
+            metrics['loss/wavelet'] = wav_loss.detach().item()
 
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
             loss = apply_masked_loss(loss, batch)
-        loss = loss.mean([1, 2, 3])
+
+        if args.beta_dpo is not None:
+            def call_unet():
+                accelerator.unwrap_model(network).set_multiplier(0.0)
+                ref_noise_pred = self.call_unet(
+                    args,
+                    accelerator,
+                    unet,
+                    noisy_latents.requires_grad_(train_unet),
+                    timesteps,
+                    text_encoder_conds,
+                    batch,
+                    weight_dtype,
+                )
+
+                # reset network multipliers
+                accelerator.unwrap_model(network).set_multiplier(1.0)
+                return ref_noise_pred
+            def apply_loss(ref_noise_pred):
+                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
+                ref_loss = train_util.conditional_loss(
+                    ref_noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                )
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    ref_loss = apply_masked_loss(ref_loss, batch)
+                return ref_loss
+
+            loss, metrics_diffusion_dpo = diffusion_dpo_loss(loss, call_unet, apply_loss, args.beta_dpo)
+            metrics = {**metrics, **metrics_diffusion_dpo}
+        elif args.mapo_weight is not None:
+            loss, metrics_mapo = mapo_loss(loss, args.mapo_weight, noise_scheduler.config.num_train_timesteps)
+            metrics = {**metrics, **metrics_mapo}
+        else:
+            loss = loss.mean([1, 2, 3])
 
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, latents)
 
-        return loss.mean(), wav_loss
+        return loss.mean(), metrics
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -1478,7 +1513,7 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss, wav_loss = self.process_batch(
+                    loss, batch_metrics = self.process_batch(
                         batch,
                         text_encoders,
                         unet,
@@ -1566,7 +1601,7 @@ class NetworkTrainer:
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                wav_loss_recorder.add(epoch=epoch, step=step, loss=wav_loss.detach().item() if wav_loss is not None else 0.0)
+                wav_loss_recorder.add(epoch=epoch, step=step, loss=batch_metrics['loss/wavelet'] if "loss/wavelet" in batch_metrics else 0.0)
                 avr_loss: float = loss_recorder.moving_average
                 avr_wav_loss: float = wav_loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
@@ -1591,7 +1626,7 @@ class NetworkTrainer:
                         gns, variance = network.gradient_noise_scale()
                         if gns is not None and variance is not None:
                             logs = {**logs, "gns/gradient_noise_scale": gns, "gns/noise_variance": variance, "gns/critcal_batch_size": gns / batch_size}
-                    self.step_logging(accelerator, logs, global_step, epoch + 1)
+                    self.step_logging(accelerator, {**logs, **batch_metrics}, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
                 # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
@@ -1614,7 +1649,7 @@ class NetworkTrainer:
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
-                            loss, wav_loss = self.process_batch(
+                            loss, metrics = self.process_batch(
                                 batch,
                                 text_encoders,
                                 unet,
@@ -1634,7 +1669,7 @@ class NetworkTrainer:
 
                             current_loss = loss.detach().item()
                             val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                            val_step_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=wav_loss.detach().item() if wav_loss is not None else 0.0)
+                            val_step_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=metrics['loss/wavelet'] if "loss/wavelet" in metrics else 0.0)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
                                 {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
@@ -1697,7 +1732,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
-                        loss, wav_loss = self.process_batch(
+                        loss, metrics = self.process_batch(
                             batch,
                             text_encoders,
                             unet,
@@ -1717,7 +1752,7 @@ class NetworkTrainer:
 
                         current_loss = loss.detach().item()
                         val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                        val_epoch_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=wav_loss.detach().item() if wav_loss is not None else 0.0)
+                        val_epoch_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=metrics['loss/wavelet'] if "loss/wavelet" in metrics else 0.0)
                         val_progress_bar.update(1)
                         val_progress_bar.set_postfix(
                             {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}

@@ -40,7 +40,7 @@ def sample_images(
     text_encoders,
     sample_prompts_te_outputs,
     prompt_replacement=None,
-    controlnet=None
+    controlnet=None,
 ):
     if steps == 0:
         if not args.sample_at_first:
@@ -101,7 +101,7 @@ def sample_images(
                     steps,
                     sample_prompts_te_outputs,
                     prompt_replacement,
-                    controlnet
+                    controlnet,
                 )
     else:
         # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
@@ -125,7 +125,7 @@ def sample_images(
                         steps,
                         sample_prompts_te_outputs,
                         prompt_replacement,
-                        controlnet
+                        controlnet,
                     )
 
     torch.set_rng_state(rng_state)
@@ -147,14 +147,16 @@ def sample_image_inference(
     steps,
     sample_prompts_te_outputs,
     prompt_replacement,
-    controlnet
+    controlnet,
 ):
     assert isinstance(prompt_dict, dict)
-    # negative_prompt = prompt_dict.get("negative_prompt")
+    negative_prompt = prompt_dict.get("negative_prompt")
     sample_steps = prompt_dict.get("sample_steps", 20)
     width = prompt_dict.get("width", 512)
     height = prompt_dict.get("height", 512)
-    scale = prompt_dict.get("scale", 3.5)
+    # TODO refactor variable names
+    cfg_scale = prompt_dict.get("guidance_scale", 1.0)
+    emb_guidance_scale = prompt_dict.get("scale", 3.5)
     seed = prompt_dict.get("seed")
     controlnet_image = prompt_dict.get("controlnet_image")
     prompt: str = prompt_dict.get("prompt", "")
@@ -162,8 +164,8 @@ def sample_image_inference(
 
     if prompt_replacement is not None:
         prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
-        # if negative_prompt is not None:
-        #     negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
+        if negative_prompt is not None:
+            negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -173,16 +175,21 @@ def sample_image_inference(
         torch.seed()
         torch.cuda.seed()
 
-    # if negative_prompt is None:
-    #     negative_prompt = ""
+    if negative_prompt is None:
+        negative_prompt = ""
     height = max(64, height - height % 16)  # round to divisible by 16
     width = max(64, width - width % 16)  # round to divisible by 16
     logger.info(f"prompt: {prompt}")
-    # logger.info(f"negative_prompt: {negative_prompt}")
+    if cfg_scale != 1.0:
+        logger.info(f"negative_prompt: {negative_prompt}")
+    elif negative_prompt != "":
+        logger.info(f"negative prompt is ignored because scale is 1.0")
     logger.info(f"height: {height}")
     logger.info(f"width: {width}")
     logger.info(f"sample_steps: {sample_steps}")
-    logger.info(f"scale: {scale}")
+    logger.info(f"embedded guidance scale: {emb_guidance_scale}")
+    if cfg_scale != 1.0:
+        logger.info(f"CFG scale: {cfg_scale}")
     # logger.info(f"sample_sampler: {sampler_name}")
     if seed is not None:
         logger.info(f"seed: {seed}")
@@ -191,26 +198,37 @@ def sample_image_inference(
     tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
     encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-    text_encoder_conds = []
-    if sample_prompts_te_outputs and prompt in sample_prompts_te_outputs:
-        text_encoder_conds = sample_prompts_te_outputs[prompt]
-        print(f"Using cached text encoder outputs for prompt: {prompt}")
-    if text_encoders is not None:
-        print(f"Encoding prompt: {prompt}")
-        tokens_and_masks = tokenize_strategy.tokenize(prompt)
-        # strategy has apply_t5_attn_mask option
-        encoded_text_encoder_conds = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
+    def encode_prompt(prpt):
+        text_encoder_conds = []
+        if sample_prompts_te_outputs and prpt in sample_prompts_te_outputs:
+            text_encoder_conds = sample_prompts_te_outputs[prpt]
+            print(f"Using cached text encoder outputs for prompt: {prpt}")
+        if text_encoders is not None:
+            print(f"Encoding prompt: {prpt}")
+            tokens_and_masks = tokenize_strategy.tokenize(prpt)
+            # strategy has apply_t5_attn_mask option
+            encoded_text_encoder_conds = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
 
-        # if text_encoder_conds is not cached, use encoded_text_encoder_conds
-        if len(text_encoder_conds) == 0:
-            text_encoder_conds = encoded_text_encoder_conds
-        else:
-            # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
-            for i in range(len(encoded_text_encoder_conds)):
-                if encoded_text_encoder_conds[i] is not None:
-                    text_encoder_conds[i] = encoded_text_encoder_conds[i]
+            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+            if len(text_encoder_conds) == 0:
+                text_encoder_conds = encoded_text_encoder_conds
+            else:
+                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                for i in range(len(encoded_text_encoder_conds)):
+                    if encoded_text_encoder_conds[i] is not None:
+                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+        return text_encoder_conds
 
-    l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
+    l_pooled, t5_out, txt_ids, t5_attn_mask = encode_prompt(prompt)
+    # encode negative prompts
+    if cfg_scale != 1.0:
+        neg_l_pooled, neg_t5_out, _, neg_t5_attn_mask = encode_prompt(negative_prompt)
+        neg_t5_attn_mask = (
+            neg_t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and neg_t5_attn_mask is not None else None
+        )
+        neg_cond = (cfg_scale, neg_l_pooled, neg_t5_out, neg_t5_attn_mask)
+    else:
+        neg_cond = None
 
     # sample image
     weight_dtype = ae.dtype  # TOFO give dtype as argument
@@ -230,12 +248,12 @@ def sample_image_inference(
 
     if controlnet_image is not None:
         controlnet_image = Image.open(controlnet_image).convert("RGB")
-        controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
+        controlnet_image = controlnet_image.resize((width, height), Image.Resampling.LANCZOS)
         controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
         controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)
 
     with accelerator.autocast(), torch.no_grad():
-        x = denoise(flux, noise, img_ids, t5_out, txt_ids, l_pooled, timesteps=timesteps, guidance=scale, t5_attn_mask=t5_attn_mask, controlnet=controlnet, controlnet_img=controlnet_image, proportional_attention=args.proportional_attention, ntk_factor=args.ntk_factor)
+        x = denoise(flux, noise, img_ids, t5_out, txt_ids, l_pooled, timesteps=timesteps, guidance=emb_guidance_scale, t5_attn_mask=t5_attn_mask, controlnet=controlnet, controlnet_img=controlnet_image, proportional_attention=args.proportional_attention, ntk_factor=args.ntk_factor)
 
     x = flux_utils.unpack_latents(x, packed_latent_height, packed_latent_width)
 
@@ -305,9 +323,9 @@ def denoise(
     model: flux_models.Flux,
     img: torch.Tensor,
     img_ids: torch.Tensor,
-    txt: torch.Tensor,
+    txt: torch.Tensor,  # t5_out
     txt_ids: torch.Tensor,
-    vec: torch.Tensor,
+    vec: torch.Tensor,  # l_pooled
     timesteps: list[float],
     guidance: float = 4.0,
     t5_attn_mask: Optional[torch.Tensor] = None,
@@ -318,11 +336,12 @@ def denoise(
 ):
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
-
+    do_cfg = neg_cond is not None
 
     for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         model.prepare_block_swap_before_forward()
+
         if controlnet is not None:
             block_samples, block_single_samples = controlnet(
                 img=img,
@@ -353,7 +372,47 @@ def denoise(
             ntk_factor=ntk_factor,
         )
 
-        img = img + (t_prev - t_curr) * pred
+        if not do_cfg:
+            pred = model(
+                img=img,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                y=vec,
+                block_controlnet_hidden_states=block_samples,
+                block_controlnet_single_hidden_states=block_single_samples,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+                txt_attention_mask=t5_attn_mask,
+            )
+
+            img = img + (t_prev - t_curr) * pred
+        else:
+            cfg_scale, neg_l_pooled, neg_t5_out, neg_t5_attn_mask = neg_cond
+            nc_c_t5_attn_mask = None if t5_attn_mask is None else torch.cat([neg_t5_attn_mask, t5_attn_mask], dim=0)
+
+            # TODO is it ok to use the same block samples for both cond and uncond?
+            block_samples = None if block_samples is None else torch.cat([block_samples, block_samples], dim=0)
+            block_single_samples = (
+                None if block_single_samples is None else torch.cat([block_single_samples, block_single_samples], dim=0)
+            )
+
+            nc_c_pred = model(
+                img=torch.cat([img, img], dim=0),
+                img_ids=torch.cat([img_ids, img_ids], dim=0),
+                txt=torch.cat([neg_t5_out, txt], dim=0),
+                txt_ids=torch.cat([txt_ids, txt_ids], dim=0),
+                y=torch.cat([neg_l_pooled, vec], dim=0),
+                block_controlnet_hidden_states=block_samples,
+                block_controlnet_single_hidden_states=block_single_samples,
+                timesteps=t_vec,
+                guidance=guidance_vec,
+                txt_attention_mask=nc_c_t5_attn_mask,
+            )
+            neg_pred, pred = torch.chunk(nc_c_pred, 2, dim=0)
+            pred = neg_pred + (pred - neg_pred) * cfg_scale
+
+            img = img + (t_prev - t_curr) * pred
 
     model.prepare_block_swap_before_forward()
     return img
@@ -363,7 +422,7 @@ def denoise(
 
 
 # region train
-def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32):
+def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32) -> torch.FloatTensor:
     sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = noise_scheduler.timesteps.to(device)
     timesteps = timesteps.to(device)
@@ -396,7 +455,7 @@ def compute_density_for_timestep_sampling(
     return u
 
 
-def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
+def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas) -> torch.Tensor:
     """Computes loss weighting scheme for SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
@@ -413,35 +472,43 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
     return weighting
 
 
-def get_noisy_model_input_and_timesteps(
+def get_noisy_model_input_and_timestep(
     args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    """
+    Returns:
+        tuple[
+            noisy_model_input: noisy at sigma applied to latent
+            timesteps: timesteps betweeen 1.0 and 1000.0
+            sigmas: sigmas between 0.0 and 1.0
+        ]
+    """
     bsz, _, h, w = latents.shape
     assert bsz > 0, "Batch size not large enough"
-    num_timesteps = noise_scheduler.config.num_train_timesteps
+    num_timesteps: int = noise_scheduler.config.num_train_timesteps
     if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random sigma-based noise sampling
         if args.timestep_sampling == "sigmoid":
             # https://github.com/XLabs-AI/x-flux/tree/main
-            sigmas = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
+            sigma = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
         else:
-            sigmas = torch.rand((bsz,), device=device)
+            sigma = torch.rand((bsz,), device=device)
 
-        timesteps = sigmas * num_timesteps
+        timestep = sigma * num_timesteps
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
-        sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas * num_timesteps
+        sigma = torch.randn(bsz, device=device)
+        sigma = sigma * args.sigmoid_scale  # larger scale for more uniform sampling
+        sigma = sigma.sigmoid()
+        sigma = (sigma * shift) / (1 + (shift - 1) * sigma)
+        timestep = sigma * num_timesteps
     elif args.timestep_sampling == "flux_shift":
-        sigmas = torch.randn(bsz, device=device)
-        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigmas = sigmas.sigmoid()
+        sigma = torch.randn(bsz, device=device)
+        sigma = sigma * args.sigmoid_scale  # larger scale for more uniform sampling
+        sigma = sigma.sigmoid()
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2)) # we are pre-packed so must adjust for packed size 
-        sigmas = time_shift(mu, 1.0, sigmas)
-        timesteps = sigmas * num_timesteps
+        sigma = time_shift(mu, 1.0, sigma)
+        timestep = sigma * num_timesteps
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly
@@ -453,26 +520,29 @@ def get_noisy_model_input_and_timesteps(
             mode_scale=args.mode_scale,
         )
         indices = (u * num_timesteps).long()
-        timesteps = noise_scheduler.timesteps[indices].to(device=device)
-        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+        timestep: torch.Tensor = noise_scheduler.timesteps[indices].to(device=device)
+        sigma = get_sigmas(noise_scheduler, timestep, device, n_dim=latents.ndim, dtype=dtype)
 
     # Broadcast sigmas to latent shape
-    sigmas = sigmas.view(-1, 1, 1, 1)
+    sigma = sigma.view(-1, 1, 1, 1)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
     if args.ip_noise_gamma:
+        assert isinstance(args.ip_noise_gamma, float)
         xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
         if args.ip_noise_gamma_random_strength:
-            ip_noise_gamma = (torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma)
+            ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
         else:
             ip_noise_gamma = args.ip_noise_gamma
-        noisy_model_input = (1.0 - sigmas) * latents + sigmas * (noise + ip_noise_gamma * xi)
+        noisy_model_input = (1.0 - sigma) * latents + sigma * (noise + ip_noise_gamma * xi)
     else:
-        noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+        noisy_model_input = (1.0 - sigma) * latents + sigma * noise
 
-    return noisy_model_input.to(dtype), timesteps.to(dtype), sigmas
-def apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas):
+    return noisy_model_input.to(dtype), timestep.to(dtype), sigma
+
+
+def apply_model_prediction_type(args, model_pred: torch.FloatTensor, noisy_model_input, sigmas):
     weighting = None
     if args.model_prediction_type == "raw":
         pass
@@ -573,7 +643,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
         "--controlnet_model_name_or_path",
         type=str,
         default=None,
-        help="path to controlnet (*.sft or *.safetensors) / controlnetのパス（*.sftまたは*.safetensors）"
+        help="path to controlnet (*.sft or *.safetensors) / controlnetのパス（*.sftまたは*.safetensors）",
     )
     parser.add_argument(
         "--t5xxl_max_token_length",
