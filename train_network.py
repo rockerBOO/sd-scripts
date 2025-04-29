@@ -48,6 +48,8 @@ from library.custom_train_functions import (
     WaveletLoss,
     diffusion_dpo_loss,
     mapo_loss,
+    FlowMatchingDDOLoss,
+    compute_target_velocity,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -467,8 +469,43 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
-        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+
+        if args.ddo_beta is not None or args.ddo_alpha is not None:
+            # Compute DDO loss
+            ddo_loss = FlowMatchingDDOLoss(alpha=args.ddo_beta or 4.0, beta=args.ddo_alpha or 0.05)
+
+            accelerator.unwrap_model(network).set_multiplier(0.0)
+            with torch.no_grad(), accelerator.autocast():
+                ref_noise_pred, _noisy_latents, ref_target, ref_timesteps, _weighting = self.get_noise_pred_and_target(
+                    args,
+                    accelerator,
+                    noise_scheduler,
+                    torch.rand_like(latents),
+                    batch,
+                    text_encoder_conds,
+                    unet,
+                    network,
+                    weight_dtype,
+                    train_unet,
+                    is_train=is_train,
+                )
+
+            # reset network multipliers
+            accelerator.unwrap_model(network).set_multiplier(1.0)
+
+            # Combine real and fake batches
+            combined_latents = torch.cat([noise_pred, ref_noise_pred], dim=0)
+            combined_t = torch.cat([timesteps, ref_timesteps], dim=0)
+
+            # Compute target vector field (straight path for rectified flow)
+            v_target = compute_target_velocity(combined_latents, combined_t)
+            v_theta = noise_pred
+            v_theta_ref = ref_noise_pred
+
+            loss = ddo_loss(v_theta, v_theta_ref, v_target, combined_t)
+        else:
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
         wav_loss = None
         if args.wavelet_loss:
@@ -508,16 +545,20 @@ class NetworkTrainer:
         if args.beta_dpo is not None:
             def call_unet():
                 accelerator.unwrap_model(network).set_multiplier(0.0)
-                ref_noise_pred = self.call_unet(
-                    args,
-                    accelerator,
-                    unet,
-                    noisy_latents.requires_grad_(train_unet),
-                    timesteps,
-                    text_encoder_conds,
-                    batch,
-                    weight_dtype,
-                )
+                with torch.no_grad(), accelerator.autocast():
+                    ref_noise_pred, _noisy_latents, ref_target, ref_timesteps, _weighting = self.get_noise_pred_and_target(
+                        args,
+                        accelerator,
+                        noise_scheduler,
+                        torch.rand_like(latents),
+                        batch,
+                        text_encoder_conds,
+                        unet,
+                        network,
+                        weight_dtype,
+                        train_unet,
+                        is_train=is_train,
+                    )
 
                 # reset network multipliers
                 accelerator.unwrap_model(network).set_multiplier(1.0)
