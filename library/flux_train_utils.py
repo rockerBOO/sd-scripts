@@ -267,7 +267,7 @@ def sample_image_inference(
             controlnet_img=controlnet_image,
             neg_cond=neg_cond,
             proportional_attention=args.proportional_attention, 
-            ntk_factor=args.ntk_factor)
+            ntk_factor=args.ntk_factor
         )
 
     x = flux_utils.unpack_latents(x, packed_latent_height, packed_latent_width)
