@@ -348,7 +348,7 @@ def denoise(
     controlnet_img: Optional[torch.Tensor] = None,
     neg_cond: Optional[Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     proportional_attention: Optional[bool] = None,
-    ntk_factor = 1.0
+    ntk_factor = 1.0,
 ):
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
@@ -386,6 +386,8 @@ def denoise(
                 timesteps=t_vec,
                 guidance=guidance_vec,
                 txt_attention_mask=t5_attn_mask,
+                proportional_attention=proportional_attention,
+                ntk_factor=ntk_factor,
             )
 
             img = img + (t_prev - t_curr) * pred
