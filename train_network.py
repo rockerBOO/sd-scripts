@@ -475,6 +475,18 @@ class NetworkTrainer:
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+
+        if args.wavelet_loss_alpha:
+            # Calculate flow-based clean estimate using the target
+            flow_based_clean = noisy_latents - sigmas.view(-1, 1, 1, 1) * target
+            
+            # Calculate model-based denoised estimate
+            model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
+
+            wav_loss, wavelet_metrics = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
+            # Weight the losses as needed
+            loss = loss + args.wavelet_loss_alpha * wav_loss
+
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -1432,6 +1444,32 @@ class NetworkTrainer:
                 logger.info(f"\tBand weights: {args.wavelet_loss_band_weights}")
             if args.wavelet_loss_band_level_weights is not None:
                 logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
+
+        if args.wavelet_loss:
+            self.wavelet_loss = WaveletLoss(
+                transform_type=args.wavelet_loss_transform,
+                wavelet=args.wavelet_loss_wavelet, 
+                level=args.wavelet_loss_level, 
+                band_weights=args.wavelet_loss_band_weights, 
+                band_level_weights=args.wavelet_loss_band_level_weights, 
+                quaternion_component_weights=args.wavelet_loss_quaternion_component_weights,
+                ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
+                device=accelerator.device
+            )
+
+            logger.info("Wavelet Loss:")
+            logger.info(f"\tLevel: {args.wavelet_loss_level}")
+            logger.info(f"\tAlpha: {args.wavelet_loss_alpha}")
+            logger.info(f"\tTransform: {args.wavelet_loss_transform}")
+            logger.info(f"\tWavelet: {args.wavelet_loss_wavelet}")
+            if args.wavelet_loss_ll_level_threshold is not None:
+                logger.info(f"\tLL level threshold: {args.wavelet_loss_ll_level_threshold}")
+            if args.wavelet_loss_band_weights is not None:
+                logger.info(f"\tBand weights: {args.wavelet_loss_band_weights}")
+            if args.wavelet_loss_band_level_weights is not None:
+                logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
+            if args.wavelet_loss_quaternion_component_weights is not None:
+                logger.info(f"\tQuaternion component weights: {args.wavelet_loss_quaternion_component_weights}")
 
         del train_dataset_group
         if val_dataset_group is not None:
