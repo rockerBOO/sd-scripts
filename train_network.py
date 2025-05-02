@@ -472,7 +472,7 @@ class NetworkTrainer:
             # Calculate model-based denoised estimate
             model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
 
-            wav_loss, pred_combined_hf, target_combined_hf = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
+            wav_loss, wavelet_metrics = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
             # Weight the losses as needed
             loss = loss + args.wavelet_loss_alpha * wav_loss
 
@@ -1282,34 +1282,30 @@ class NetworkTrainer:
         val_epoch_loss_recorder = train_util.LossRecorder()
 
         if args.wavelet_loss:
-            def loss_fn(args):
-                loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
-                if loss_type == "huber":
-                    def huber(pred, target, reduction="mean"):
-                        if args.huber_c is None:
-                            raise NotImplementedError("huber_c not implemented correctly")
-                        b_size = pred.shape[0]
-                        huber_c = torch.full((b_size,), args.huber_c * args.huber_scale, device=pred.device)
-                        huber_c = huber_c.view(-1, 1, 1, 1)
-                        loss = 2 * huber_c * (torch.sqrt((pred - target) ** 2 + huber_c**2) - huber_c)
-                        return loss.mean()
-                    return huber
+            self.wavelet_loss = WaveletLoss(
+                transform_type=args.wavelet_loss_transform,
+                wavelet=args.wavelet_loss_wavelet, 
+                level=args.wavelet_loss_level, 
+                band_weights=args.wavelet_loss_band_weights, 
+                band_level_weights=args.wavelet_loss_band_level_weights, 
+                quaternion_component_weights=args.wavelet_loss_quaternion_component_weights,
+                ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
+                device=accelerator.device
+            )
 
-                elif loss_type == "smooth_l1":
-                    def smooth_l1(pred, target, reduction="mean"):
-                        if args.huber_c is None:
-                            raise NotImplementedError("huber_c not implemented correctly")
-                        b_size = pred.shape[0]
-                        huber_c = torch.full((b_size,), args.huber_c * args.huber_scale, device=pred.device)
-                        huber_c = huber_c.view(-1, 1, 1, 1)
-                        loss = 2 * (torch.sqrt((pred - target) ** 2 + huber_c**2) - huber_c)
-                        return loss.mean()
-                elif loss_type == "l2":
-                    return  torch.nn.functional.mse_loss
-                elif loss_type == "l1":
-                    return torch.nn.functional.l1_loss
-
-            self.wavelet_loss = WaveletLoss(wavelet=args.wavelet_loss_wavelet, level=args.wavelet_loss_level, loss_fn=loss_fn(args), device=accelerator.device)
+            logger.info("Wavelet Loss:")
+            logger.info(f"\tLevel: {args.wavelet_loss_level}")
+            logger.info(f"\tAlpha: {args.wavelet_loss_alpha}")
+            logger.info(f"\tTransform: {args.wavelet_loss_transform}")
+            logger.info(f"\tWavelet: {args.wavelet_loss_wavelet}")
+            if args.wavelet_loss_ll_level_threshold is not None:
+                logger.info(f"\tLL level threshold: {args.wavelet_loss_ll_level_threshold}")
+            if args.wavelet_loss_band_weights is not None:
+                logger.info(f"\tBand weights: {args.wavelet_loss_band_weights}")
+            if args.wavelet_loss_band_level_weights is not None:
+                logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
+            if args.wavelet_loss_quaternion_component_weights is not None:
+                logger.info(f"\tQuaternion component weights: {args.wavelet_loss_quaternion_component_weights}")
 
         del train_dataset_group
         if val_dataset_group is not None:
