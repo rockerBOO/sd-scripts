@@ -407,7 +407,7 @@ class NetworkTrainer:
         """
         Process a batch for the network
         """
-        metrics: dict[str, float | int] = {}
+        metrics: dict[str, int | float] = {}
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
@@ -476,17 +476,6 @@ class NetworkTrainer:
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
-        if args.wavelet_loss_alpha:
-            # Calculate flow-based clean estimate using the target
-            flow_based_clean = noisy_latents - sigmas.view(-1, 1, 1, 1) * target
-            
-            # Calculate model-based denoised estimate
-            model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
-
-            wav_loss, wavelet_metrics = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
-            # Weight the losses as needed
-            loss = loss + args.wavelet_loss_alpha * wav_loss
-
         if weighting is not None:
             loss = loss * weighting
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
@@ -550,6 +539,8 @@ class NetworkTrainer:
         elif args.mapo_weight is not None:
             loss, metrics_mapo = mapo_loss(loss, args.mapo_weight, noise_scheduler.config.num_train_timesteps)
             metrics = {**metrics, **metrics_mapo}
+        else:
+            loss = loss.mean([1, 2, 3])
 
         wav_loss = None
         if args.wavelet_loss:
@@ -615,7 +606,6 @@ class NetworkTrainer:
                 if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                     ref_loss = apply_masked_loss(ref_loss, batch)
                 return ref_loss
-
 
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
@@ -1422,28 +1412,6 @@ class NetworkTrainer:
         val_step_wav_loss_recorder = train_util.LossRecorder()
         val_epoch_loss_recorder = train_util.LossRecorder()
         val_epoch_wav_loss_recorder = train_util.LossRecorder()
-
-        if args.wavelet_loss:
-            self.wavelet_loss = WaveletLoss(
-                wavelet=args.wavelet_loss_wavelet, 
-                level=args.wavelet_loss_level, 
-                band_level_weights=args.wavelet_loss_band_level_weights, 
-                band_weights=args.wavelet_loss_band_weights, 
-                ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
-                device=accelerator.device
-            )
-
-            logger.info("Wavelet Loss:")
-            logger.info(f"\tLevel: {args.wavelet_loss_level}")
-            logger.info(f"\tAlpha: {args.wavelet_loss_alpha}")
-            logger.info(f"\tTransform: {args.wavelet_loss_transform}")
-            logger.info(f"\tWavelet: {args.wavelet_loss_wavelet}")
-            if args.wavelet_loss_ll_level_threshold is not None:
-                logger.info(f"\tLL level threshold: {args.wavelet_loss_ll_level_threshold}")
-            if args.wavelet_loss_band_weights is not None:
-                logger.info(f"\tBand weights: {args.wavelet_loss_band_weights}")
-            if args.wavelet_loss_band_level_weights is not None:
-                logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
 
         if args.wavelet_loss:
             self.wavelet_loss = WaveletLoss(
