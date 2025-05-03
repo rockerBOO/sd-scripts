@@ -4,7 +4,7 @@ import torch
 import argparse
 import random
 import re
-import torch.nn as nn 
+import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.types import Number
@@ -639,6 +639,7 @@ def apply_masked_loss(loss, batch) -> torch.FloatTensor:
     return loss
 
 
+
 class LossCallableMSE(Protocol):
     def __call__(
         self,
@@ -733,6 +734,7 @@ class DiscreteWaveletTransform(WaveletTransform):
         hh = hh.view(batch, channels, hh.shape[2], hh.shape[3]).to(x.device)
 
         return ll, lh, hl, hh
+
 
 class StationaryWaveletTransform(WaveletTransform):
     """Stationary Wavelet Transform (SWT) implementation."""
@@ -870,6 +872,7 @@ class QuaternionWaveletTransform(WaveletTransform):
     def _apply_hilbert(self, x, direction):
         """Apply Hilbert transform in specified direction with correct padding."""
         batch, channels, height, width = x.shape
+
         x_flat = x.reshape(batch * channels, 1, height, width)
 
         # Get the appropriate filter
@@ -993,7 +996,7 @@ class QuaternionWaveletTransform(WaveletTransform):
         return qwt_coeffs
 
     def _dwt_single_level(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Perform single-level DWT decomposition, reusing existing implementation."""
+        """Perform single-level DWT decomposition."""
         batch, channels, height, width = x.shape
         x = x.view(batch * channels, 1, height, width)
 
@@ -1011,12 +1014,13 @@ class QuaternionWaveletTransform(WaveletTransform):
         hh = F.conv2d(hi, self.dec_hi.view(1, 1, 1, -1), stride=(1, 2))
 
         # Reshape back to batch format
-        ll = ll.view(batch, channels, ll.shape[2], ll.shape[3])
-        lh = lh.view(batch, channels, lh.shape[2], lh.shape[3])
-        hl = hl.view(batch, channels, hl.shape[2], hl.shape[3])
-        hh = hh.view(batch, channels, hh.shape[2], hh.shape[3])
+        ll = ll.view(batch, channels, ll.shape[2], ll.shape[3]).to(x.device)
+        lh = lh.view(batch, channels, lh.shape[2], lh.shape[3]).to(x.device)
+        hl = hl.view(batch, channels, hl.shape[2], hl.shape[3]).to(x.device)
+        hh = hh.view(batch, channels, hh.shape[2], hh.shape[3]).to(x.device)
 
         return ll, lh, hl, hh
+
 
 class WaveletLoss(nn.Module):
     """Wavelet-based loss calculation module."""
@@ -1335,6 +1339,7 @@ def visualize_qwt_results(qwt_transform, lr_image, pred_latent, target_latent, f
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
+
 
 """
 ##########################################
