@@ -82,6 +82,9 @@ class NetworkTrainer:
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
+        if avr_wav_loss is not None:
+            logs['loss/wavelet_average'] = avr_wav_loss
+
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
             logs["max_norm/max_key_norm"] = maximum_norm
