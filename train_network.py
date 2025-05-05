@@ -570,7 +570,7 @@ class NetworkTrainer:
 
             self.wavelet_loss.set_loss_fn(wavelet_loss_fn(args))
 
-            wav_loss, pred_combined_hf, target_combined_hf = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
+            wav_loss, metrics_wavelet = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
             # Weight the losses as needed
             loss = loss + args.wavelet_loss_alpha * wav_loss
             metrics['loss/wavelet'] = wav_loss.detach().item()
