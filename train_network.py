@@ -1588,7 +1588,7 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss, batch_metrics = self.process_batch(
+                    loss, metrics = self.process_batch(
                         batch,
                         text_encoders,
                         unet,
@@ -1726,7 +1726,7 @@ class NetworkTrainer:
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
-                            loss, metrics = self.process_batch(
+                            loss, val_metrics = self.process_batch(
                                 batch,
                                 text_encoders,
                                 unet,
@@ -1746,7 +1746,7 @@ class NetworkTrainer:
 
                             current_loss = loss.detach().item()
                             val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                            val_step_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=metrics['loss/wavelet'] if 'loss/wavelet' in metrics else 0.0)
+                            val_step_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=val_metrics['loss/wavelet'] if 'loss/wavelet' in val_metrics else 0.0)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
                                 {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
@@ -1809,7 +1809,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
-                        loss, metrics = self.process_batch(
+                        loss, val_metrics = self.process_batch(
                             batch,
                             text_encoders,
                             unet,
@@ -1829,7 +1829,7 @@ class NetworkTrainer:
 
                         current_loss = loss.detach().item()
                         val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                        val_epoch_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=metrics['loss/wavelet'] if 'loss/wavelet' in metrics else 0.0)
+                        val_epoch_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=val_metrics['loss/wavelet'] if 'loss/wavelet' in val_metrics else 0.0)
                         val_progress_bar.update(1)
                         val_progress_bar.set_postfix(
                             {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
