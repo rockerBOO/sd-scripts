@@ -1703,7 +1703,7 @@ class NetworkTrainer:
                         gns, variance = network.gradient_noise_scale()
                         if gns is not None and variance is not None:
                             logs = {**logs, "gns/gradient_noise_scale": gns, "gns/noise_variance": variance, "gns/critcal_batch_size": gns / batch_size}
-                    self.step_logging(accelerator, {**logs, **batch_metrics}, global_step, epoch + 1)
+                    self.step_logging(accelerator, {**logs, **metrics}, global_step, epoch + 1)
 
                 # VALIDATION PER STEP: global_step is already incremented
                 # for example, if validate_every_n_steps=100, validate at step 100, 200, 300, ...
