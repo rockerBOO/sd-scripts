@@ -7,6 +7,7 @@
 # https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
+from dataclasses import asdict
 import math
 import os
 from contextlib import contextmanager
@@ -17,8 +18,10 @@ import numpy as np
 import torch
 from torch import Tensor
 import re
+from tqdm import tqdm
 from library.utils import setup_logging
-from library.train_util import initialize_lora, initialize_pissa, initialize_urae
+from library.device_utils import clean_memory_on_device
+from library.network_utils import initialize_lora, initialize_parse_opts, initialize_pissa, initialize_urae
 
 setup_logging()
 import logging
@@ -125,13 +128,6 @@ class LoRAModule(torch.nn.Module):
             else:
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
-
-            if initialize == "urae":
-                initialize_urae(org_module, self.lora_down, self.lora_up, self.lora_dim)
-            elif initialize == "pissa":
-                initialize_pissa(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim)
-            else:
-                initialize_lora(self.lora_down, self.lora_up)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -141,13 +137,6 @@ class LoRAModule(torch.nn.Module):
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
             )
             self.lora_up = torch.nn.ModuleList([torch.nn.Linear(self.lora_dim, split_dim, bias=False) for split_dim in split_dims])
-            for lora_down, lora_up in zip(self.lora_down, self.lora_up):
-                if initialize == "urae":
-                    initialize_urae(org_module, lora_down, lora_up, self.lora_dim)
-                elif initialize == "pissa":
-                    initialize_pissa(org_module, lora_down, lora_up, self.scale, self.lora_dim)
-                else:
-                    initialize_lora(lora_down, lora_up)
 
         # same as microsoft's
         self.multiplier = multiplier
@@ -167,6 +156,66 @@ class LoRAModule(torch.nn.Module):
             self.initialize_norm_cache(org_module.weight)
             self.org_module_shape: tuple[int] = org_module.weight.shape
 
+        self._org_lora_up = None
+        self._org_lora_down = None
+
+        self.ggpo_sigma = ggpo_sigma
+        self.ggpo_beta = ggpo_beta
+
+        if self.ggpo_beta is not None and self.ggpo_sigma is not None:
+            self.combined_weight_norms = None
+            self.grad_norms = None
+            self.perturbation_norm_factor = 1.0 / math.sqrt(org_module.weight.shape[0])
+            self.initialize_norm_cache(org_module.weight)
+            self.org_module_shape: tuple[int] = org_module.weight.shape
+
+
+    def initialize_weights(self, org_module: torch.nn.Module, initialize: Optional[str], device: Optional[torch.device]):
+        """
+        Initialize the weights for the LoRA
+
+        org_module: original module we are applying the LoRA to
+        device: device to run initialization computation on
+        """
+        if self.split_dims is None:
+            if initialize is not None:
+                params = initialize_parse_opts(initialize)
+                if initialize[:4] == "urae":
+                    initialize_urae(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim, device=device, **asdict(params))
+                    # Need to store the original weights so we can get a plain LoRA out
+                    self._org_lora_up = self.lora_up.weight.data.detach().clone()
+                    self._org_lora_down = self.lora_down.weight.data.detach().clone()
+                elif initialize[:5] == "pissa":
+                    initialize_pissa(org_module, self.lora_down, self.lora_up, self.scale, self.lora_dim, device=device, **asdict(params))
+                    # Need to store the original weights so we can get a plain LoRA out
+                    self._org_lora_up = self.lora_up.weight.data.detach().clone()
+                    self._org_lora_down = self.lora_down.weight.data.detach().clone()
+            else:
+                initialize_lora(self.lora_down, self.lora_up)
+        else:
+            assert isinstance(self.lora_down, torch.nn.ModuleList)
+            assert isinstance(self.lora_up, torch.nn.ModuleList)
+            for lora_down, lora_up in zip(self.lora_down, self.lora_up):
+                if initialize is not None:
+                    params = initialize_parse_opts(initialize)
+                    if initialize[:4] == "urae":
+                        initialize_urae(org_module, lora_down, lora_up, self.scale, self.lora_dim, device=device, **asdict(params))
+                        # Need to store the original weights so we can get a plain LoRA out
+                        self._org_lora_up = lora_up.weight.data.detach().clone()
+                        self._org_lora_down = lora_down.weight.data.detach().clone()
+                    elif initialize[:5] == "pissa":
+                        initialize_pissa(org_module, lora_down, lora_up, self.scale, self.lora_dim, device=device, **asdict(params))
+                        # Need to store the original weights so we can get a plain LoRA out
+                        self._org_lora_up = lora_up.weight.data.detach().clone()
+                        self._org_lora_down = lora_down.weight.data.detach().clone()
+                else:
+                    initialize_lora(lora_down, lora_up)
+
+        if self._org_lora_up is not None and self._org_lora_down is not None:
+            # TODO: Capture option if we should keep on VRAM
+            # offloading to CPU
+            self._org_lora_up = self._org_lora_up.to("cpu")
+            self._org_lora_down = self._org_lora_down.to("cpu")
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -1308,6 +1357,76 @@ class LoRANetwork(torch.nn.Module):
             metadata = None
 
         state_dict = self.state_dict()
+
+        # Need to decompose the parameters into a LoRA format
+        if self.initialize is not None and (self.initialize[:5] == "pissa" or self.initialize[:4] == "urae"):
+            loras: List[Union[LoRAModule, LoRAInfModule]] = self.text_encoder_loras + self.unet_loras
+            def convert_pissa_to_standard_lora(trained_up: Tensor, trained_down: Tensor, orig_up: Tensor, orig_down: Tensor, rank: int):
+                # Calculate ΔW = A'B' - AB
+                delta_w = (trained_up @ trained_down) - (orig_up @ orig_down)
+
+                # We need to create new low-rank matrices that represent this delta
+                U, S, V = torch.linalg.svd(delta_w.to(device="cuda", dtype=torch.float32), full_matrices=False)
+
+                # Take the top 2*r singular values (as suggested in the paper)
+                rank = rank * 2
+                rank = min(rank, len(S))  # Make sure we don't exceed available singular values
+
+                # Create new LoRA matrices
+                new_up = U[:, :rank] @ torch.diag(torch.sqrt(S[:rank]))
+                new_down = torch.diag(torch.sqrt(S[:rank])) @ V[:rank, :]
+
+                # These matrices can now be used as standard LoRA weights
+                return new_up, new_down
+
+            def convert_urae_to_standard_lora(trained_up: Tensor, trained_down: Tensor, orig_up: Tensor, orig_down: Tensor, rank: int):
+                # Calculate ΔW = A'B' - AB
+                delta_w = (trained_up @ trained_down) - (orig_up @ orig_down)
+                
+                # We need to create new low-rank matrices that represent this delta
+                U, S, V = torch.linalg.svd(delta_w.to(device="cuda", dtype=torch.float32), full_matrices=False)
+                
+                # For URAE, we want to focus on the smallest singular values
+                # Take the bottom rank*2 singular values (opposite of PiSSA which takes the top ones)
+                total_rank = len(S)
+                rank_to_use = min(rank * 2, total_rank)
+                
+                if rank_to_use < total_rank:
+                    # Use the smallest singular values and vectors
+                    selected_U = U[:, -rank_to_use:]
+                    selected_S = S[-rank_to_use:]
+                    selected_V = V[-rank_to_use:, :]
+                else:
+                    # If we'd use all values, just use the standard approach but with a note
+                    print("Warning: Requested rank is too large for URAE specialty, using all singular values")
+                    selected_U = U
+                    selected_S = S
+                    selected_V = V
+                
+                # Create new LoRA matrices
+                new_up = selected_U @ torch.diag(torch.sqrt(selected_S))
+                new_down = torch.diag(torch.sqrt(selected_S)) @ selected_V
+                
+                # These matrices can now be used as standard LoRA weights
+                return new_up, new_down
+
+            with torch.no_grad():
+                progress = tqdm(total=len(loras), desc="Converting weights")
+                for lora in loras:
+                    lora_up_key = f"{lora.lora_name}.lora_up.weight"
+                    lora_down_key = f"{lora.lora_name}.lora_down.weight"
+                    lora_up = state_dict[lora_up_key]
+                    lora_down = state_dict[lora_down_key]
+                    if self.initialize[:4] == "urae":
+                        up, down = convert_urae_to_standard_lora(lora_up, lora_down, lora._org_lora_up.to(lora_up.device), lora._org_lora_down.to(lora_up.device), lora.lora_dim)
+                    elif self.initialize[:5] == "pissa":
+                        up, down = convert_pissa_to_standard_lora(lora_up, lora_down, lora._org_lora_up.to(lora_up.device), lora._org_lora_down.to(lora_up.device), lora.lora_dim)
+
+                    # TODO: Capture option if we should offload
+                    # offload to CPU
+                    state_dict[lora_up_key] = up.detach()
+                    state_dict[lora_down_key] = down.detach()
+                    progress.update(1)
 
         if dtype is not None:
             for key in list(state_dict.keys()):
