@@ -72,7 +72,7 @@ class NetworkTrainer:
         mean_norm=None,
         maximum_norm=None,
         mean_grad_norm=None,
-        mean_combined_norm=None
+        mean_combined_norm=None,
     ):
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
 
@@ -401,7 +401,18 @@ class NetworkTrainer:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
             else:
                 # latentに変換
-                latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
+                    latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
+                else:
+                    chunks = [
+                        batch["images"][i : i + args.vae_batch_size] for i in range(0, len(batch["images"]), args.vae_batch_size)
+                    ]
+                    list_latents = []
+                    for chunk in chunks:
+                        with torch.no_grad():
+                            chunk = self.encode_images_to_latents(args, vae, chunk.to(accelerator.device, dtype=vae_dtype))
+                            list_latents.append(chunk)
+                    latents = torch.cat(list_latents, dim=0)
 
                 # NaNが含まれていれば警告を表示し0に置き換える
                 if torch.any(torch.isnan(latents)):
@@ -669,6 +680,10 @@ class NetworkTrainer:
         if network is None:
             return
         network_has_multiplier = hasattr(network, "set_multiplier")
+
+        # TODO remove `hasattr`s by setting up methods if not defined in the network like (hacky but works):
+        # if not hasattr(network, "prepare_network"):
+        #    network.prepare_network = lambda args: None
 
         if hasattr(network, "prepare_network"):
             network.prepare_network(args)
@@ -1032,12 +1047,12 @@ class NetworkTrainer:
             "ss_huber_c": args.huber_c,
             "ss_fp8_base": bool(args.fp8_base),
             "ss_fp8_base_unet": bool(args.fp8_base_unet),
-            "ss_validation_seed": args.validation_seed, 
-            "ss_validation_split": args.validation_split, 
-            "ss_max_validation_steps": args.max_validation_steps, 
-            "ss_validate_every_n_epochs": args.validate_every_n_epochs, 
-            "ss_validate_every_n_steps": args.validate_every_n_steps, 
-            "ss_resize_interpolation": args.resize_interpolation
+            "ss_validation_seed": args.validation_seed,
+            "ss_validation_split": args.validation_split,
+            "ss_max_validation_steps": args.max_validation_steps,
+            "ss_validate_every_n_epochs": args.validate_every_n_epochs,
+            "ss_validate_every_n_steps": args.validate_every_n_steps,
+            "ss_resize_interpolation": args.resize_interpolation,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1433,7 +1448,6 @@ class NetworkTrainer:
                         if hasattr(network, "update_norms"):
                             network.update_norms()
 
-
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -1453,7 +1467,7 @@ class NetworkTrainer:
                         weight_norms = network.weight_norms()
                         maximum_norm = weight_norms.max().item() if weight_norms.numel() > 0 else None
                         keys_scaled = None
-                        max_mean_logs = {"avg weight norm": mean_norm, "avg grad norm": mean_grad_norm, "avg comb norm": mean_combined_norm}
+                        max_mean_logs = {}
                     else:
                         keys_scaled, mean_norm, maximum_norm = None, None, None
                         mean_grad_norm = None
@@ -1494,7 +1508,17 @@ class NetworkTrainer:
 
                 if is_tracking:
                     logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm, mean_grad_norm, mean_combined_norm
+                        args,
+                        current_loss,
+                        avr_loss,
+                        lr_scheduler,
+                        lr_descriptions,
+                        optimizer,
+                        keys_scaled,
+                        mean_norm,
+                        maximum_norm,
+                        mean_grad_norm,
+                        mean_combined_norm,
                     )
                     self.step_logging(accelerator, logs, global_step, epoch + 1)
 
