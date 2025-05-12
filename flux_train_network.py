@@ -365,7 +365,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         train_unet: bool,
         is_train=True,
         timesteps: torch.FloatTensor | None=None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None]:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None, torch.Tensor]:
         # Sample noise that we'll add to the latents
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -390,7 +390,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         else:
             img_ids = flux_utils.prepare_img_ids(bsz, latent_height // 2, latent_width // 2).to(device=accelerator.device)
 
-        assert packed_noisy_model_input.shape[2] * packed_noisy_model_input.shape[3] == img_ids.shape[1], "Packed latent dimensions are not aligned with img ids"
+        assert packed_noisy_model_input.shape[1] == img_ids.shape[1], "Packed latent dimensions are not aligned with img ids"
 
         # get guidance
         # ensure guidance_scale in args is float
@@ -503,7 +503,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, noisy_model_input, target, sigmas, timesteps, weighting
+        return model_pred, noisy_model_input, target, sigmas, timesteps, weighting, noise
 
     def post_process_loss(self, loss: torch.Tensor, args, timesteps, noise_scheduler, latents: Optional[torch.Tensor]) -> torch.FloatTensor:
         image_size = None

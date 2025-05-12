@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-from library.custom_train_functions import mapo_loss
+from library.custom_train_functions import calculate_mapo_loss
 
 
 def test_mapo_loss_basic():
@@ -12,7 +12,7 @@ def test_mapo_loss_basic():
     # Create dummy loss tensor with shape [B, C, H, W]
     loss = torch.rand(batch_size, channels, height, width)
     mapo_weight = 0.5
-    result, metrics = mapo_loss(loss, mapo_weight)
+    result, metrics = calculate_mapo_loss(loss, mapo_weight)
 
     # Check return types
     assert isinstance(result, torch.Tensor)
@@ -41,7 +41,7 @@ def test_mapo_loss_different_shapes():
     ]
     for shape in shapes:
         loss = torch.rand(*shape)
-        result, metrics = mapo_loss(loss.mean((1, 2, 3)), 0.5)
+        result, metrics = calculate_mapo_loss(loss.mean((1, 2, 3)), 0.5)
         # The result should have dimension batch_size//2
         assert result.shape == torch.Size([shape[0] // 2])
         # All metrics should be scalars
@@ -52,7 +52,7 @@ def test_mapo_loss_different_shapes():
 def test_mapo_loss_with_zero_weight():
     loss = torch.rand(8, 3, 64, 64)  # Batch size must be even
     loss_mean = loss.mean((1, 2, 3))
-    result, metrics = mapo_loss(loss_mean, 0.0)
+    result, metrics = calculate_mapo_loss(loss_mean, 0.0)
     
     # With zero mapo_weight, ratio_loss should be zero
     assert metrics["loss/mapo_ratio"] == 0.0
@@ -68,7 +68,7 @@ def test_mapo_loss_with_different_timesteps():
     timesteps = [1, 10, 100, 1000]
     results = []
     for ts in timesteps:
-        result, metrics = mapo_loss(loss, 0.5, ts)
+        result, metrics = calculate_mapo_loss(loss, 0.5, ts)
         results.append(metrics["loss/mapo_ratio"])
 
     # Check that the results are different for different timesteps
@@ -89,7 +89,7 @@ def test_mapo_loss_win_loss_scores():
     loss = torch.cat([w_loss, l_loss], dim=0)
 
     # Run the function
-    result, metrics = mapo_loss(loss, 0.5)
+    result, metrics = calculate_mapo_loss(loss, 0.5)
 
     # Win score should be higher than lose score (better performance)
     assert metrics["loss/mapo_win_score"] > metrics["loss/mapo_lose_score"]
@@ -107,7 +107,7 @@ def test_mapo_loss_gradient_flow():
     mapo_weight = 0.5
 
     # Compute loss
-    result, _ = mapo_loss(loss, mapo_weight)
+    result, _ = calculate_mapo_loss(loss, mapo_weight)
 
     # Compute mean for backprop
     result.mean().backward()

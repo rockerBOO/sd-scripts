@@ -38,18 +38,19 @@ from library.config_util import (
 import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.custom_train_functions import (
+    UncertaintyWeightedLoss,
     apply_snr_weight,
-    ddo_loss,
+    calculate_ddo_loss,
     get_weighted_text_embeddings,
+    pcgrad_update,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
     WaveletLoss,
-    diffusion_dpo_loss,
-    mapo_loss,
-    ddo_loss,
+    calculate_diffusion_dpo_loss,
+    calculate_mapo_loss,
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -97,7 +98,7 @@ class NetworkTrainer:
 
         lrs = lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
+            if lr_descriptions is not None and i in lr_descriptions:
                 lr_desc = lr_descriptions[i]
             else:
                 idx = i - (0 if args.network_train_unet_only else -1)
@@ -288,7 +289,7 @@ class NetworkTrainer:
         train_unet: bool,
         is_train=True,
         timesteps=None
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None]:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None, torch.Tensor]:
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, rand_timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
@@ -346,7 +347,7 @@ class NetworkTrainer:
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
         sigmas = timesteps / noise_scheduler.config.num_train_timesteps
-        return noise_pred, noisy_latents, target, sigmas, timesteps, None
+        return noise_pred, noisy_latents, target, sigmas, timesteps, None, noise
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler, latents: Optional[torch.Tensor]) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -406,7 +407,7 @@ class NetworkTrainer:
         train_text_encoder=True,
         train_unet=True,
         multipliers=1.0,
-    ) -> tuple[torch.Tensor, dict[str, float | int]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float | int]]:
         """
         Process a batch for the network
         """
@@ -462,7 +463,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, noisy_latents, target, sigmas, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -476,6 +477,8 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
+        losses: dict[str, torch.Tensor] = {}
+
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
@@ -486,7 +489,7 @@ class NetworkTrainer:
 
         if args.ddo_beta is not None or args.ddo_alpha is not None:
             accelerator.unwrap_model(network).set_multiplier(0.0)
-            ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, ref_weighting = self.get_noise_pred_and_target(
+            ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, ref_weighting, noise = self.get_noise_pred_and_target(
                 args,
                 accelerator,
                 noise_scheduler,
@@ -508,17 +511,19 @@ class NetworkTrainer:
             ref_loss= train_util.conditional_loss(ref_noise_pred.float(), ref_target.float(), args.loss_type, "none", huber_c)
             if weighting is not None and ref_weighting is not None:
                 ddo_weighting = weighting * ref_weighting 
-            loss, metrics_ddo = ddo_loss(
+            ddo_loss, metrics_ddo = calculate_ddo_loss(
                 loss.mean(dim=(1, 2, 3)) * (weighting if weighting is not None else 1), 
                 ref_loss.mean(dim=(1, 2, 3)) * (ref_weighting if ref_weighting is not None else 1), 
                 args.ddo_alpha or 4.0, 
                 args.ddo_beta or 0.05,
             )
             metrics = {**metrics, **metrics_ddo}
+            losses['ddo'] = ddo_loss
+            loss = ddo_loss
         elif args.beta_dpo is not None:
             with torch.no_grad():
                 accelerator.unwrap_model(network).set_multiplier(0.0)
-                ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, _weighting = self.get_noise_pred_and_target(
+                ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, _weighting, noise = self.get_noise_pred_and_target(
                     args,
                     accelerator,
                     noise_scheduler,
@@ -537,31 +542,27 @@ class NetworkTrainer:
 
             huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
             ref_loss= train_util.conditional_loss(ref_noise_pred.float(), ref_target.float(), args.loss_type, "none", huber_c)
-            loss, metrics_diffusion_dpo = diffusion_dpo_loss(loss, ref_loss, args.beta_dpo)
+            diffusion_dpo_loss, metrics_diffusion_dpo = calculate_diffusion_dpo_loss(loss, ref_loss, args.beta_dpo)
             metrics = {**metrics, **metrics_diffusion_dpo}
+            losses['diffusion_dpo'] = diffusion_dpo_loss
+            loss = diffusion_dpo_loss
         elif args.mapo_weight is not None:
-            loss, metrics_mapo = mapo_loss(loss, args.mapo_weight, noise_scheduler.config.num_train_timesteps)
+            mapo_loss, metrics_mapo = calculate_mapo_loss(loss, args.mapo_weight, noise_scheduler.config.num_train_timesteps)
             metrics = {**metrics, **metrics_mapo}
+            losses['mapo'] = mapo_loss
+            loss = mapo_loss
         else:
             loss = loss.mean([1, 2, 3])
+            losses['conditional'] = loss
 
         wav_loss = None
         if args.wavelet_loss:
-            if args.wavelet_loss_rectified_flow:
-                # Calculate flow-based clean estimate using the target
-                flow_based_clean = noisy_latents - sigmas.view(-1, 1, 1, 1) * target
-                
-                # Calculate model-based denoised estimate
-                model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
-            else:
-                flow_based_clean = target
-                model_denoised = noise_pred
+            predicted_denoised = (noisy_latents - sigmas * noise_pred) / (1.0 - sigmas)
+            target_denoised = (noisy_latents - sigmas * noise) / (1.0 - sigmas)
 
             def wavelet_loss_fn(args):
                 loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
                 def loss_fn(input: torch.Tensor, target: torch.Tensor, reduction: str = "mean"):
-                    # TODO: we need to get the proper huber_c here, or apply the loss_fn before we get the loss
-                    # To get the noise scheduler, timesteps, and latents
                     huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
                     return train_util.conditional_loss(input.float(), target.float(), loss_type, reduction, huber_c)
 
@@ -570,52 +571,33 @@ class NetworkTrainer:
 
             self.wavelet_loss.set_loss_fn(wavelet_loss_fn(args))
 
-            wav_loss, metrics_wavelet = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
+            wav_loss, metrics_wavelet = self.wavelet_loss(predicted_denoised, target_denoised, timesteps)
+            metrics.update(metrics_wavelet)
             # Weight the losses as needed
-            loss = loss + args.wavelet_loss_alpha * wav_loss
-            metrics['loss/wavelet'] = wav_loss.detach().item()
-
-        if weighting is not None:
-            loss = loss * weighting
-        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-            loss = apply_masked_loss(loss, batch)
-
-        if args.beta_dpo is not None:
-            def call_unet():
-                accelerator.unwrap_model(network).set_multiplier(0.0)
-                with torch.no_grad(), accelerator.autocast():
-                    ref_noise_pred, _noisy_latents, ref_target, ref_timesteps, _weighting = self.get_noise_pred_and_target(
-                        args,
-                        accelerator,
-                        noise_scheduler,
-                        torch.rand_like(latents),
-                        batch,
-                        text_encoder_conds,
-                        unet,
-                        network,
-                        weight_dtype,
-                        train_unet,
-                        is_train=is_train,
-                    )
-
-                # reset network multipliers
-                accelerator.unwrap_model(network).set_multiplier(1.0)
-                return ref_noise_pred
-            def apply_loss(ref_noise_pred):
-                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
-                ref_loss = train_util.conditional_loss(
-                    ref_noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
-                )
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    ref_loss = apply_masked_loss(ref_loss, batch)
-                return ref_loss
+            if args.uncertainty_weighted_loss:
+                loss, weighted_losses = self.uncertainty_weighted_loss({"loss/denoise": loss, "loss/wavelet": args.wavelet_loss_alpha * wav_loss})
+                metrics.update({k: v.detach().mean().item() for k, v in weighted_losses.items()})
+                metrics.update(self.uncertainty_weighted_loss.get_weights())
+                losses.update(weighted_losses)
+            else:
+                if args.wavelet_loss_primary:
+                    loss = args.wavelet_loss_alpha * wav_loss
+                else:
+                    loss = loss + args.wavelet_loss_alpha * wav_loss
+                metrics['loss/wavelet'] = wav_loss.detach().mean().item()
+                metrics['loss/wavelet_scaled'] = args.wavelet_loss_alpha * wav_loss.detach().mean().item()
+                losses.update({"wavelet": wav_loss})
 
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, latents)
 
-        return loss.mean(), metrics
+        for k in losses.keys():
+            losses[k] = self.post_process_loss(losses[k], args, timesteps, noise_scheduler, latents)
+            loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+
+        return loss.mean(), losses, metrics
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -1184,6 +1166,7 @@ class NetworkTrainer:
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
             "ss_wavelet_loss": args.wavelet_loss,
+            "ss_wavelet_loss_primary": args.wavelet_loss_primary,
             "ss_wavelet_loss_alpha": args.wavelet_loss_alpha,
             "ss_wavelet_loss_type": args.wavelet_loss_type,
             "ss_wavelet_loss_transform": args.wavelet_loss_transform,
@@ -1191,6 +1174,8 @@ class NetworkTrainer:
             "ss_wavelet_loss_level": args.wavelet_loss_level,
             "ss_wavelet_loss_band_weights": json.dumps(args.wavelet_loss_band_weights) if args.wavelet_loss_band_weights is not None else None,
             "ss_wavelet_loss_band_level_weights": json.dumps(args.wavelet_loss_band_level_weights) if args.wavelet_loss_band_weights is not None else None,
+            "ss_wavelet_loss_quaternion_component_weights": json.dumps(args.wavelet_loss_band_level_weights) if args.wavelet_loss_band_weights is not None else None,
+            "ss_wavelet_loss_energy_ratio": args.wavelet_loss_energy_ratio,
             "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
             "ss_wavelet_loss_rectified_flow": args.wavelet_loss_rectified_flow,
         }
@@ -1425,6 +1410,8 @@ class NetworkTrainer:
                 band_level_weights=args.wavelet_loss_band_level_weights, 
                 quaternion_component_weights=args.wavelet_loss_quaternion_component_weights,
                 ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
+                metrics=args.wavelet_loss_metrics,
+                energy_ratio=args.wavelet_loss_energy_ratio,
                 device=accelerator.device
             )
 
@@ -1441,6 +1428,16 @@ class NetworkTrainer:
                 logger.info(f"\tBand level weights: {args.wavelet_loss_band_level_weights}")
             if args.wavelet_loss_quaternion_component_weights is not None:
                 logger.info(f"\tQuaternion component weights: {args.wavelet_loss_quaternion_component_weights}")
+
+        if args.uncertainty_weighted_loss:
+            self.uncertainty_weighted_loss = UncertaintyWeightedLoss(num_tasks=2, target_ratios=[0.15])
+            self.uncertainty_weighted_loss.to(accelerator.device)
+            self.uncertainty_weighted_loss.train()
+
+            uncertainty_optimizer = torch.optim.AdamW([{
+                'params': self.uncertainty_weighted_loss.parameters(),
+                'lr': 1e-2,
+            }])
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1588,7 +1585,7 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss, metrics = self.process_batch(
+                    loss, losses, metrics = self.process_batch(
                         batch,
                         text_encoders,
                         unet,
@@ -1622,9 +1619,16 @@ class NetworkTrainer:
                         if args.gradient_noise_scale and hasattr(network, "accumulate_grad"):
                             network.accumulate_grad()
 
+                        if args.pcgrad:
+                            accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
+                            pcgrad_update(accelerator.unwrap_model(network), losses)
+
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if args.uncertainty_weighted_loss:
+                        uncertainty_optimizer.step()
+                        uncertainty_optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -1726,7 +1730,7 @@ class NetworkTrainer:
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
-                            loss, val_metrics = self.process_batch(
+                            loss, _losses, val_metrics = self.process_batch(
                                 batch,
                                 text_encoders,
                                 unet,
@@ -1809,7 +1813,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
-                        loss, val_metrics = self.process_batch(
+                        loss, _losses, val_metrics = self.process_batch(
                             batch,
                             text_encoders,
                             unet,
