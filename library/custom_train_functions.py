@@ -503,6 +503,91 @@ def apply_masked_loss(loss, batch) -> torch.FloatTensor:
     return loss
 
 
+class UncertaintyWeightedLoss(torch.nn.Module):
+    def __init__(
+        self,
+        num_tasks=3,
+        initial_log_var: torch.Tensor | float = 0.0,
+    ):
+        """
+        Initialize uncertainty parameters for multi-task learning
+
+        Paper:
+            Multi-Task Learning Using Uncertainty to Weigh Losses
+            for Scene Geometry and Semantics
+
+        Args:
+            num_tasks: Number of different loss components
+            initial_log_vars: Initial log variance values (optional)
+            fast_adapt_steps: Number of steps to perform fast adaptation
+            adapt_strength: Strength of direct adjustment (0-1)
+            target_ratios: List of target ratios between task 0 and each other task.
+                           None means aim for equal weighted losses for all tasks.
+        """
+        super(UncertaintyWeightedLoss, self).__init__()
+
+        # Create learnable log variance parameters for each task
+        self.log_vars = torch.nn.Parameter(torch.ones(num_tasks) * initial_log_var)
+
+        self._keys = []
+
+    def forward(self, losses_dict: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Weight the losses based on learned uncertainty parameters
+
+        Args:
+            losses_dict: Dictionary containing unweighted losses
+                         Each loss should be a tensor of shape [batch_size]
+
+        Returns:
+            total_loss: Uncertainty-weighted sum of losses per batch
+            weighted_losses: Dictionary of individual weighted losses
+        """
+        device = self.log_vars.device
+        weighted_losses = {}
+
+        # Get all the losses in a specific order
+        task_keys = sorted(losses_dict.keys())
+
+        if len(self._keys) == 0:
+            self._keys = task_keys
+
+        # Gather all raw losses
+        raw_losses = []
+        for i, key in enumerate(task_keys):
+            raw_loss = losses_dict[key].to(device)
+            raw_losses.append(raw_loss)
+
+        # Process the first loss to initialize total_loss with proper batch dimension
+        first_key = task_keys[0]
+        first_loss = losses_dict[first_key].to(device)
+
+        # Initialize total_loss with proper batch shape
+        batch_size = first_loss.shape[0] if len(first_loss.shape) > 0 else 1
+
+        # Handle both batched and non-batched cases
+        if len(first_loss.shape) == 0:  # Scalar
+            total_loss = torch.zeros(1, device=device)
+        else:  # Batched
+            total_loss = torch.zeros(batch_size, device=device)
+
+        # Apply weighting to each task's loss
+        for i, (key, raw_loss) in enumerate(zip(task_keys, raw_losses)):
+            # Apply uncertainty weighting
+            precision = torch.exp(-self.log_vars[i])
+            weighted_loss = precision * raw_loss + self.log_vars[i]
+
+            weighted_losses[key] = weighted_loss
+            total_loss = total_loss + weighted_loss
+
+        return total_loss, weighted_losses
+
+    def get_weights(self):
+        """Return the current weights (1/σ²) for each task"""
+        weights = torch.exp(-self.log_vars)
+        return {f"{k}_weight": w.item() for i, (w, k) in enumerate(zip(weights, self._keys))}
+
+
 """
 ##########################################
 # Perlin Noise
