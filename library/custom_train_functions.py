@@ -503,6 +503,58 @@ def apply_masked_loss(loss, batch) -> torch.FloatTensor:
     return loss
 
 
+def pcgrad_update(network, losses_dict):
+    """
+    Applies PCGrad to modify gradients from multiple losses to reduce conflicting gradients.
+    Returns the modified gradients ready to be applied.
+
+    Note: This should be called after computing individual gradients but before optimizer.step()
+    """
+    # Get trainable parameters
+    trainable_params = network.get_trainable_params()
+
+    # Collect gradients for each loss
+    gradients = {}
+    for loss_name, loss_value in losses_dict.items():
+        # Store current gradients for this loss
+        loss_value.backward(retain_graph=True)
+        gradients[loss_name] = [param.grad.clone() if param.grad is not None else None for param in trainable_params]
+
+        # Reset gradients for next loss computation (but keep computation graph)
+        for param in trainable_params:
+            if param.grad is not None:
+                param.grad.zero_()
+
+    # Apply PCGrad algorithm
+    modified_gradients = {}
+    for task_i in gradients:
+        modified_gradients[task_i] = list(gradients[task_i])
+
+        for task_j in gradients:
+            if task_i != task_j:
+                # Calculate dot product (need to handle None gradients)
+                dot_product = sum(
+                    torch.sum(g_i * g_j)
+                    for g_i, g_j in zip(gradients[task_i], gradients[task_j])
+                    if g_i is not None and g_j is not None
+                )
+
+                if dot_product < 0:  # Conflicting gradients
+                    # Calculate squared norm of g_j
+                    g_j_sq = sum(torch.sum(g_j * g_j) for g_j in gradients[task_j] if g_j is not None)
+                    for idx, (g_i, g_j) in enumerate(zip(modified_gradients[task_i], gradients[task_j])):
+                        if g_i is not None and g_j is not None:
+                            modified_gradients[task_i][idx] = g_i - (dot_product / g_j_sq) * g_j
+
+    # Set the combined modified gradients to parameters
+    for param_idx, param in enumerate(trainable_params):
+        # Sum all task gradients for this parameter
+        summed_grad = sum(task_grads[param_idx] for task_grads in modified_gradients.values() if task_grads[param_idx] is not None)
+        param.grad = summed_grad
+
+    # Return the network with modified gradients
+    return network
+
 """
 ##########################################
 # Perlin Noise

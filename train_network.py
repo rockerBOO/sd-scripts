@@ -380,7 +380,7 @@ class NetworkTrainer:
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Process a batch for the network
         """
@@ -460,6 +460,8 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
+        losses: dict[str, torch.Tensor] = {}
+
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
         if weighting is not None:
@@ -467,13 +469,14 @@ class NetworkTrainer:
         if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
             loss = apply_masked_loss(loss, batch)
         loss = loss.mean([1, 2, 3])
+        losses['conditional'] = loss
 
         loss_weights = batch["loss_weights"]  # 各sampleごとのweight
         loss = loss * loss_weights
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-        return loss.mean()
+        return loss.mean(), losses
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -1400,7 +1403,7 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss = self.process_batch(
+                    loss, losses = self.process_batch(
                         batch,
                         text_encoders,
                         unet,
@@ -1429,6 +1432,10 @@ class NetworkTrainer:
                             network.update_grad_norms()
                         if hasattr(network, "update_norms"):
                             network.update_norms()
+
+                        if args.pcgrad:
+                            accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
+                            pcgrad_update(accelerator.unwrap_model(network), losses)
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -1530,7 +1537,7 @@ class NetworkTrainer:
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
-                            loss = self.process_batch(
+                            loss, _losses = self.process_batch(
                                 batch,
                                 text_encoders,
                                 unet,
@@ -1608,7 +1615,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
-                        loss = self.process_batch(
+                        loss, _losses = self.process_batch(
                             batch,
                             text_encoders,
                             unet,
