@@ -104,7 +104,6 @@ def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
 
 
 def apply_snr_weight(
-<<<<<<< HEAD
     loss: torch.Tensor,
     timesteps: torch.IntTensor,
     noise_scheduler: DDPMScheduler,
@@ -119,11 +118,6 @@ def apply_snr_weight(
         timesteps_indices = train_util.timesteps_to_indices(timesteps, len(noise_scheduler.all_snr))
         snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps_indices])
 
-=======
-    loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, gamma: Number, v_prediction=False
-):
-    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
->>>>>>> network-wavelet-loss
     min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
     if v_prediction:
         snr_weight = torch.div(min_snr_gamma, snr + 1).float().to(loss.device)
@@ -157,15 +151,9 @@ def get_snr_scale(timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, im
 
 
 def add_v_prediction_like_loss(
-<<<<<<< HEAD
     loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, v_pred_like_loss: torch.Tensor, image_size=None
 ):
     scale = get_snr_scale(timesteps, noise_scheduler, image_size)
-=======
-    loss: torch.Tensor, timesteps: torch.IntTensor, noise_scheduler: DDPMScheduler, v_pred_like_loss: torch.Tensor
-):
-    scale = get_snr_scale(timesteps, noise_scheduler)
->>>>>>> network-wavelet-loss
     # logger.info(f"add v-prediction like loss: {v_pred_like_loss}, scale: {scale}, loss: {loss}, time: {timesteps}")
     loss = loss + loss / scale * v_pred_like_loss
     return loss
@@ -227,14 +215,9 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         action="store_true",
         help="debiased estimation loss / debiased estimation loss",
     )
-<<<<<<< HEAD
-    parser.add_argument("--wavelet_loss", action="store_true", help="Activate wavelet loss")
-    parser.add_argument("--wavelet_loss_alpha", type=float, default=0.015, help="Wavelet loss alpha")
-=======
     parser.add_argument("--wavelet_loss", action="store_true", help="Activate wavelet loss. Default: False")
     parser.add_argument("--wavelet_loss_primary", action="store_true", help="Use wavelet loss as the primary loss")
     parser.add_argument("--wavelet_loss_alpha", type=float, default=1.0, help="Wavelet loss alpha. Default: 1.0")
->>>>>>> network-wavelet-loss
     parser.add_argument("--wavelet_loss_type", help="Wavelet loss type l1, l2, huber, smooth_l1. Default to --loss_type value.")
     parser.add_argument("--wavelet_loss_transform", default="swt", help="Wavelet transform type of DWT or SWT. Default: swt")
     parser.add_argument("--wavelet_loss_wavelet", default="sym7", help="Wavelet. Default: sym7")
