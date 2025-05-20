@@ -287,8 +287,7 @@ class NetworkTrainer:
         weight_dtype: torch.dtype,
         train_unet: bool,
         is_train=True,
-        timesteps=None
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None]:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None, torch.Tensor]:
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, rand_timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
@@ -345,8 +344,10 @@ class NetworkTrainer:
                     )
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
+
         sigmas = timesteps / noise_scheduler.config.num_train_timesteps
-        return noise_pred, noisy_latents, target, sigmas, timesteps, None
+
+        return noise_pred, noisy_latents, target, sigmas, timesteps, None, noise
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler, latents: Optional[torch.Tensor]) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -405,8 +406,7 @@ class NetworkTrainer:
         is_train=True,
         train_text_encoder=True,
         train_unet=True,
-        multipliers=1.0,
-    ) -> tuple[torch.Tensor, dict[str, float | int]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float | int]]:
         """
         Process a batch for the network
         """
@@ -462,7 +462,7 @@ class NetworkTrainer:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
         # sample noise, call unet, get target
-        noise_pred, noisy_latents, target, sigmas, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -476,7 +476,9 @@ class NetworkTrainer:
             is_train=is_train,
         )
 
-        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
+        losses: dict[str, torch.Tensor] = {}
+
+        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
         if weighting is not None:
@@ -547,15 +549,27 @@ class NetworkTrainer:
 
         wav_loss = None
         if args.wavelet_loss:
-            if args.wavelet_loss_rectified_flow:
-                # Calculate flow-based clean estimate using the target
-                flow_based_clean = noisy_latents - sigmas.view(-1, 1, 1, 1) * target
-                
-                # Calculate model-based denoised estimate
-                model_denoised = noisy_latents - sigmas.view(-1, 1, 1, 1) * noise_pred
-            else:
-                flow_based_clean = target
-                model_denoised = noise_pred
+            predicted_denoised = (noisy_latents - sigmas * noise_pred) / (1.0 - sigmas)
+            target_denoised = (noisy_latents - sigmas * noise) / (1.0 - sigmas)
+
+            def save_as_img(latent_to, output_name):
+                from PIL import Image
+                with torch.no_grad():
+                    image = vae.decode(latent_to.to(vae.dtype)).float()
+                    # VAE outputs are typically in the range [-1, 1], so rescale to [0, 255]
+                    image = (image / 2 + 0.5).clamp(0, 1)
+                    
+                    # Convert to numpy array with values in range [0, 255]
+                    image = (image * 255).cpu().numpy().astype(np.uint8)
+                    
+                    # Rearrange dimensions from [batch_size, channels, height, width] to [batch_size, height, width, channels]
+                    image = image.transpose(0, 2, 3, 1)
+                    
+                    # Take the first image if you have a batch
+                    pil_image = Image.fromarray(image[0])
+                    
+                    # Save the image
+                    pil_image.save(output_name)
 
             def wavelet_loss_fn(args):
                 loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
@@ -570,10 +584,9 @@ class NetworkTrainer:
 
             self.wavelet_loss.set_loss_fn(wavelet_loss_fn(args))
 
-            wav_loss, metrics_wavelet = self.wavelet_loss(model_denoised.float(), flow_based_clean.float())
-            # Weight the losses as needed
+            wav_loss, metrics_wavelet = self.wavelet_loss(predicted_denoised, target_denoised, timesteps)
+            metrics.update(metrics_wavelet)
             loss = loss + args.wavelet_loss_alpha * wav_loss
-            metrics['loss/wavelet'] = wav_loss.detach().item()
 
         if weighting is not None:
             loss = loss * weighting
@@ -614,6 +627,10 @@ class NetworkTrainer:
         loss = loss * loss_weights
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, latents)
+
+        for k in losses.keys():
+            losses[k] = self.post_process_loss(losses[k], args, timesteps, noise_scheduler, latents)
+            loss_weights = batch["loss_weights"]  # 各sampleごとのweight
 
         return loss.mean(), metrics
 
