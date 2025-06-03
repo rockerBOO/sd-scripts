@@ -472,8 +472,6 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
     sigma = sigmas[step_indices].flatten()
-    while len(sigma.shape) < n_dim:
-        sigma = sigma.unsqueeze(-1)
     return sigma
 
 
@@ -546,12 +544,12 @@ def get_noisy_model_input_and_timestep(
         sigma = (sigma * shift) / (1 + (shift - 1) * sigma)
         timestep = sigma * num_timesteps
     elif args.timestep_sampling == "flux_shift":
-        sigma = torch.randn(bsz, device=device)
-        sigma = sigma * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigma = sigma.sigmoid()
-        mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2)) # we are pre-packed so must adjust for packed size 
-        sigma = time_shift(mu, 1.0, sigma)
-        timestep = sigma * num_timesteps
+        sigmas = torch.randn(bsz, device=device)
+        sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
+        sigmas = sigmas.sigmoid()
+        mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
+        sigmas = time_shift(mu, 1.0, sigmas)
+        timesteps = noise_scheduler._sigma_to_t(sigmas)
     else:
         # Sample a random timestep for each image
         # for weighting schemes where we sample timesteps non-uniformly

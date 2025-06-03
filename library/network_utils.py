@@ -4,7 +4,6 @@ import math
 import warnings
 from torch import Tensor
 from typing import Optional
-from library.incremental_pca import IncrementalPCA
 from dataclasses import dataclass
 
 
@@ -12,11 +11,9 @@ from dataclasses import dataclass
 class InitializeParams:
     """Parameters for initialization methods (PiSSA, URAE)"""
 
-    use_ipca: bool = False
     use_lowrank: bool = False
-    lowrank_q: Optional[int] = None
+    # lowrank_q: Optional[int] = None
     lowrank_niter: int = 4
-    lowrank_seed: Optional[int] = None
 
 
 def initialize_parse_opts(key: str) -> InitializeParams:
@@ -27,10 +24,6 @@ def initialize_parse_opts(key: str) -> InitializeParams:
     - "pissa" -> Default PiSSA with lowrank=True, niter=4
     - "pissa_niter_4" -> PiSSA with niter=4
     - "pissa_lowrank_false" -> PiSSA without lowrank
-    - "pissa_ipca_true" -> PiSSA with IPCA
-    - "pissa_q_16" -> PiSSA with lowrank_q=16
-    - "pissa_seed_42" -> PiSSA with seed=42
-    - "urae_..." -> Same options but for URAE
 
     Args:
         key: String key to parse
@@ -51,14 +44,7 @@ def initialize_parse_opts(key: str) -> InitializeParams:
     # Parse the remaining parts
     i = 1
     while i < len(parts):
-        if parts[i] == "ipca":
-            if i + 1 < len(parts) and parts[i + 1] in ["true", "false"]:
-                params.use_ipca = parts[i + 1] == "true"
-                i += 2
-            else:
-                params.use_ipca = True
-                i += 1
-        elif parts[i] == "lowrank":
+        if parts[i] == "lowrank":
             if i + 1 < len(parts) and parts[i + 1] in ["true", "false"]:
                 params.use_lowrank = parts[i + 1] == "true"
                 i += 2
@@ -68,18 +54,7 @@ def initialize_parse_opts(key: str) -> InitializeParams:
         elif parts[i] == "niter":
             if i + 1 < len(parts) and parts[i + 1].isdigit():
                 params.lowrank_niter = int(parts[i + 1])
-                i += 2
-            else:
-                i += 1
-        elif parts[i] == "q":
-            if i + 1 < len(parts) and parts[i + 1].isdigit():
-                params.lowrank_q = int(parts[i + 1])
-                i += 2
-            else:
-                i += 1
-        elif parts[i] == "seed":
-            if i + 1 < len(parts) and parts[i + 1].isdigit():
-                params.lowrank_seed = int(parts[i + 1])
+                params.use_lowrank = True
                 i += 2
             else:
                 i += 1
@@ -104,11 +79,7 @@ def initialize_urae(
     rank: int,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
-    use_ipca: bool = False,
-    use_lowrank: bool = True,
-    lowrank_q: Optional[int] = None,
-    lowrank_niter: int = 4,
-    lowrank_seed: Optional[int] = None,
+    **kwargs,
 ):
     # Store original device, dtype, and requires_grad status
     orig_device = org_module.weight.device
@@ -122,45 +93,17 @@ def initialize_urae(
     # Move original weight to chosen device and use float32 for numerical stability
     weight = org_module.weight.data.to(device, dtype=torch.float32)
 
-    with torch.autocast(device.type), torch.no_grad():
-        # Perform SVD decomposition (either directly or with IPCA for memory efficiency)
-        if use_ipca:
-            ipca = IncrementalPCA(
-                n_components=None,
-                batch_size=1024,
-                lowrank=use_lowrank,
-                lowrank_q=lowrank_q if lowrank_q is not None else min(weight.shape),
-                lowrank_niter=lowrank_niter,
-                lowrank_seed=lowrank_seed,
-            )
-            ipca.fit(weight)
+    with torch.no_grad():
+        # Direct SVD approach
+        U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
 
-            # Extract singular values and vectors, focusing on the minor components (smallest singular values)
-            S_full = ipca.singular_values_
-            V_full = ipca.components_.T  # Shape: [out_features, total_rank]
+        # Extract the minor components (smallest singular values)
+        Sr = S[-rank:]
+        Vr = U[:, -rank:]
+        Uhr = Vh[-rank:]
 
-            # Get identity matrix to transform for right singular vectors
-            identity = torch.eye(weight.shape[1], device=weight.device)
-            Uhr_full = ipca.transform(identity).T  # Shape: [total_rank, in_features]
-
-            # Extract the last 'rank' components (the minor/smallest ones)
-            Sr = S_full[-rank:]
-            Vr = V_full[:, -rank:]
-            Uhr = Uhr_full[-rank:]
-
-            # Scale singular values
-            Sr = Sr / rank
-        else:
-            # Direct SVD approach
-            U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-
-            # Extract the minor components (smallest singular values)
-            Sr = S[-rank:]
-            Vr = U[:, -rank:]
-            Uhr = Vh[-rank:]
-
-            # Scale singular values
-            Sr = Sr / rank
+        # Scale singular values
+        Sr = Sr / rank
 
         # Create the low-rank adapter matrices by splitting the minor components
         # Down matrix: scaled right singular vectors with singular values
@@ -189,11 +132,9 @@ def initialize_pissa(
     rank: int,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
-    use_ipca: bool = False,
     use_lowrank: bool = False,
-    lowrank_q: Optional[int] = None,
+    # lowrank_q: Optional[int] = None,
     lowrank_niter: int = 4,
-    lowrank_seed: Optional[int] = None,
 ):
     org_module_device = org_module.weight.device
     org_module_weight_dtype = org_module.weight.data.dtype
@@ -206,56 +147,21 @@ def initialize_pissa(
     weight = org_module.weight.data.clone().to(device, dtype=torch.float32)
 
     with torch.no_grad():
-        if use_ipca:
-            # Use Incremental PCA for large matrices
-            ipca = IncrementalPCA(
-                n_components=rank,
-                batch_size=1024,
-                lowrank=use_lowrank,
-                lowrank_q=lowrank_q if lowrank_q is not None else 2 * rank,
-                lowrank_niter=lowrank_niter,
-                lowrank_seed=lowrank_seed,
-            )
-            ipca.fit(weight)
-
-            # Extract principal components and singular values
-            Vr = ipca.components_.T  # [out_features, rank]
-            Sr = ipca.singular_values_  # [rank]
+        if use_lowrank:
+            # q_value = lowrank_q if lowrank_q is not None else 2 * rank
+            Vr, Sr, Ur = torch.svd_lowrank(weight.data, q=rank, niter=lowrank_niter)
             Sr /= rank
-
-            # We need to get Uhr from transforming an identity matrix
-            identity = torch.eye(weight.shape[1], device=weight.device)
-            with torch.autocast(device.type, dtype=torch.float64):
-                Uhr = ipca.transform(identity).T  # [rank, in_features]
-
-        elif use_lowrank:
-            # Use low-rank SVD approximation which is faster
-            seed_enabled = lowrank_seed is not None
-            q_value = lowrank_q if lowrank_q is not None else 2 * rank
-
-            with torch.random.fork_rng(enabled=seed_enabled):
-                if seed_enabled:
-                    torch.manual_seed(lowrank_seed)
-                U, S, V = torch.svd_lowrank(weight, q=q_value, niter=lowrank_niter)
-
-            Vr = U[:, :rank]  # First rank left singular vectors
-            Sr = S[:rank]  # First rank singular values
-            Sr /= rank
-            Uhr = V[:rank]  # First rank right singular vectors
-
+            Uhr = Ur.t()
         else:
-            # Standard SVD approach
-            V, S, Uh = torch.linalg.svd(weight, full_matrices=False)
+            # USV^T = W <-> VSU^T = W^T, where W^T = weight.data in R^{out_channel, in_channel},
+            V, S, Uh = torch.linalg.svd(weight.data, full_matrices=False)
             Vr = V[:, :rank]
             Sr = S[:rank]
             Sr /= rank
             Uhr = Uh[:rank]
 
-        # Uhr may be in higher precision
-        with torch.autocast(device.type, dtype=Uhr.dtype):
-            # Create down and up matrices
-            down = torch.diag(torch.sqrt(Sr)) @ Uhr
-            up = Vr @ torch.diag(torch.sqrt(Sr))
+        down = torch.diag(torch.sqrt(Sr)) @ Uhr
+        up = Vr @ torch.diag(torch.sqrt(Sr))
 
         # Get expected shapes
         expected_down_shape = lora_down.weight.shape
@@ -276,13 +182,15 @@ def initialize_pissa(
         org_module.weight.requires_grad = org_module_requires_grad
 
 
-def convert_pissa_to_standard_lora(trained_up: Tensor, trained_down: Tensor, orig_up: Tensor, orig_down: Tensor, rank: int):
+def convert_pissa_to_standard_lora(
+    trained_up: Tensor, trained_down: Tensor, orig_up: Tensor, orig_down: Tensor, rank: int
+):
     with torch.no_grad():
         # Calculate ΔW = A'B' - AB
         delta_w = (trained_up @ trained_down) - (orig_up @ orig_down)
 
         # We need to create new low-rank matrices that represent this delta
-        U, S, V = torch.linalg.svd(delta_w.to(device="cuda", dtype=torch.float32), full_matrices=False)
+        U, S, V = torch.linalg.svd(delta_w.to(trained_up.device, dtype=torch.float32), full_matrices=False)
 
         # Take the top 2*r singular values (as suggested in the paper)
         rank = rank * 2
