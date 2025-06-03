@@ -14,6 +14,7 @@ from PIL import Image
 import numpy as np
 
 
+
 def fire_in_thread(f, *args, **kwargs):
     threading.Thread(target=f, args=args, kwargs=kwargs).start()
 
@@ -332,6 +333,29 @@ def validate_interpolation_fn(interpolation_str: str) -> bool:
     Check if a interpolation function is supported
     """
     return interpolation_str in ["lanczos", "nearest", "bilinear", "linear", "bicubic", "cubic", "area", "box"]
+
+
+# For debugging
+def save_latent_as_img(vae, latent_to, output_name):
+    """Save latent as image using VAE"""
+    from PIL import Image
+
+    with torch.no_grad():
+        image = vae.decode(latent_to.to(vae.dtype)).float()
+        # VAE outputs are typically in the range [-1, 1], so rescale to [0, 255]
+        image = (image / 2 + 0.5).clamp(0, 1)
+
+        # Convert to numpy array with values in range [0, 255]
+        image = (image * 255).cpu().numpy().astype(np.uint8)
+
+        # Rearrange dimensions from [batch_size, channels, height, width] to [batch_size, height, width, channels]
+        image = image.transpose(0, 2, 3, 1)
+
+        # Take the first image if you have a batch
+        pil_image = Image.fromarray(image[0])
+
+        # Save the image
+        pil_image.save(output_name)
 
 
 # endregion
