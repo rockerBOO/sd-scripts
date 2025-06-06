@@ -68,7 +68,6 @@ class NetworkTrainer:
         args: argparse.Namespace,
         current_loss,
         avr_loss,
-        avr_wav_loss,
         lr_scheduler,
         lr_descriptions,
         optimizer=None,
@@ -479,6 +478,53 @@ class NetworkTrainer:
 
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+
+        if args.wavelet_loss:
+            def maybe_denoise_latents(denoise_latents: bool, noisy_latents, sigmas, noise_pred, noise):
+                if denoise_latents:
+                    # denoise latents to use for wavelet loss
+                    wavelet_predicted = (noisy_latents - sigmas * noise_pred) / (1.0 - sigmas)
+                    wavelet_target = (noisy_latents - sigmas * noise) / (1.0 - sigmas)
+                    return wavelet_predicted, wavelet_target
+                else:
+                    return  noise_pred, target
+
+
+            def wavelet_loss_fn(args):
+                loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
+                def loss_fn(input: torch.Tensor, target: torch.Tensor, reduction: str = "mean"):
+                    return train_util.conditional_loss(input, target, loss_type, reduction, huber_c)
+
+                return loss_fn
+
+            self.wavelet_loss.set_loss_fn(wavelet_loss_fn(args))
+
+            wavelet_predicted, wavelet_target = maybe_denoise_latents(args.wavelet_loss_rectified_flow, noisy_latents, sigmas, noise_pred, noise)
+
+            wav_losses, metrics_wavelet = self.wavelet_loss(wavelet_predicted.float(), wavelet_target.float(), timesteps)
+            metrics_wavelet = {f"wavelet_loss/{k}": v for k, v in metrics_wavelet.items()}
+            metrics.update(metrics_wavelet)
+
+            current_losses = []
+            for i, wav_loss in enumerate(wav_losses):
+                # Downsample loss to wavelet size
+                downsampled_loss = torch.nn.functional.adaptive_avg_pool2d(loss, wav_loss.shape[-2:])
+                
+                # Combine with wavelet loss
+                combined_loss = downsampled_loss + args.wavelet_loss_alpha * wav_loss
+                
+                # Upsample back to original latent size
+                upsampled_loss = torch.nn.functional.interpolate(
+                    combined_loss, 
+                    size=loss.shape[-2:],  # Original latent size
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                
+                current_losses.append(upsampled_loss)
+
+            # Now combine all levels at original latent resolution
+            loss = torch.stack(current_losses).mean(dim=0)  # Average across levels
 
         if weighting is not None:
             loss = loss * weighting
@@ -1107,6 +1153,8 @@ class NetworkTrainer:
             "ss_wavelet_loss_band_level_weights": json.dumps(args.wavelet_loss_band_level_weights) if args.wavelet_loss_band_weights is not None else None,
             "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
             "ss_wavelet_loss_rectified_flow": args.wavelet_loss_rectified_flow,
+            "ss_wavelet_loss_energy_ratio": args.wavelet_loss_energy_ratio,
+            "ss_wavelet_loss_energy_scale_factor": args.wavelet_loss_energy_scale_factor,
             "ss_mapo_beta": args.mapo_beta,
             "ss_cpo_beta": args.cpo_beta,
             "ss_bpo_beta": args.bpo_beta,
@@ -1332,11 +1380,8 @@ class NetworkTrainer:
         train_util.init_trackers(accelerator, args, "network_train")
 
         loss_recorder = train_util.LossRecorder()
-        wav_loss_recorder = train_util.LossRecorder()
         val_step_loss_recorder = train_util.LossRecorder()
-        val_step_wav_loss_recorder = train_util.LossRecorder()
         val_epoch_loss_recorder = train_util.LossRecorder()
-        val_epoch_wav_loss_recorder = train_util.LossRecorder()
 
         if args.wavelet_loss:
             self.wavelet_loss = WaveletLoss(
@@ -1347,6 +1392,7 @@ class NetworkTrainer:
                 band_level_weights=args.wavelet_loss_band_level_weights, 
                 quaternion_component_weights=args.wavelet_loss_quaternion_component_weights,
                 ll_level_threshold=args.wavelet_loss_ll_level_threshold, 
+                metrics=args.wavelet_loss_metrics,
                 device=accelerator.device
             )
 
@@ -1611,9 +1657,7 @@ class NetworkTrainer:
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                wav_loss_recorder.add(epoch=epoch, step=step, loss=metrics['loss/wavelet'] if 'loss/wavelet'  in metrics else 0.0)
                 avr_loss: float = loss_recorder.moving_average
-                avr_wav_loss: float = wav_loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
@@ -1622,7 +1666,6 @@ class NetworkTrainer:
                         args,
                         current_loss,
                         avr_loss,
-                        avr_wav_loss,
                         lr_scheduler,
                         lr_descriptions,
                         optimizer,
@@ -1674,7 +1717,6 @@ class NetworkTrainer:
 
                             current_loss = loss.detach().item()
                             val_step_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                            val_step_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=val_metrics['loss/wavelet'] if 'loss/wavelet' in val_metrics else 0.0)
                             val_progress_bar.update(1)
                             val_progress_bar.set_postfix(
                                 {"val_avg_loss": val_step_loss_recorder.moving_average, "timestep": timestep}
@@ -1691,7 +1733,6 @@ class NetworkTrainer:
                         loss_validation_divergence = val_step_loss_recorder.moving_average - loss_recorder.moving_average
                         logs = {
                             "loss/validation/step_average": val_step_loss_recorder.moving_average,
-                            "loss/validation/step_wavelet_average": val_step_wav_loss_recorder.moving_average,
                             "loss/validation/step_divergence": loss_validation_divergence,
                         }
                         self.step_logging(accelerator, logs, global_step, epoch=epoch + 1)
@@ -1757,7 +1798,6 @@ class NetworkTrainer:
 
                         current_loss = loss.detach().item()
                         val_epoch_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=current_loss)
-                        val_epoch_wav_loss_recorder.add(epoch=epoch, step=val_timesteps_step, loss=val_metrics['loss/wavelet'] if 'loss/wavelet' in val_metrics else 0.0)
                         val_progress_bar.update(1)
                         val_progress_bar.set_postfix(
                             {"val_epoch_avg_loss": val_epoch_loss_recorder.moving_average, "timestep": timestep}
@@ -1772,12 +1812,10 @@ class NetworkTrainer:
 
                 if is_tracking:
                     avr_loss: float = val_epoch_loss_recorder.moving_average
-                    avr_wav_loss: float = val_epoch_wav_loss_recorder.moving_average
                     loss_validation_divergence = val_epoch_loss_recorder.moving_average - loss_recorder.moving_average
                     logs = {
                         "loss/validation/epoch_average": avr_loss,
                         "loss/validation/epoch_divergence": loss_validation_divergence,
-                        "loss/validation/epoch_wavelet_average": avr_wav_loss,
                     }
                     self.epoch_logging(accelerator, logs, global_step, epoch + 1)
 
