@@ -1,12 +1,10 @@
 from collections.abc import Mapping
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import torch
-from typing import Callable, Protocol
 import math
 import argparse
 import random
 import re
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
