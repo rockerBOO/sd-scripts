@@ -1405,8 +1405,8 @@ class ControlNetFlux(nn.Module):
         if self.blocks_to_swap:
             save_double_blocks = self.double_blocks
             save_single_blocks = self.single_blocks
-            self.double_blocks = None
-            self.single_blocks = None
+            self.double_blocks = nn.ModuleList()
+            self.single_blocks = nn.ModuleList()
 
         self.to(device)
 
