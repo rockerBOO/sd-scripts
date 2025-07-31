@@ -414,7 +414,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     guidance=guidance_vec,
                     txt_attention_mask=t5_attn_mask,
                     proportional_attention=proportional_attention,
-                    ntk_factor=ntk_factor
+                    ntk_factor=ntk_factor,
                     mod_vectors=mod_vectors,
                 )
             return model_pred

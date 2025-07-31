@@ -109,6 +109,18 @@ class NetworkTrainer:
                     logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["effective_lr"]
                 else:
                     logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
+            if args.optimizer_type.lower() in ["muon", "adamuon"] and optimizer is not None:
+                # Get effective LRs for all parameters (they may differ)
+                effective_lrs = []
+                for group in optimizer.param_groups:
+                    for p in group['params']:
+                        if 'effective_lr' in optimizer.state[p]:
+                            effective_lrs.append(optimizer.state[p]['effective_lr'])
+                
+                if effective_lrs:
+                    logs["lr/effective_lr_mean"] = sum(effective_lrs) / len(effective_lrs)
+                    logs["lr/effective_lr_max"] = max(effective_lrs)
+                    logs["lr/effective_lr_min"] = min(effective_lrs)
         else:
             idx = 0
             if not args.network_train_unet_only:
@@ -131,6 +143,25 @@ class NetworkTrainer:
                         logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
                     else:
                         logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
+                if args.optimizer_type.lower() in ["muon", "adamuon"] and optimizer is not None:
+                    # Calculate effective LRs for each group
+                    muon_params = [p for p in optimizer.param_groups[i]['params'] 
+                                   if optimizer.state[p].get('use_muon', False)]
+                    
+                    if muon_params:
+                        base_lr = optimizer.param_groups[i]['lr']
+                        use_adjusted_lr = optimizer.param_groups[i].get('use_adjusted_lr', False)
+                        
+                        effective_lrs = []
+                        for p in muon_params:
+                            eff_lr = optimizer.get_adjusted_lr(base_lr, p.size(), use_adjusted_lr)
+                            effective_lrs.append(eff_lr)
+                        
+                        # Log statistics for this group
+                        logs[f"lr/effective_lr_mean/group{i}"] = sum(effective_lrs) / len(effective_lrs)
+                        logs[f"lr/effective_lr_max/group{i}"] = max(effective_lrs)
+                        logs[f"lr/effective_lr_min/group{i}"] = min(effective_lrs)
+                        logs[f"lr/base_lr/group{i}"] = base_lr
 
                 if args.optimizer_type.lower() in ["AdamW".lower(), "AdamW8Bit".lower()]:
                     logs[f'momentum/betas1-{i}'] = lr_scheduler.optimizers[-1].param_groups[i]['betas'][0]
