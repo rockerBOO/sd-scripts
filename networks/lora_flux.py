@@ -701,6 +701,41 @@ def create_network(
     comp_device = kwargs.get("comp_device", None)
     if comp_device is not None:
         comp_device = torch.device(comp_device)
+    # regex-specific learning rates
+    def parse_kv_pairs(kv_pair_str: str, is_int: bool) -> Dict[str, float]:
+        """
+        Parse a string of key-value pairs separated by commas.
+        """
+        pairs = {}
+        for pair in kv_pair_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                logger.warning(f"Invalid format: {pair}, expected 'key=value'")
+                continue
+            key, value = pair.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            try:
+                pairs[key] = int(value) if is_int else float(value)
+            except ValueError:
+                logger.warning(f"Invalid value for {key}: {value}")
+        return pairs
+
+    # parse regular expression based learning rates
+    network_reg_lrs = kwargs.get("network_reg_lrs", None)
+    if network_reg_lrs is not None:
+        reg_lrs = parse_kv_pairs(network_reg_lrs, is_int=False)
+    else:
+        reg_lrs = None
+
+    # regex-specific dimensions (ranks)
+    network_reg_dims = kwargs.get("network_reg_dims", None)
+    if network_reg_dims is not None:
+        reg_dims = parse_kv_pairs(network_reg_dims, is_int=True)
+    else:
+        reg_dims = None
 
     # すごく引数が多いな ( ^ω^)･･･
     network = LoRANetwork(
@@ -725,8 +760,10 @@ def create_network(
         train_single_block_indices=train_single_block_indices,
         initialize=initialize,
         comp_device=comp_device,
+        reg_dims=reg_dims,
         ggpo_beta=ggpo_beta,
         ggpo_sigma=ggpo_sigma,
+        reg_lrs=reg_lrs,
         verbose=verbose,
     )
 
@@ -744,7 +781,6 @@ def create_network(
 
 # Create network from weights for inference, weights are not loaded here (because can be merged)
 def create_network_from_weights(multiplier, file, ae, text_encoders, flux, weights_sd=None, for_inference=False, **kwargs):
-    # if unet is an instance of SdxlUNet2DConditionModel or subclass, set is_sdxl to True
     if weights_sd is None:
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import load_file
@@ -775,22 +811,6 @@ def create_network_from_weights(multiplier, file, ae, text_encoders, flux, weigh
     if train_t5xxl is None:
         train_t5xxl = False
 
-    # # split qkv
-    # double_qkv_rank = None
-    # single_qkv_rank = None
-    # rank = None
-    # for lora_name, dim in modules_dim.items():
-    #     if "double" in lora_name and "qkv" in lora_name:
-    #         double_qkv_rank = dim
-    #     elif "single" in lora_name and "linear1" in lora_name:
-    #         single_qkv_rank = dim
-    #     elif rank is None:
-    #         rank = dim
-    #     if double_qkv_rank is not None and single_qkv_rank is not None and rank is not None:
-    #         break
-    # split_qkv = (double_qkv_rank is not None and double_qkv_rank != rank) or (
-    #     single_qkv_rank is not None and single_qkv_rank != rank
-    # )
     split_qkv = False  # split_qkv is not needed to care, because state_dict is qkv combined
 
     module_class = LoRAInfModule if for_inference else LoRAModule
@@ -843,8 +863,10 @@ class LoRANetwork(torch.nn.Module):
         train_single_block_indices: Optional[List[bool]] = None,
         initialize: Optional[str] = None,
         comp_device: Optional[torch.device] = None,
+        reg_dims: Optional[Dict[str, int]] = None,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
+        reg_lrs: Optional[Dict[str, float]] = None,
         verbose: Optional[bool] = False,
         rank_stabilized: Optional[bool] = False,
     ) -> None:
@@ -870,6 +892,8 @@ class LoRANetwork(torch.nn.Module):
         self.in_dims = in_dims
         self.train_double_block_indices = train_double_block_indices
         self.train_single_block_indices = train_single_block_indices
+        self.reg_dims = reg_dims
+        self.reg_lrs = reg_lrs
 
         self.loraplus_lr_ratio = None
         self.loraplus_unet_lr_ratio = None
@@ -956,8 +980,16 @@ class LoRANetwork(torch.nn.Module):
                                 if lora_name in modules_dim:
                                     dim = modules_dim[lora_name]
                                     alpha = modules_alpha[lora_name]
-                            else:
-                                # 通常、すべて対象とする
+                            elif self.reg_dims is not None:
+                                for reg, d in self.reg_dims.items():
+                                    if re.search(reg, lora_name):
+                                        dim = d
+                                        alpha = self.alpha
+                                        logger.info(f"LoRA {lora_name} matched with regex {reg}, using dim: {dim}")
+                                        break
+
+                            # if modules_dim is None, we use default lora_dim. if modules_dim is not None, we use the specified dim (no default)
+                            if dim is None and modules_dim is None: 
                                 if is_linear or is_conv2d_1x1:
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
@@ -1068,6 +1100,9 @@ class LoRANetwork(torch.nn.Module):
         text_encoders = text_encoders if isinstance(text_encoders, list) else [text_encoders]
         for i, text_encoder in enumerate(text_encoders):
             index = i
+            if text_encoder is None:
+                logger.info(f"Text Encoder {index+1} is None, skipping LoRA creation for this encoder.")
+                continue
             if not train_t5xxl and index > 0:  # 0: CLIP, 1: T5XXL, so we skip T5XXL if train_t5xxl is False
                 break
 
@@ -1403,17 +1438,77 @@ class LoRANetwork(torch.nn.Module):
         all_params = []
         lr_descriptions = []
 
+        reg_lrs_list = list(self.reg_lrs.items()) if self.reg_lrs is not None else []
+
         def assemble_params(loras, lr, loraplus_ratio):
             param_groups = {"lora": {}, "plus": {}}
+            # regular expression param groups: {"reg_lr_0": {"lora": {}, "plus": {}}, ...}
+            reg_groups = {}
+
             for lora in loras:
+                # check if this lora matches any regex learning rate
+                matched_reg_lr = None
+                for i, (regex_str, reg_lr) in enumerate(reg_lrs_list):
+                    try:
+                        if re.search(regex_str, lora.lora_name):
+                            matched_reg_lr = (i, reg_lr)
+                            logger.info(f"Module {lora.lora_name} matched regex '{regex_str}' -> LR {reg_lr}")
+                            break
+                    except re.error:
+                        # regex error should have been caught during parsing, but just in case
+                        continue
+
                 for name, param in lora.named_parameters():
-                    if loraplus_ratio is not None and "lora_up" in name:
-                        param_groups["plus"][f"{lora.lora_name}.{name}"] = param
+                    param_key = f"{lora.lora_name}.{name}"
+                    is_plus = loraplus_ratio is not None and "lora_up" in name
+
+                    if matched_reg_lr is not None:
+                        # use regex-specific learning rate
+                        reg_idx, reg_lr = matched_reg_lr
+                        group_key = f"reg_lr_{reg_idx}"
+                        if group_key not in reg_groups:
+                            reg_groups[group_key] = {"lora": {}, "plus": {}, "lr": reg_lr}
+
+                        if is_plus:
+                            reg_groups[group_key]["plus"][param_key] = param
+                        else:
+                            reg_groups[group_key]["lora"][param_key] = param
                     else:
-                        param_groups["lora"][f"{lora.lora_name}.{name}"] = param
+                        # use default learning rate
+                        if is_plus:
+                            param_groups["plus"][param_key] = param
+                        else:
+                            param_groups["lora"][param_key] = param
 
             params = []
             descriptions = []
+
+            # process regex-specific groups first (higher priority)
+            for group_key in sorted(reg_groups.keys()):
+                group = reg_groups[group_key]
+                reg_lr = group["lr"]
+
+                for param_type in ["lora", "plus"]:
+                    if len(group[param_type]) == 0:
+                        continue
+
+                    param_data = {"params": group[param_type].values()}
+
+                    if param_type == "plus" and loraplus_ratio is not None:
+                        param_data["lr"] = reg_lr * loraplus_ratio
+                    else:
+                        param_data["lr"] = reg_lr
+
+                    if param_data.get("lr", None) == 0 or param_data.get("lr", None) is None:
+                        continue
+
+                    params.append(param_data)
+                    desc = f"reg_lr_{group_key.split('_')[-1]}"
+                    if param_type == "plus":
+                        desc += " plus"
+                    descriptions.append(desc)
+
+            # process default groups
             for key in param_groups.keys():
                 param_data = {"params": param_groups[key].values()}
 

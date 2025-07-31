@@ -154,9 +154,8 @@ def sample_image_inference(
     sample_steps = prompt_dict.get("sample_steps", 20)
     width = prompt_dict.get("width", 512)
     height = prompt_dict.get("height", 512)
-    # TODO refactor variable names
-    cfg_scale = prompt_dict.get("guidance_scale", 1.0)
-    emb_guidance_scale = prompt_dict.get("scale", 3.5)
+    emb_guidance_scale = prompt_dict.get("guidance_scale", 3.5)
+    cfg_scale = prompt_dict.get("scale", 1.0)
     seed = prompt_dict.get("seed")
     controlnet_image = prompt_dict.get("controlnet_image")
     prompt: str = prompt_dict.get("prompt", "")
@@ -446,8 +445,8 @@ def denoise(
                 y=torch.cat([neg_l_pooled, vec], dim=0),
                 block_controlnet_hidden_states=block_samples,
                 block_controlnet_single_hidden_states=block_single_samples,
-                timesteps=t_vec,
-                guidance=guidance_vec,
+                timesteps=t_vec.repeat(2),
+                guidance=guidance_vec.repeat(2),
                 txt_attention_mask=nc_c_t5_attn_mask,
                 proportional_attention=proportional_attention,
                 ntk_factor=ntk_factor,
@@ -761,3 +760,10 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--proportional_attention", action="store_true", help="Dynamic attention scale with respect to the resolution. Proportional attention to the image sequence length. From URAE paper")
     parser.add_argument("--ntk_factor", type=float, default=1.0, help="NTK Factor for increasing the embedding space for RoPE. Defaults to 1.0. 10.0 for 2k/4k images. From URAE paper.")
     parser.add_argument("--partitioned_vae", action="store_true", help="Partitioned VAE from Diffusion4k paper")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["flux", "chroma"],
+        default="flux",
+        help="Model type to use for training / トレーニングに使用するモデルタイプ：flux or chroma (default: flux)",
+    )
