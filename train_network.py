@@ -20,6 +20,7 @@ import torch
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.network_utils import maybe_pruned_save, maybe_sample_params
+import library.sai_model_spec as sai_model_spec
 
 init_ipex()
 
@@ -109,7 +110,8 @@ class NetworkTrainer:
                     logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["effective_lr"]
                 else:
                     logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
-            if args.optimizer_type.lower() in ["muon", "adamuon"] and optimizer is not None:
+            if (args.optimizer_type.lower().endswith("muon") or 
+                args.optimizer_type.lower().endswith("adamuon")) and optimizer is not None:
                 # Get effective LRs for all parameters (they may differ)
                 effective_lrs = []
                 for group in optimizer.param_groups:
@@ -143,7 +145,8 @@ class NetworkTrainer:
                         logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
                     else:
                         logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
-                if args.optimizer_type.lower() in ["muon", "adamuon"] and optimizer is not None:
+                if (args.optimizer_type.lower().endswith("muon") or 
+                    args.optimizer_type.lower().endswith("adamuon")) and optimizer is not None:
                     # Calculate effective LRs for each group
                     muon_params = [p for p in optimizer.param_groups[i]['params'] 
                                    if optimizer.state[p].get('use_muon', False)]
@@ -1724,7 +1727,7 @@ class NetworkTrainer:
                         avr_loss,
                         lr_scheduler,
                         lr_descriptions,
-                        optimizer,
+                        optimizer if optimizer.optimizer is None else optimizer.optimizer,
                     )
                     if args.gradient_noise_scale and hasattr(network, "gradient_noise_scale"):
                         gns, variance = network.gradient_noise_scale()
@@ -1950,6 +1953,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
+    sai_model_spec.add_model_spec_arguments(parser)
 
     parser.add_argument(
         "--cpu_offload_checkpointing",

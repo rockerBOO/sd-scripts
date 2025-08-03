@@ -1113,13 +1113,11 @@ class Flux(nn.Module):
 
         self.offloader_double = custom_offloading_utils.ModelOffloader(
             self.double_blocks,
-            self.num_double_blocks,
             double_blocks_to_swap,
             device,  # , debug=True
         )
         self.offloader_single = custom_offloading_utils.ModelOffloader(
             self.single_blocks,
-            self.num_single_blocks,
             single_blocks_to_swap,
             device,  # , debug=True
         )

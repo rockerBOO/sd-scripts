@@ -4459,6 +4459,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     parser.add_argument(
         "--output_config", action="store_true", help="output command line args to given .toml file / 引数を.tomlファイルに出力する"
     )
+    parser.add_argument("--gradient_noise_scale", action="store_true", default=False, help="Calculate the gradient noise scale")
     if support_dreambooth:
         # DreamBooth training
         parser.add_argument(

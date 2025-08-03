@@ -170,6 +170,10 @@ class ModelOffloader(Offloader):
                 self.remove_handles.append(handle)
 
     def __del__(self):
+        if self.remove_handles is None:
+            # Not set so nothing to remove
+            return
+
         for handle in self.remove_handles:
             handle.remove()
 
