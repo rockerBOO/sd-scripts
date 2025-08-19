@@ -79,6 +79,8 @@ class LoRAModule(torch.nn.Module):
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
         initialize: Optional[str] = None,
+        mgpo_rho: float | None = None,
+        mgpo_beta: float | None = None,
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -144,6 +146,18 @@ class LoRAModule(torch.nn.Module):
 
         self.ggpo_sigma = ggpo_sigma
         self.ggpo_beta = ggpo_beta
+
+        self.ggpo_sigma = ggpo_sigma
+        self.ggpo_beta = ggpo_beta
+
+        self.mgpo_rho = mgpo_rho
+        self.mgpo_beta = mgpo_beta
+
+        # EMA of gradient magnitudes for adaptive normalization
+        self._grad_magnitude_ema_down = torch.nn.Parameter(torch.tensor(1.0), requires_grad=False)
+        self._grad_magnitude_ema_up = torch.nn.Parameter(torch.tensor(1.0), requires_grad=False)
+
+        self.optimizer: torch.optim.Optimizer | None = None
 
         if self.ggpo_beta is not None and self.ggpo_sigma is not None:
             self.combined_weight_norms = None
@@ -251,6 +265,18 @@ class LoRAModule(torch.nn.Module):
 
             # Activation by Interval-wise Dropout
             lx = self.aid(lx)
+
+            # LoRA Momentum-Guided Perturbation Optimization (MGPO)
+            if (
+                self.training
+                and hasattr(self, "mgpo_rho")
+                and self.mgpo_rho is not None
+                and hasattr(self, "optimizer")
+                and self.optimizer is not None
+            ):
+                mgpo_perturbation_output = self.get_mgpo_output_perturbation(x)
+                if mgpo_perturbation_output is not None:
+                    return org_forwarded + (self.multiplier * scale * lx) + mgpo_perturbation_output
 
             # LoRA Gradient-Guided Perturbation Optimization
             if (
@@ -407,6 +433,97 @@ class LoRAModule(torch.nn.Module):
                 else:
                     self.sum_grads += grad.sum()
                     self.sum_squared_grads += (grad**2).sum()
+    def update_gradient_ema(self):
+        """
+        Update EMA of gradient magnitudes for adaptive perturbation normalization
+
+        Formula: ḡₗ⁽ᵗ⁾ = β * ḡₗ⁽ᵗ⁻¹⁾ + (1 - β) * ||∇ΔWₗL||₂
+        """
+        if self.mgpo_beta is None:
+            return
+
+        # Update EMA for lora_down gradient magnitude
+        if self.lora_down.weight.grad is not None:
+            current_grad_norm = torch.norm(self.lora_down.weight.grad, p=2)
+            self._grad_magnitude_ema_down.data = (
+                self.mgpo_beta * self._grad_magnitude_ema_down.data + (1 - self.mgpo_beta) * current_grad_norm
+            )
+
+        # Update EMA for lora_up gradient magnitude
+        if self.lora_up.weight.grad is not None:
+            current_grad_norm = torch.norm(self.lora_up.weight.grad, p=2)
+            self._grad_magnitude_ema_up.data = (
+                self.mgpo_beta * self._grad_magnitude_ema_up.data + (1 - self.mgpo_beta) * current_grad_norm
+            )
+
+    def get_mgpo_output_perturbation(self, x: Tensor) -> Tensor | None:
+        """
+        Generate MGPO perturbation using both momentum direction and gradient magnitude normalization
+
+        Full MGPO Formula: ε = -ρ · (vₜ / ||vₜ||₂) · (ḡₗ⁽ᵗ⁾)⁻¹
+        Where:
+        - ε = perturbation vector
+        - ρ = perturbation radius (mgpo_rho)
+        - vₜ = momentum vector from optimizer (exp_avg) - provides DIRECTION
+        - ||vₜ||₂ = L2 norm of momentum for unit direction
+        - ḡₗ⁽ᵗ⁾ = EMA of gradient magnitude - provides ADAPTIVE SCALING
+
+        Two separate EMAs:
+        1. Momentum EMA (from Adam): vₜ = β₁ * vₜ₋₁ + (1 - β₁) * ∇L(Wₜ)
+        2. Gradient Magnitude EMA: ḡₗ⁽ᵗ⁾ = β * ḡₗ⁽ᵗ⁻¹⁾ + (1 - β) * ||∇L(Wₜ)||₂
+        """
+        if self.optimizer is None or self.mgpo_rho is None or self.mgpo_beta is None:
+            return None
+
+        total_perturbation_scale = 0.0
+        valid_params = 0
+
+        # Handle both single and split dims cases
+        if self.split_dims is None:
+            params_and_emas = [
+                (self.lora_down.weight, self._grad_magnitude_ema_down),
+                (self.lora_up.weight, self._grad_magnitude_ema_up),
+            ]
+        else:
+            # For split dims, use average EMA (or extend to per-param EMAs)
+            avg_ema = (self._grad_magnitude_ema_down + self._grad_magnitude_ema_up) / 2
+            params_and_emas = []
+            for lora_down in self.lora_down:
+                params_and_emas.append((lora_down.weight, avg_ema))
+            for lora_up in self.lora_up:
+                params_and_emas.append((lora_up.weight, avg_ema))
+
+        for param, grad_ema in params_and_emas:
+            if param in self.optimizer.state and "exp_avg" in self.optimizer.state[param]:
+                # Get momentum direction: vₜ / ||vₜ||₂
+                momentum = self.optimizer.state[param]["exp_avg"]
+                momentum_norm = torch.norm(momentum, p=2)
+
+                if momentum_norm > 1e-8 and grad_ema > 1e-8:
+                    # Apply full MGPO formula: ρ · (momentum_direction) · (1/grad_magnitude_ema)
+                    direction_component = momentum_norm  # We'll use this for scaling
+                    adaptive_scale = 1.0 / grad_ema  # Adaptive normalization
+
+                    perturbation_scale = self.mgpo_rho * direction_component * adaptive_scale
+                    total_perturbation_scale += perturbation_scale.item()
+                    valid_params += 1
+
+        if valid_params == 0:
+            return None
+
+        # Average perturbation scale across all valid parameters
+        avg_perturbation_scale = total_perturbation_scale / valid_params
+
+        with torch.no_grad():
+            # Generate random perturbation scaled by MGPO formula
+            perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
+            perturbation.mul_(avg_perturbation_scale)
+            perturbation_output = x @ perturbation.T  # Result: (batch × n)
+
+        return perturbation_output
+
+    def register_optimizer(self, optimizer):
+        self.optimizer = optimizer
 
     @property
     def device(self):
@@ -687,6 +804,15 @@ def create_network(
     if ggpo_sigma is not None:
         ggpo_sigma = float(ggpo_sigma)
 
+    mgpo_beta = kwargs.get("mgpo_beta", None)
+    mgpo_rho = kwargs.get("mgpo_rho", None)
+
+    if mgpo_beta is not None:
+        mgpo_beta = float(mgpo_beta)
+
+    if mgpo_rho is not None:
+        mgpo_rho = float(mgpo_rho)
+
     # train T5XXL
     train_t5xxl = kwargs.get("train_t5xxl", False)
     if train_t5xxl is not None:
@@ -763,6 +889,8 @@ def create_network(
         reg_dims=reg_dims,
         ggpo_beta=ggpo_beta,
         ggpo_sigma=ggpo_sigma,
+        mgpo_rho=mgpo_rho,
+        mgpo_beta=mgpo_beta,
         reg_lrs=reg_lrs,
         verbose=verbose,
     )
@@ -866,6 +994,8 @@ class LoRANetwork(torch.nn.Module):
         reg_dims: Optional[Dict[str, int]] = None,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
+        mgpo_rho: Optional[float] = None,
+        mgpo_beta: Optional[float] = None,
         reg_lrs: Optional[Dict[str, float]] = None,
         verbose: Optional[bool] = False,
         rank_stabilized: Optional[bool] = False,
@@ -925,6 +1055,8 @@ class LoRANetwork(torch.nn.Module):
         if self.initialize:
             logger.info(f"initialization={self.initialize}")
 
+        if mgpo_beta is not None and mgpo_rho is not None:
+            logger.info(f"LoRA-MGPO training rho: {mgpo_rho} beta: {mgpo_beta}")
         if self.split_qkv:
             logger.info("split qkv for LoRA")
         if self.train_blocks is not None:
@@ -989,7 +1121,7 @@ class LoRANetwork(torch.nn.Module):
                                         break
 
                             # if modules_dim is None, we use default lora_dim. if modules_dim is not None, we use the specified dim (no default)
-                            if dim is None and modules_dim is None: 
+                            if dim is None and modules_dim is None:
                                 if is_linear or is_conv2d_1x1:
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
@@ -1084,6 +1216,8 @@ class LoRANetwork(torch.nn.Module):
                                 ggpo_beta=ggpo_beta,
                                 ggpo_sigma=ggpo_sigma,
                                 initialize=initialize,
+                                mgpo_rho=mgpo_rho,
+                                mgpo_beta=mgpo_beta,
                             )
                             assert isinstance(lora, LoRAModule)
                             lora.initialize_weights(child_module, initialize, comp_device)
