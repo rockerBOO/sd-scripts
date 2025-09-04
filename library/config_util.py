@@ -202,6 +202,7 @@ class ConfigSanitizer:
         "caption_prefix": str,
         "caption_suffix": str,
         "custom_attributes": dict,
+        "validation_split": float,
         "resize_interpolation": str,
         "preference": bool,
         "preference_caption_prefix": str,
