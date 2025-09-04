@@ -1858,6 +1858,14 @@ class BaseDataset(torch.utils.data.Dataset):
                     text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
                         image_info.text_encoder_outputs_npz
                     )
+                if self.enable_bucket:
+                    img, original_size, crop_ltrb = trim_and_resize_if_required(
+                        subset.random_crop,
+                        img,
+                        image_info.bucket_reso,
+                        image_info.resized_size,
+                        resize_interpolation=image_info.resize_interpolation,
+                    )
                 else:
                     tokenization_required = True
                 text_encoder_outputs_list.append(text_encoder_outputs)
@@ -3742,9 +3750,9 @@ def get_sai_model_spec(
     textual_inversion: bool,
     is_stable_diffusion_ckpt: Optional[bool] = None,  # None for TI and LoRA
     sd3: str = None,
-    flux: str = None, # "dev", "schnell" or "chroma"
+    flux: str = None,  # "dev", "schnell" or "chroma"
     lumina: str = None,
-    optional_metadata: dict[str, str] | None = None
+    optional_metadata: dict[str, str] | None = None,
 ):
     timestamp = time.time()
 
@@ -3773,7 +3781,7 @@ def get_sai_model_spec(
 
     # Extract metadata_* fields from args and merge with optional_metadata
     extracted_metadata = {}
-    
+
     # Extract all metadata_* attributes from args
     for attr_name in dir(args):
         if attr_name.startswith("metadata_") and not attr_name.startswith("metadata___"):
@@ -3783,7 +3791,7 @@ def get_sai_model_spec(
                 field_name = attr_name[9:]  # len("metadata_") = 9
                 if field_name not in ["title", "author", "description", "license", "tags"]:
                     extracted_metadata[field_name] = value
-    
+
     # Merge extracted metadata with provided optional_metadata
     all_optional_metadata = {**extracted_metadata}
     if optional_metadata:
@@ -3806,7 +3814,7 @@ def get_sai_model_spec(
         tags=args.metadata_tags,
         timesteps=timesteps,
         clip_skip=args.clip_skip,  # None or int
-        model_config=model_config, 
+        model_config=model_config,
         optional_metadata=all_optional_metadata if all_optional_metadata else None,
     )
     return metadata
@@ -3822,7 +3830,7 @@ def get_sai_model_spec_dataclass(
     sd3: str = None,
     flux: str = None,
     lumina: str = None,
-    optional_metadata: dict[str, str] | None = None
+    optional_metadata: dict[str, str] | None = None,
 ) -> sai_model_spec.ModelSpecMetadata:
     """
     Get ModelSpec metadata as a dataclass - preferred for new code.
@@ -5868,11 +5876,12 @@ def load_target_model(args, weight_dtype, accelerator, unet_use_linear_projectio
 
 
 def patch_accelerator_for_fp16_training(accelerator):
-    
+
     from accelerate import DistributedType
+
     if accelerator.distributed_type == DistributedType.DEEPSPEED:
         return
-    
+
     org_unscale_grads = accelerator.scaler._unscale_grads_
 
     def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
@@ -6365,7 +6374,6 @@ def get_noise_noisy_latents_and_timesteps(
 
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-
     timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
@@ -6690,7 +6698,6 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["renorm_cfg"] = float(m.group(1))
                 continue
 
-
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
@@ -6739,7 +6746,7 @@ def sample_images_common(
     vae,
     tokenizer,
     text_encoder,
-    unet,
+    unet_wrapped,
     prompt_replacement=None,
     controlnet=None,
 ):
@@ -6774,7 +6781,7 @@ def sample_images_common(
     vae.to(distributed_state.device)  # distributed_state.device is same as accelerator.device
 
     # unwrap unet and text_encoder(s)
-    unet = accelerator.unwrap_model(unet)
+    unet = accelerator.unwrap_model(unet_wrapped)
     if isinstance(text_encoder, (list, tuple)):
         text_encoder = [accelerator.unwrap_model(te) for te in text_encoder]
     else:
@@ -6920,7 +6927,7 @@ def sample_image_inference(
     logger.info(f"sample_sampler: {sampler_name}")
     if seed is not None:
         logger.info(f"seed: {seed}")
-    with accelerator.autocast():
+    with accelerator.autocast(), torch.no_grad():
         latents = pipeline(
             prompt=prompt,
             height=height,
