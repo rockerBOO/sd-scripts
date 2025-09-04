@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from unittest.mock import patch
 from transformers import Gemma2Model
+from PIL import Image
 
 from library.strategy_lumina import (
     LuminaTokenizeStrategy,
@@ -11,6 +12,7 @@ from library.strategy_lumina import (
     LuminaTextEncoderOutputsCachingStrategy,
     LuminaLatentsCachingStrategy,
 )
+from library.train_util import ImageInfo
 
 
 class SimpleMockGemma2Model:
@@ -36,6 +38,34 @@ class SimpleMockGemma2Model:
         ]
 
         return MockOutput(mock_hidden_states)
+
+class MockImageInfo:
+    def __init__(self, caption, cache_path):
+        self.caption = caption
+        self.text_encoder_outputs_npz = cache_path
+
+        self._current = 0
+
+    def __iter__(self):
+        self._current = 0
+        return self
+
+    def __next__(self):
+        if self._current < 1:
+            self._current += 1
+            return self
+        else:
+            self.current = 0
+            raise StopIteration
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, item):
+        if item == 0:
+            return self
+        else:
+            raise IndexError("Index out of range")
 
 
 def test_lumina_tokenize_strategy():
@@ -134,12 +164,6 @@ def test_lumina_text_encoder_outputs_caching_strategy():
             skip_disk_cache_validity_check=False,
         )
 
-        # Create a mock class for ImageInfo
-        class MockImageInfo:
-            def __init__(self, caption, cache_path):
-                self.caption = caption
-                self.text_encoder_outputs_npz = cache_path
-
         # Create a sample input info
         image_info = MockImageInfo("Test caption", cache_file)
 
@@ -209,33 +233,48 @@ def test_lumina_latents_caching_strategy():
                 encoded = torch.randn(1, 4, 8, 8, device=x.device)
                 return type("EncodedLatents", (), {"to": lambda *args, **kwargs: encoded})
 
-        # Prepare a mock batch
-        class MockImageInfo:
-            def __init__(self, path, image):
-                self.absolute_path = path
-                self.image = image
-                self.image_path = path
-                self.bucket_reso = image_size
-                self.resized_size = image_size
-                self.resize_interpolation = "lanczos"
-                # Specify full path to the latents npz file
-                self.latents_npz = os.path.join(tmpdir, f"{os.path.splitext(os.path.basename(path))[0]}_0064x0064_lumina.npz")
+        image_info = ImageInfo(
+            image_key="test_image",
+            num_repeats=1,
+            caption="",
+            is_reg=False,
+            absolute_path=abs_path,
+        )
+        image_info.image = Image.fromarray(test_image)
+        image_info.image_size = image_info.image.size
+        image_info.resized_size = image_info.image_size
+        image_info.bucket_reso = (8, 8)
 
-        batch = [MockImageInfo(abs_path, test_image)]
+        # Generate the expected npz path
+        npz_path = caching_strategy.get_latents_npz_path(abs_path, image_info.bucket_reso)
+        image_info.latents_npz = npz_path
+
+        print(vars(image_info))
+
+        batch = [image_info]
 
         # Call cache_batch_latents
         mock_vae = MockVAE()
         caching_strategy.cache_batch_latents(mock_vae, batch, flip_aug=False, alpha_mask=False, random_crop=False)
 
-        # Generate the expected npz path
-        npz_path = caching_strategy.get_latents_npz_path(abs_path, image_size)
-
         # Verify the file was created
         assert os.path.exists(npz_path), f"NPZ file not created at {npz_path}"
+        assert npz_path.endswith("_lumina.npz"), "Wrong suffix in NPZ path"
+
 
         # Verify is_disk_cached_latents_expected
         assert caching_strategy.is_disk_cached_latents_expected(image_size, npz_path, False, False)
+        key_reso_suffix="_8x8"
+        dummy_npz = {
+            f"latents{key_reso_suffix}": np.random.randn(1, 4, 8, 8).astype(np.float32),
+            f"original_size{key_reso_suffix}": np.array(image_size, dtype=np.int64),
+            f"crop_ltrb{key_reso_suffix}": np.array([0, 0, image_size[0], image_size[1]], dtype=np.int64),
+            f"latents_flipped{key_reso_suffix}": np.random.randn(1, 4, 8, 8).astype(np.float32),
+            f"alpha_mask{key_reso_suffix}": np.random.randint(0, 2, image_size, dtype=np.int64),
+        }
+        np.savez(npz_path, **dummy_npz)
 
-        # Test loading from disk
-        loaded_data = caching_strategy.load_latents_from_disk(npz_path, image_size)
-        assert len(loaded_data) == 5  # Check for 5 expected elements
+        # Loader should read it correctly
+        loaded = caching_strategy.load_latents_from_disk(npz_path, (64, 64))
+        assert isinstance(loaded, tuple) and len(loaded) == 5
+

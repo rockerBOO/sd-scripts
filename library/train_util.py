@@ -1858,16 +1858,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     text_encoder_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(
                         image_info.text_encoder_outputs_npz
                     )
-                if self.enable_bucket:
-                    img, original_size, crop_ltrb = trim_and_resize_if_required(
-                        subset.random_crop,
-                        img,
-                        image_info.bucket_reso,
-                        image_info.resized_size,
-                        resize_interpolation=image_info.resize_interpolation,
-                    )
-                else:
-                    tokenization_required = True
+
                 text_encoder_outputs_list.append(text_encoder_outputs)
 
                 if tokenization_required:
