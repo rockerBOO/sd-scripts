@@ -18,7 +18,7 @@ import torch
 from torch import Tensor
 import re
 from library.utils import setup_logging
-from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from library.device_utils import clean_memory_on_device
 
 setup_logging()
 import logging
@@ -48,6 +48,7 @@ class LoRAModule(torch.nn.Module):
         split_dims: Optional[List[int]] = None,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
+        ggpo_min_grad: float | None = None,
         mgpo_rho: float | None = None,
         mgpo_beta: float | None = None,
     ):
@@ -111,10 +112,12 @@ class LoRAModule(torch.nn.Module):
 
         self.ggpo_sigma = ggpo_sigma
         self.ggpo_beta = ggpo_beta
+        self.ggpo_min_grad = ggpo_min_grad
+
+        self.combined_weight_norms = None
+        self.grad_norms = None
 
         if self.ggpo_beta is not None and self.ggpo_sigma is not None:
-            self.combined_weight_norms = None
-            self.grad_norms = None
             self.perturbation_norm_factor = 1.0 / math.sqrt(org_module.weight.shape[0])
             self.initialize_norm_cache(org_module.weight)
             self.org_module_shape: tuple[int] = org_module.weight.shape
@@ -176,37 +179,19 @@ class LoRAModule(torch.nn.Module):
 
             lx = self.lora_up(lx)
 
-            # LoRA Momentum-Guided Perturbation Optimization (MGPO)
-            if (
-                self.training
-                and hasattr(self, "mgpo_rho")
-                and self.mgpo_rho is not None
-                and hasattr(self, "optimizer")
-                and self.optimizer is not None
-            ):
-                mgpo_perturbation_output = self.get_mgpo_output_perturbation(x)
-                if mgpo_perturbation_output is not None:
-                    return org_forwarded + (self.multiplier * scale * lx) + mgpo_perturbation_output
+            if self.training:
+                # LoRA Momentum-Guided Perturbation Optimization (MGPO)
+                if self.mgpo_rho is not None and hasattr(self, "optimizer") and self.optimizer is not None:
+                    mgpo_perturbation_output = self.get_mgpo_output_perturbation(x)
+                    if mgpo_perturbation_output is not None:
+                        return org_forwarded + (self.multiplier * scale * lx) + mgpo_perturbation_output
 
-            # LoRA Gradient-Guided Perturbation Optimization
-            if (
-                self.training
-                and self.ggpo_sigma is not None
-                and self.ggpo_beta is not None
-                and self.combined_weight_norms is not None
-                and self.grad_norms is not None
-            ):
-                with torch.no_grad():
-                    perturbation_scale = (self.ggpo_sigma * torch.sqrt(self.combined_weight_norms**2)) + (
-                        self.ggpo_beta * (self.grad_norms**2)
-                    )
-                    perturbation_scale_factor = (perturbation_scale * self.perturbation_norm_factor).to(self.device)
-                    perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
-                    perturbation.mul_(perturbation_scale_factor)
-                    perturbation_output = x @ perturbation.T  # Result: (batch × n)
-                return org_forwarded + (self.multiplier * scale * lx) + perturbation_output
-            else:
-                return org_forwarded + lx * self.multiplier * scale
+                # LoRA Gradient-Guided Perturbation Optimization
+                ggpo_perturbation_output = self.get_ggpo_output_perturbation(x)
+                if ggpo_perturbation_output is not None:
+                    return org_forwarded + (self.multiplier * scale * lx) + ggpo_perturbation_output
+
+            return org_forwarded + lx * self.multiplier * scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
 
@@ -357,6 +342,30 @@ class LoRAModule(torch.nn.Module):
                 self.mgpo_beta * self._grad_magnitude_ema_up.data + (1 - self.mgpo_beta) * current_grad_norm
             )
 
+    @torch.no_grad()
+    def get_ggpo_output_perturbation(self, x: Tensor) -> Tensor | None:
+        if self.combined_weight_norms is None or self.grad_norms is None:
+            return None
+
+        if self.ggpo_beta is None or self.ggpo_sigma is None:
+            return None
+
+        grad_norms = self.grad_norms**2
+
+        # Ignore GGPO for low grad norms
+        if self.ggpo_min_grad is None or torch.mean(grad_norms) < self.ggpo_min_grad:
+            return None
+
+        perturbation_scale = (self.ggpo_sigma * torch.sqrt(self.combined_weight_norms**2)) + (self.ggpo_beta * grad_norms)
+
+        perturbation_scale_factor = (perturbation_scale * self.perturbation_norm_factor).to(self.device)
+        perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
+        perturbation.mul_(perturbation_scale_factor)
+        perturbation_output = x @ perturbation.T  # Result: (batch × n)
+
+        return perturbation_output
+
+    @torch.no_grad()
     def get_mgpo_output_perturbation(self, x: Tensor) -> Tensor | None:
         """
         Generate MGPO perturbation using both momentum direction and gradient magnitude normalization
@@ -415,11 +424,10 @@ class LoRAModule(torch.nn.Module):
         # Average perturbation scale across all valid parameters
         avg_perturbation_scale = total_perturbation_scale / valid_params
 
-        with torch.no_grad():
-            # Generate random perturbation scaled by MGPO formula
-            perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
-            perturbation.mul_(avg_perturbation_scale)
-            perturbation_output = x @ perturbation.T  # Result: (batch × n)
+        # Generate random perturbation scaled by MGPO formula
+        perturbation = torch.randn(self.org_module_shape, dtype=self.dtype, device=self.device)
+        perturbation.mul_(avg_perturbation_scale)
+        perturbation_output = x @ perturbation.T  # Result: (batch × n)
 
         return perturbation_output
 
@@ -688,13 +696,13 @@ def create_network(
         split_qkv = True if split_qkv == "True" else False
 
     ggpo_beta = kwargs.get("ggpo_beta", None)
+    ggpo_beta = float(ggpo_beta) if ggpo_beta is not None else None
+
     ggpo_sigma = kwargs.get("ggpo_sigma", None)
+    ggpo_sigma = float(ggpo_sigma) if ggpo_sigma is not None else None
 
-    if ggpo_beta is not None:
-        ggpo_beta = float(ggpo_beta)
-
-    if ggpo_sigma is not None:
-        ggpo_sigma = float(ggpo_sigma)
+    ggpo_min_grad = kwargs.get("ggpo_min_grad", None)
+    ggpo_min_grad = float(ggpo_min_grad) if ggpo_min_grad is not None else None
 
     mgpo_beta = kwargs.get("mgpo_beta", None)
     mgpo_rho = kwargs.get("mgpo_rho", None)
@@ -773,6 +781,7 @@ def create_network(
         reg_dims=reg_dims,
         ggpo_beta=ggpo_beta,
         ggpo_sigma=ggpo_sigma,
+        ggpo_min_grad=ggpo_min_grad,
         mgpo_rho=mgpo_rho,
         mgpo_beta=mgpo_beta,
         reg_lrs=reg_lrs,
@@ -874,6 +883,7 @@ class LoRANetwork(torch.nn.Module):
         reg_dims: Optional[Dict[str, int]] = None,
         ggpo_beta: Optional[float] = None,
         ggpo_sigma: Optional[float] = None,
+        ggpo_min_grad: float | None = None,
         mgpo_rho: Optional[float] = None,
         mgpo_beta: Optional[float] = None,
         reg_lrs: Optional[Dict[str, float]] = None,
@@ -1002,6 +1012,16 @@ class LoRANetwork(torch.nn.Module):
                                             if d is not None and all([id in lora_name for id in identifier[i]]):
                                                 dim = d  # may be 0 for skip
                                                 break
+                                    is_double = False
+                                    if "double" in lora_name:
+                                        is_double = True
+                                    is_single = False
+                                    if "single" in lora_name:
+                                        is_single = True
+                                    block_index = None
+                                    if is_flux and dim and (is_double or is_single):
+                                        # "lora_unet_double_blocks_0_..." or "lora_unet_single_blocks_0_..."
+                                        block_index = int(lora_name.split("_")[4])  # bit dirty
 
                                     if (
                                         is_flux
@@ -1057,6 +1077,7 @@ class LoRANetwork(torch.nn.Module):
                                 split_dims=split_dims,
                                 ggpo_beta=ggpo_beta,
                                 ggpo_sigma=ggpo_sigma,
+                                ggpo_min_grad=ggpo_min_grad,
                                 mgpo_rho=mgpo_rho,
                                 mgpo_beta=mgpo_beta,
                             )
@@ -1073,7 +1094,7 @@ class LoRANetwork(torch.nn.Module):
         for i, text_encoder in enumerate(text_encoders):
             index = i
             if text_encoder is None:
-                logger.info(f"Text Encoder {index+1} is None, skipping LoRA creation for this encoder.")
+                logger.info(f"Text Encoder {index + 1} is None, skipping LoRA creation for this encoder.")
                 continue
             if not train_t5xxl and index > 0:  # 0: CLIP, 1: T5XXL, so we skip T5XXL if train_t5xxl is False
                 break
