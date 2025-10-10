@@ -1761,6 +1761,7 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs_list = []
         vision_encoder_outputs_list = []
         custom_attributes = []
+        image_keys = []  # CDC-FM: track image keys for CDC lookup
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_infos = self.image_data[image_key]
@@ -1770,6 +1771,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # in case of fine tuning, is_reg is always False
                 loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
+            # CDC-FM: Store image_key for CDC lookup
+            image_keys.append(image_key)
+
+            custom_attributes.append(subset.custom_attributes)
 
                 flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
@@ -1897,7 +1902,39 @@ class BaseDataset(torch.utils.data.Dataset):
             # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
             if len(tensors_list) == 0 or tensors_list[0] == None or len(tensors_list[0]) == 0 or tensors_list[0][0] is None:
                 return None
-            return [torch.stack([converter(x[i]) for x in tensors_list]) for i in range(len(tensors_list[0]))]
+
+            # old implementation without padding: all elements must have same length
+            # return [torch.stack([converter(x[i]) for x in tensors_list]) for i in range(len(tensors_list[0]))]
+
+            # new implementation with padding support
+            result = []
+            for i in range(len(tensors_list[0])):
+                tensors = [x[i] for x in tensors_list]
+                if tensors[0].ndim == 0:
+                    # scalar value: e.g. ocr mask
+                    result.append(torch.stack([converter(x[i]) for x in tensors_list]))
+                    continue
+
+                min_len = min([len(x) for x in tensors])
+                max_len = max([len(x) for x in tensors])
+
+                if min_len == max_len:
+                    # no padding
+                    result.append(torch.stack([converter(x) for x in tensors]))
+                else:
+                    # padding
+                    tensors = [converter(x) for x in tensors]
+                    if tensors[0].ndim == 1:
+                        # input_ids or mask
+                        result.append(
+                            torch.stack([(torch.nn.functional.pad(x, (0, max_len - x.shape[0]))) for x in tensors])
+                        )
+                    else:
+                        # text encoder outputs
+                        result.append(
+                            torch.stack([(torch.nn.functional.pad(x, (0, 0, 0, max_len - x.shape[0]))) for x in tensors])
+                        )
+            return result
 
         # set example
         example = {}
@@ -1941,6 +1978,9 @@ class BaseDataset(torch.utils.data.Dataset):
         example["flippeds"] = flippeds
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
+
+        # CDC-FM: Add image keys to batch for CDC lookup
+        example["image_keys"] = image_keys
 
         if self.debug_dataset:
             example["image_keys"] = bucket[image_index : image_index + self.batch_size]
@@ -2883,6 +2923,137 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.new_cache_text_encoder_outputs(models, accelerator)
         accelerator.wait_for_everyone()
 
+    def cache_cdc_gamma_b(
+        self,
+        cdc_output_path: str,
+        k_neighbors: int = 256,
+        k_bandwidth: int = 8,
+        d_cdc: int = 8,
+        gamma: float = 1.0,
+        force_recache: bool = False,
+        accelerator: Optional["Accelerator"] = None,
+        debug: bool = False,
+        adaptive_k: bool = False,
+        min_bucket_size: int = 16,
+    ) -> str:
+        """
+        Cache CDC Γ_b matrices for all latents in the dataset
+
+        Args:
+            cdc_output_path: Path to save cdc_gamma_b.safetensors
+            k_neighbors: k-NN neighbors
+            k_bandwidth: Bandwidth estimation neighbors
+            d_cdc: CDC subspace dimension
+            gamma: CDC strength
+            force_recache: Force recompute even if cache exists
+            accelerator: For multi-GPU support
+
+        Returns:
+            Path to cached CDC file
+        """
+        from pathlib import Path
+
+        cdc_path = Path(cdc_output_path)
+
+        # Check if valid cache exists
+        if cdc_path.exists() and not force_recache:
+            if self._is_cdc_cache_valid(cdc_path, k_neighbors, d_cdc, gamma):
+                logger.info(f"Valid CDC cache found at {cdc_path}, skipping preprocessing")
+                return str(cdc_path)
+            else:
+                logger.info(f"CDC cache found but invalid, will recompute")
+
+        # Only main process computes CDC
+        is_main = accelerator is None or accelerator.is_main_process
+        if not is_main:
+            if accelerator is not None:
+                accelerator.wait_for_everyone()
+            return str(cdc_path)
+
+        logger.info("=" * 60)
+        logger.info("Starting CDC-FM preprocessing")
+        logger.info(f"Parameters: k={k_neighbors}, k_bw={k_bandwidth}, d_cdc={d_cdc}, gamma={gamma}")
+        logger.info("=" * 60)
+        # Initialize CDC preprocessor
+        # Initialize CDC preprocessor
+        try:
+            from library.cdc_fm import CDCPreprocessor
+        except ImportError as e:
+            logger.warning(
+                "FAISS not installed. CDC-FM preprocessing skipped. "
+                "Install with: pip install faiss-cpu (CPU) or faiss-gpu (GPU)"
+            )
+            return None
+
+        preprocessor = CDCPreprocessor(
+            k_neighbors=k_neighbors, k_bandwidth=k_bandwidth, d_cdc=d_cdc, gamma=gamma, device="cuda" if torch.cuda.is_available() else "cpu", debug=debug, adaptive_k=adaptive_k, min_bucket_size=min_bucket_size
+        )
+
+        # Get caching strategy for loading latents
+        from library.strategy_base import LatentsCachingStrategy
+
+        caching_strategy = LatentsCachingStrategy.get_strategy()
+
+        # Collect all latents from all datasets
+        for dataset_idx, dataset in enumerate(self.datasets):
+            logger.info(f"Loading latents from dataset {dataset_idx}...")
+            image_infos = list(dataset.image_data.values())
+
+            for local_idx, info in enumerate(tqdm(image_infos, desc=f"Dataset {dataset_idx}")):
+                # Load latent from disk or memory
+                if info.latents is not None:
+                    latent = info.latents
+                elif info.latents_npz is not None:
+                    # Load from disk
+                    latent, _, _, _, _ = caching_strategy.load_latents_from_disk(info.latents_npz, info.bucket_reso)
+                    if latent is None:
+                        logger.warning(f"Failed to load latent from {info.latents_npz}, skipping")
+                        continue
+                else:
+                    logger.warning(f"No latent found for {info.absolute_path}, skipping")
+                    continue
+
+                # Add to preprocessor (with unique global index across all datasets)
+                actual_global_idx = sum(len(d.image_data) for d in self.datasets[:dataset_idx]) + local_idx
+                preprocessor.add_latent(latent=latent, global_idx=actual_global_idx, shape=latent.shape, metadata={"image_key": info.image_key})
+
+        # Compute and save
+        logger.info(f"\nComputing CDC Γ_b matrices for {len(preprocessor.batcher)} samples...")
+        preprocessor.compute_all(save_path=cdc_path)
+
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+
+        return str(cdc_path)
+
+    def _is_cdc_cache_valid(self, cdc_path: "pathlib.Path", k_neighbors: int, d_cdc: int, gamma: float) -> bool:
+        """Check if CDC cache has matching hyperparameters"""
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(cdc_path), framework="pt", device="cpu") as f:
+                cached_k = int(f.get_tensor("metadata/k_neighbors").item())
+                cached_d = int(f.get_tensor("metadata/d_cdc").item())
+                cached_gamma = float(f.get_tensor("metadata/gamma").item())
+                cached_num = int(f.get_tensor("metadata/num_samples").item())
+
+            expected_num = sum(len(d.image_data) for d in self.datasets)
+
+            valid = cached_k == k_neighbors and cached_d == d_cdc and abs(cached_gamma - gamma) < 1e-6 and cached_num == expected_num
+
+            if not valid:
+                logger.info(
+                    f"Cache mismatch: k={cached_k} (expected {k_neighbors}), "
+                    f"d_cdc={cached_d} (expected {d_cdc}), "
+                    f"gamma={cached_gamma} (expected {gamma}), "
+                    f"num={cached_num} (expected {expected_num})"
+                )
+
+            return valid
+        except Exception as e:
+            logger.warning(f"Error validating CDC cache: {e}")
+            return False
+
     def set_caching_mode(self, caching_mode):
         for dataset in self.datasets:
             dataset.set_caching_mode(caching_mode)
@@ -3821,6 +3992,7 @@ def get_sai_model_spec_dataclass(
     sd3: str = None,
     flux: str = None,
     lumina: str = None,
+    hunyuan_image: str = None,
     optional_metadata: dict[str, str] | None = None,
 ) -> sai_model_spec.ModelSpecMetadata:
     """
@@ -3850,6 +4022,8 @@ def get_sai_model_spec_dataclass(
         model_config["flux"] = flux
     if lumina is not None:
         model_config["lumina"] = lumina
+    if hunyuan_image is not None:
+        model_config["hunyuan_image"] = hunyuan_image
 
     # Use the dataclass function directly
     return sai_model_spec.build_metadata_dataclass(
@@ -4225,11 +4399,21 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         choices=["no", "fp16", "bf16"],
         help="use mixed precision / 混合精度を使う場合、その精度",
     )
-    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
     parser.add_argument(
-        "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
+        "--full_fp16",
+        action="store_true",
+        help="fp16 training including gradients, some models are not supported / 勾配も含めてfp16で学習する、一部のモデルではサポートされていません",
+    )
+    parser.add_argument(
+        "--full_bf16",
+        action="store_true",
+        help="bf16 training including gradients, some models are not supported / 勾配も含めてbf16で学習する、一部のモデルではサポートされていません",
     )  # TODO move to SDXL training, because it is not supported by SD1/2
-    parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
+    parser.add_argument(
+        "--fp8_base",
+        action="store_true",
+        help="use fp8 for base model, some models are not supported / base modelにfp8を使う、一部のモデルではサポートされていません",
+    )
 
     parser.add_argument(
         "--ddp_timeout",
@@ -6687,6 +6871,11 @@ def line_to_prompt_dict(line: str) -> dict:
             m = re.match(r"rcfg (.+)", parg, re.IGNORECASE)
             if m:
                 prompt_dict["renorm_cfg"] = float(m.group(1))
+                continue
+
+            m = re.match(r"fs (.+)", parg, re.IGNORECASE)
+            if m:
+                prompt_dict["flow_shift"] = m.group(1)
                 continue
 
         except ValueError as ex:

@@ -1,3 +1,4 @@
+import gc
 import importlib
 import argparse
 import math
@@ -10,13 +11,13 @@ import time
 import json
 from multiprocessing import Value
 import numpy as np
-import toml
 
 import ast
 
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.network_utils import maybe_pruned_save, maybe_sample_params
@@ -222,7 +223,7 @@ class NetworkTrainer:
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(32)
 
-    def load_target_model(self, args, weight_dtype, accelerator) -> tuple:
+    def load_target_model(self, args, weight_dtype, accelerator) -> tuple[str, nn.Module, nn.Module, Optional[nn.Module]]:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
 
         # モデルに xformers とか memory efficient attention を組み込む
@@ -231,6 +232,9 @@ class NetworkTrainer:
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
         return model_util.get_model_version_str_for_sd1_sd2(args.v2, args.v_parameterization), text_encoder, vae, unet
+
+    def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, List[nn.Module]]:
+        raise NotImplementedError()
 
     def get_tokenize_strategy(self, args):
         return strategy_sd.SdTokenizeStrategy(args.v2, args.max_token_length, args.tokenizer_cache_dir)
@@ -631,6 +635,15 @@ class NetworkTrainer:
 
         return loss.mean(), losses, metrics
 
+    def cast_text_encoder(self, args):
+        return True  # default for other than HunyuanImage
+
+    def cast_vae(self, args):
+        return True  # default for other than HunyuanImage
+
+    def cast_unet(self, args):
+        return True  # default for other than HunyuanImage
+
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
@@ -739,13 +752,70 @@ class NetworkTrainer:
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = train_util.prepare_dtype(args)
-        vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
+        vae_dtype = (torch.float32 if args.no_half_vae else weight_dtype) if self.cast_vae(args) else None
 
-        # モデルを読み込む
+        # load target models: unet may be None for lazy loading
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
+        if vae_dtype is None:
+            vae_dtype = vae.dtype
+            logger.info(f"vae_dtype is set to {vae_dtype} by the model since cast_vae() is false")
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+
+        # prepare dataset for latents caching if needed
+        if cache_latents:
+            vae.to(accelerator.device, dtype=vae_dtype)
+            vae.requires_grad_(False)
+            vae.eval()
+
+            train_dataset_group.new_cache_latents(vae, accelerator)
+            if val_dataset_group is not None:
+                val_dataset_group.new_cache_latents(vae, accelerator)
+
+            vae.to("cpu")
+            clean_memory_on_device(accelerator.device)
+
+            accelerator.wait_for_everyone()
+
+        # CDC-FM preprocessing
+        if hasattr(args, "use_cdc_fm") and args.use_cdc_fm:
+            logger.info("CDC-FM enabled, preprocessing Γ_b matrices...")
+            cdc_output_path = os.path.join(args.output_dir, "cdc_gamma_b.safetensors")
+
+            self.cdc_cache_path = train_dataset_group.cache_cdc_gamma_b(
+                cdc_output_path=cdc_output_path,
+                k_neighbors=args.cdc_k_neighbors,
+                k_bandwidth=args.cdc_k_bandwidth,
+                d_cdc=args.cdc_d_cdc,
+                gamma=args.cdc_gamma,
+                force_recache=args.force_recache_cdc,
+                accelerator=accelerator,
+                debug=getattr(args, 'cdc_debug', False),
+                adaptive_k=getattr(args, 'cdc_adaptive_k', False),
+                min_bucket_size=getattr(args, 'cdc_min_bucket_size', 16),
+            )
+
+            if self.cdc_cache_path is None:
+                logger.warning("CDC-FM preprocessing failed (likely missing FAISS). Training will continue without CDC-FM.")
+        else:
+            self.cdc_cache_path = None
+
+        # 必要ならテキストエンコーダーの出力をキャッシュする: Text Encoderはcpuまたはgpuへ移される
+        # cache text encoder outputs if needed: Text Encoder is moved to cpu or gpu
+        text_encoding_strategy = self.get_text_encoding_strategy(args)
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+
+        text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
+        if text_encoder_outputs_caching_strategy is not None:
+            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
+        self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
+        if val_dataset_group is not None:
+            self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+
+        if unet is None:
+            # lazy load unet if needed. text encoders may be freed or replaced with dummy models for saving memory
+            unet, text_encoders = self.load_unet_lazily(args, weight_dtype, accelerator, text_encoders)
 
         # 差分追加学習のためにモデルを読み込む
         sys.path.append(os.path.dirname(__file__))
@@ -769,32 +839,16 @@ class NetworkTrainer:
 
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
 
-        # 学習を準備する
-        if cache_latents:
-            vae.to(accelerator.device, dtype=vae_dtype)
-            vae.requires_grad_(False)
-            vae.eval()
+        # Load CDC-FM Γ_b dataset if enabled
+        if hasattr(args, "use_cdc_fm") and args.use_cdc_fm and self.cdc_cache_path is not None:
+            from library.cdc_fm import GammaBDataset
 
-            train_dataset_group.new_cache_latents(vae, accelerator)
-            if val_dataset_group is not None:
-                val_dataset_group.new_cache_latents(vae, accelerator)
-
-            vae.to("cpu")
-            clean_memory_on_device(accelerator.device)
-
-            accelerator.wait_for_everyone()
-
-        # 必要ならテキストエンコーダーの出力をキャッシュする: Text Encoderはcpuまたはgpuへ移される
-        # cache text encoder outputs if needed: Text Encoder is moved to cpu or gpu
-        text_encoding_strategy = self.get_text_encoding_strategy(args)
-        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
-
-        text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
-        if text_encoder_outputs_caching_strategy is not None:
-            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
-        self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
-        if val_dataset_group is not None:
-            self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
+            logger.info(f"Loading CDC Γ_b dataset from {self.cdc_cache_path}")
+            self.gamma_b_dataset = GammaBDataset(
+                gamma_b_path=self.cdc_cache_path, device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+        else:
+            self.gamma_b_dataset = None
 
         # prepare network
         net_kwargs = {}
@@ -825,7 +879,7 @@ class NetworkTrainer:
             return
         network_has_multiplier = hasattr(network, "set_multiplier")
 
-        # TODO remove `hasattr`s by setting up methods if not defined in the network like (hacky but works):
+        # TODO remove `hasattr` by setting up methods if not defined in the network like below  (hacky but will work):
         # if not hasattr(network, "prepare_network"):
         #    network.prepare_network = lambda args: None
 
@@ -987,12 +1041,13 @@ class NetworkTrainer:
             unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
         unet.requires_grad_(False)
-        unet.to(dtype=unet_weight_dtype)
+        if self.cast_unet(args):
+            unet.to(dtype=unet_weight_dtype)
         for i, t_enc in enumerate(text_encoders):
             t_enc.requires_grad_(False)
 
             # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu":
+            if t_enc.device.type != "cpu" and self.cast_text_encoder(args):
                 t_enc.to(dtype=te_weight_dtype)
 
                 # nn.Embedding not support FP8
@@ -1018,7 +1073,8 @@ class NetworkTrainer:
                 # default implementation is:  unet = accelerator.prepare(unet)
                 unet = self.prepare_unet_with_accelerator(args, accelerator, unet)  # accelerator does some magic here
             else:
-                unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
+                # move to device because unet is not prepared by accelerator
+                unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
             if train_text_encoder:
                 text_encoders = [
                     (accelerator.prepare(t_enc) if flag else t_enc)
@@ -1516,6 +1572,8 @@ class NetworkTrainer:
                 del t_enc
             text_encoders = []
             text_encoder = None
+            gc.collect()
+            clean_memory_on_device(accelerator.device)
 
         # For --sample_at_first
         optimizer_eval_fn()

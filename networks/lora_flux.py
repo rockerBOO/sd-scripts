@@ -1016,6 +1016,10 @@ class LoRANetwork(torch.nn.Module):
     LORA_PREFIX_TEXT_ENCODER_CLIP = "lora_te1"
     LORA_PREFIX_TEXT_ENCODER_T5 = "lora_te3"  # make ComfyUI compatible
 
+    @classmethod
+    def get_qkv_mlp_split_dims(cls) -> List[int]:
+        return [3072] * 3 + [12288]
+
     def __init__(
         self,
         text_encoders: Union[List[CLIPTextModel], CLIPTextModel],
@@ -1245,9 +1249,9 @@ class LoRANetwork(torch.nn.Module):
                             split_dims = None
                             if is_flux and split_qkv:
                                 if "double" in lora_name and "qkv" in lora_name:
-                                    split_dims = [3072] * 3
+                                    (split_dims,) = self.get_qkv_mlp_split_dims()[:3]  # qkv only
                                 elif "single" in lora_name and "linear1" in lora_name:
-                                    split_dims = [3072] * 3 + [12288]
+                                    split_dims = self.get_qkv_mlp_split_dims()  # qkv + mlp
 
                             assert module_class is LoRAModule or module_class is LoRAInfModule, (
                                 f"Module class is not valid {type(module_class)}"
@@ -1456,9 +1460,9 @@ class LoRANetwork(torch.nn.Module):
         # split qkv
         for key in list(state_dict.keys()):
             if "double" in key and "qkv" in key:
-                split_dims = [3072] * 3
+                split_dims = self.get_qkv_mlp_split_dims()[:3]  # qkv only
             elif "single" in key and "linear1" in key:
-                split_dims = [3072] * 3 + [12288]
+                split_dims = self.get_qkv_mlp_split_dims()  # qkv + mlp
             else:
                 continue
 
@@ -1512,9 +1516,9 @@ class LoRANetwork(torch.nn.Module):
         new_state_dict = {}
         for key in list(state_dict.keys()):
             if "double" in key and "qkv" in key:
-                split_dims = [3072] * 3
+                split_dims = self.get_qkv_mlp_split_dims()[:3]  # qkv only
             elif "single" in key and "linear1" in key:
-                split_dims = [3072] * 3 + [12288]
+                split_dims = self.get_qkv_mlp_split_dims()  # qkv + mlp
             else:
                 new_state_dict[key] = state_dict[key]
                 continue
