@@ -673,7 +673,7 @@ def get_noisy_model_input_and_timesteps(
     if gamma_b_dataset is not None and image_keys is not None:
         noise = apply_cdc_noise_transformation(
             noise=noise,
-            timesteps=timesteps,
+            timesteps=timestep,
             num_timesteps=num_timesteps,
             gamma_b_dataset=gamma_b_dataset,
             image_keys=image_keys,

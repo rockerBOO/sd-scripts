@@ -1771,10 +1771,10 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # in case of fine tuning, is_reg is always False
                 loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
-            # CDC-FM: Store image_key for CDC lookup
-            image_keys.append(image_key)
+                # CDC-FM: Store image_key for CDC lookup
+                image_keys.append(image_key)
 
-            custom_attributes.append(subset.custom_attributes)
+                custom_attributes.append(subset.custom_attributes)
 
                 flipped = subset.flip_aug and random.random() < 0.5  # not flipped or flipped with 50% chance
 
