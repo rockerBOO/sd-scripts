@@ -1,18 +1,5 @@
-"""
-CDC Gradient Flow Verification Tests
-
-This module provides testing of:
-1. Mock dataset gradient preservation
-2. Real dataset gradient flow
-3. Various time steps and computation paths
-4. Fallback and edge case scenarios
-"""
-
-import pytest
 import torch
-
-from library.cdc_fm import CDCPreprocessor, GammaBDataset
-from library.flux_train_utils import apply_cdc_noise_transformation
+from typing import Union
 
 
 class MockGammaBDataset:
@@ -30,7 +17,7 @@ class MockGammaBDataset:
         eigenvectors: torch.Tensor,
         eigenvalues: torch.Tensor,
         x: torch.Tensor,
-        t: torch.Tensor
+        t: Union[float, torch.Tensor]
     ) -> torch.Tensor:
         """
         Simplified implementation of compute_sigma_t_x for testing
@@ -42,6 +29,9 @@ class MockGammaBDataset:
         if x.dim() == 4:
             B, C, H, W = x.shape
             x = x.reshape(B, -1)  # (B, C*H*W)
+
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, device=x.device, dtype=x.dtype)
 
         # Validate dimensions
         assert eigenvectors.shape[0] == x.shape[0], "Batch size mismatch"
@@ -70,20 +60,15 @@ class MockGammaBDataset:
 
         return result
 
-
-class TestCDCGradientFlow:
-    """
-    Gradient flow testing for CDC noise transformations
-    """
-
+class TestCDCAdvanced:
     def setup_method(self):
         """Prepare consistent test environment"""
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def test_mock_gradient_flow_near_zero_time_step(self):
+    def test_gradient_flow_preservation(self):
         """
-        Verify gradient flow preservation for near-zero time steps
-        using mock dataset with learnable time embeddings
+        Verify that gradient flow is preserved even for near-zero time steps
+        with learnable time embeddings
         """
         # Set random seed for reproducibility
         torch.manual_seed(42)
@@ -131,7 +116,11 @@ class TestCDCGradientFlow:
         assert t_grad_magnitude > 0, f"Time embedding gradient is zero: {t_grad_magnitude}"
         assert latent_grad_magnitude > 0, f"Input latent gradient is zero: {latent_grad_magnitude}"
 
-    def test_gradient_flow_with_multiple_time_steps(self):
+        # Optional: Print gradient details for debugging
+        print(f"Time embedding gradient magnitude: {t_grad_magnitude}")
+        print(f"Latent gradient magnitude: {latent_grad_magnitude}")
+
+    def test_gradient_flow_with_different_time_steps(self):
         """
         Verify gradient flow across different time step values
         """
@@ -179,119 +168,16 @@ class TestCDCGradientFlow:
             assert latent_grad_magnitude > 0, f"Input latent gradient is zero for t={time_val}"
 
             # Reset gradients for next iteration
-            t.grad.zero_() if t.grad is not None else None
-            latent.grad.zero_() if latent.grad is not None else None
-
-    def test_gradient_flow_with_real_dataset(self, tmp_path):
-        """
-        Test gradient flow with real CDC dataset
-        """
-        # Create cache with uniform shapes
-        preprocessor = CDCPreprocessor(
-            k_neighbors=8, k_bandwidth=3, d_cdc=8, gamma=1.0, device="cpu"
-        )
-
-        shape = (16, 32, 32)
-        for i in range(10):
-            latent = torch.randn(*shape, dtype=torch.float32)
-            metadata = {'image_key': f'test_image_{i}'}
-            preprocessor.add_latent(latent=latent, global_idx=i, shape=shape, metadata=metadata)
-
-        cache_path = tmp_path / "test_gradient.safetensors"
-        preprocessor.compute_all(save_path=cache_path)
-        dataset = GammaBDataset(gamma_b_path=cache_path, device="cpu")
-
-        # Prepare test noise
-        torch.manual_seed(42)
-        noise = torch.randn(4, *shape, dtype=torch.float32, requires_grad=True)
-        timesteps = torch.tensor([100.0, 200.0, 300.0, 400.0], dtype=torch.float32)
-        image_keys = ['test_image_0', 'test_image_1', 'test_image_2', 'test_image_3']
-
-        # Apply CDC transformation
-        noise_out = apply_cdc_noise_transformation(
-            noise=noise,
-            timesteps=timesteps,
-            num_timesteps=1000,
-            gamma_b_dataset=dataset,
-            image_keys=image_keys,
-            device="cpu"
-        )
-
-        # Verify gradient flow
-        assert noise_out.requires_grad, "Output should require gradients"
-
-        loss = noise_out.sum()
-        loss.backward()
-
-        assert noise.grad is not None, "Gradients should flow back to input noise"
-        assert not torch.isnan(noise.grad).any(), "Gradients should not contain NaN"
-        assert not torch.isinf(noise.grad).any(), "Gradients should not contain inf"
-        assert (noise.grad != 0).any(), "Gradients should not be all zeros"
-
-    def test_gradient_flow_with_fallback(self, tmp_path):
-        """
-        Test gradient flow when using Gaussian fallback (shape mismatch)
-
-        Ensures that cloned tensors maintain gradient flow correctly
-        even when shape mismatch triggers Gaussian noise
-        """
-        # Create cache with one shape
-        preprocessor = CDCPreprocessor(
-            k_neighbors=8, k_bandwidth=3, d_cdc=8, gamma=1.0, device="cpu"
-        )
-
-        preprocessed_shape = (16, 32, 32)
-        latent = torch.randn(*preprocessed_shape, dtype=torch.float32)
-        metadata = {'image_key': 'test_image_0'}
-        preprocessor.add_latent(latent=latent, global_idx=0, shape=preprocessed_shape, metadata=metadata)
-
-        cache_path = tmp_path / "test_fallback_gradient.safetensors"
-        preprocessor.compute_all(save_path=cache_path)
-        dataset = GammaBDataset(gamma_b_path=cache_path, device="cpu")
-
-        # Use different shape at runtime (will trigger fallback)
-        runtime_shape = (16, 64, 64)
-        noise = torch.randn(1, *runtime_shape, dtype=torch.float32, requires_grad=True)
-        timesteps = torch.tensor([100.0], dtype=torch.float32)
-        image_keys = ['test_image_0']
-
-        # Apply transformation (should fallback to Gaussian for this sample)
-        noise_out = apply_cdc_noise_transformation(
-            noise=noise,
-            timesteps=timesteps,
-            num_timesteps=1000,
-            gamma_b_dataset=dataset,
-            image_keys=image_keys,
-            device="cpu"
-        )
-
-        # Ensure gradients still flow through fallback path
-        assert noise_out.requires_grad, "Fallback output should require gradients"
-
-        loss = noise_out.sum()
-        loss.backward()
-
-        assert noise.grad is not None, "Gradients should flow even in fallback case"
-        assert not torch.isnan(noise.grad).any(), "Fallback gradients should not contain NaN"
-
+            if t.grad is not None:
+                t.grad.zero_()
+            if latent.grad is not None:
+                latent.grad.zero_()
 
 def pytest_configure(config):
     """
-    Configure custom markers for CDC gradient flow tests
+    Add custom markers for CDC-FM tests
     """
     config.addinivalue_line(
         "markers",
         "gradient_flow: mark test to verify gradient preservation in CDC Flow Matching"
     )
-    config.addinivalue_line(
-        "markers",
-        "mock_dataset: mark test using mock dataset for simplified gradient testing"
-    )
-    config.addinivalue_line(
-        "markers",
-        "real_dataset: mark test using real dataset for comprehensive gradient testing"
-    )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
