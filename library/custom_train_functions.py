@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from collections import defaultdict
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import torch
 import math
@@ -379,6 +380,22 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         type=float,
         help="Scaling factor for likelihood ratio (range: 0.01-0.1). Higher values create stronger separation between target and reference distributions. Start with 0.05.",
     )
+    parser.add_argument("--srpo_beta", type=float, default=None, help="Enable SRPO with given beta (timestep discount factor)")
+    parser.add_argument(
+        "--srpo_positive_prompt", type=str, default="Realistic photo", help="Positive control phrase for SRPO semantic guidance"
+    )
+    parser.add_argument(
+        "--srpo_negative_prompt", type=str, default="CG Render", help="Negative control phrase for SRPO semantic guidance"
+    )
+    parser.add_argument("--srpo_use_inversion", action="store_true", help="Use inversion-based regularization in SRPO")
+    parser.add_argument(
+        "--srpo_reward_model",
+        type=str,
+        default="clip",
+        choices=["clip", "hpsv2", "pickscore", "imagereward"],
+        help="Reward model for SRPO",
+    )
+    parser.add_argument("--srpo_delta_sigma", type=float, default=0.025, help="Delta sigma parameter for Direct-Align recovery")
 
 
 re_attention = re.compile(
@@ -751,6 +768,7 @@ class PreferenceOptimization:
     def __init__(self, args):
         self.loss_fn = None
         self.loss_ref_fn = None
+        self.reward_fn = None
 
         assert_po_variables(args)
 
@@ -788,19 +806,39 @@ class PreferenceOptimization:
             self.algo = "CPO"
             self.loss_fn = cpo_loss
             self.args = {"beta": args.cpo_beta}
+        elif args.srpo_beta is not None:
+            self.algo = "SRPO"
+            self.reward_fn = srpo_loss
+            self.args = {
+                "beta": args.srpo_beta,
+                "positive_prompt": args.srpo_positive_prompt,
+                "negative_prompt": args.srpo_negative_prompt,
+                "use_inversion": getattr(args, "srpo_use_inversion", False),
+                "reward_model": getattr(args, "srpo_reward_model", "clip"),
+                "delta_sigma": getattr(args, "srpo_delta_sigma", 0.025),
+            }
 
     def is_po(self):
-        return self.loss_fn is not None or self.loss_ref_fn is not None
+        return self.loss_fn is not None or self.loss_ref_fn is not None or self.reward_fn is not None
 
     def is_reference(self):
         return self.loss_ref_fn is not None
 
-    def __call__(self, loss: torch.Tensor, ref_loss: torch.Tensor | None = None):
-        if self.is_reference():
+    def is_reward_based(self):
+        """SRPO uses reward-based optimization instead of preference pairs"""
+        return self.reward_fn is not None
+
+    def __call__(self, loss: torch.Tensor | None = None, ref_loss: torch.Tensor | None = None, reward_inputs: dict | None = None):
+        if self.is_reward_based():
+            assert reward_inputs is not None, "SRPO requires reward_inputs"
+            loss, metrics = self.reward_fn(reward_inputs=reward_inputs, **self.args)
+        elif self.is_reference():
+            assert loss is not None, "Loss required for reference-based preference optimization"
             assert ref_loss is not None, "Reference required for this preference optimization"
             assert self.loss_ref_fn is not None, "No reference loss function"
             loss, metrics = self.loss_ref_fn(loss, ref_loss, **self.args)
         else:
+            assert loss is not None, "Loss required for preference optimization"
             assert self.loss_fn is not None, "No loss function"
             loss, metrics = self.loss_fn(loss, **self.args)
 
@@ -1167,6 +1205,121 @@ def simpo_loss(
     metrics["loss/simpo_logratio"] = (beta * logits.detach()).mean().item()
 
     return losses, metrics
+
+
+def srpo_loss(
+    reward_inputs: dict,
+    beta: float = 1.0,
+    positive_prompt: str = "Realistic photo",
+    negative_prompt: str = "CG Render",
+    use_inversion: bool = False,
+    **kwargs,  # Catch unused args from PreferenceOptimization
+) -> tuple[torch.Tensor, dict[str, int | float]]:
+    """
+    SRPO loss for FLUX (Flow Matching)
+
+    This version receives already-recovered latents from Direct-Align,
+    so it only needs to decode and compute rewards.
+
+    Args:
+        reward_inputs: Dictionary containing:
+            - latents_recovered: Clean latents from Direct-Align recovery
+            - sigma_t: Noise level (for timestep discount)
+            - captions: Original text prompts
+            - vae: VAE decoder
+            - reward_model: CLIP reward model
+        beta: Timestep discount strength
+        positive_prompt: Positive control phrase for semantic guidance
+        negative_prompt: Negative control phrase for semantic guidance
+        use_inversion: Whether to use inversion-based regularization
+    """
+
+    # Unpack inputs
+    latents_recovered = reward_inputs["latents_recovered"]
+    sigma_t = reward_inputs["sigma_t"]
+    captions = reward_inputs["captions"]
+    vae = reward_inputs["vae"]
+    clip_reward_model = reward_inputs["reward_model"]
+
+    # Get target for computing loss with gradients
+    target = reward_inputs.get("target")
+    model_pred = reward_inputs.get("model_pred")
+
+    # Decode latents to pixels for CLIP reward
+    with torch.no_grad():
+        # FLUX uses 0.3611 scale factor (different from SD's 0.18215)
+        vae_scale_factor = getattr(vae, "scaling_factor", 0.3611)
+
+        # Get VAE dtype and convert latents to match
+        vae_dtype = next(vae.parameters()).dtype
+        latents_recovered = latents_recovered.to(dtype=vae_dtype)
+
+        # Decode in smaller batches if needed to save memory
+        batch_size = latents_recovered.shape[0]
+        if batch_size > 4:
+            images_list = []
+            for i in range(0, batch_size, 4):
+                batch_latents = latents_recovered[i : i + 4]
+                batch_images = vae.decode(batch_latents / vae_scale_factor)
+                images_list.append(batch_images)
+            images_recovered = torch.cat(images_list, dim=0)
+        else:
+            images_recovered = vae.decode(latents_recovered / vae_scale_factor)
+
+        # Normalize to [0, 1] for CLIP and convert to float32 (CLIP doesn't support bfloat16)
+        images_recovered = (images_recovered + 1) / 2
+        images_recovered = torch.clamp(images_recovered, 0, 1).to(dtype=torch.float32)
+
+    # Semantic Relative Preference: Augment prompts
+    positive_prompts = [f"{positive_prompt}. {caption}" for caption in captions]
+    negative_prompts = [f"{negative_prompt}. {caption}" for caption in captions]
+
+    # Compute rewards with CLIP
+    with torch.no_grad():
+        reward_positive = clip_reward_model(images_recovered, positive_prompts)
+        reward_negative = clip_reward_model(images_recovered, negative_prompts)
+
+        # Semantic-Relative reward: r = r_positive - r_negative
+        reward = reward_positive - reward_negative
+
+        # Timestep discount to prevent reward hacking at late timesteps
+        # Debug sigma_t before computing discount
+        sigma_t_squeezed = sigma_t.squeeze()
+        exponent = -beta * sigma_t_squeezed
+        exponent = exponent - exponent.max()  # now in (−∞,0]
+        discount = torch.exp(exponent)  # now in (0,1] and always finite
+
+        discount = torch.exp(exponent)
+        discounted_reward = discount * reward
+
+    # Loss: Use reward to weight the prediction loss
+    # Negative reward means we minimize loss (good), positive reward means we maximize loss (bad)
+    if model_pred is not None and target is not None:
+        # MSE loss between prediction and target
+        mse_loss = F.mse_loss(model_pred, target, reduction="none").mean(dim=[1, 2, 3])
+        # Weight by -discounted_reward: high reward -> negative weight -> gradient goes opposite direction
+        loss = mse_loss * (-discounted_reward.detach())
+    else:
+        # Fallback: just use reward directly (though this has no gradients)
+        loss = -discounted_reward
+
+    # Optional: Inversion-based regularization
+    if use_inversion:
+        # Penalize late timesteps (high sigma) to prevent reward hacking
+        late_timestep_mask = (sigma_t.squeeze() > 0.7).float()
+        loss = loss * (1 - 0.5 * late_timestep_mask)
+
+    metrics = {
+        "loss/srpo_reward_positive": reward_positive.mean().item(),
+        "loss/srpo_reward_negative": reward_negative.mean().item(),
+        "loss/srpo_reward_relative": reward.mean().item(),
+        "loss/srpo_reward_discounted": discounted_reward.mean().item(),
+        "loss/srpo_discount_mean": discount.mean().item(),
+        "loss/srpo_sigma_mean": sigma_t.mean().item(),
+        "loss/srpo_final_loss": loss.mean().item(),
+    }
+
+    return loss, metrics
 
 
 def normalize_gradients(model):

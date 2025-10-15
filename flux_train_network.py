@@ -335,17 +335,51 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         accelerator: Accelerator,
         noise_scheduler,
         latents: torch.FloatTensor,
-        batch: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor | dict],
         text_encoder_conds,
         unet,
         network,
         weight_dtype: torch.dtype,
         train_unet: bool,
         is_train=True,
-        timesteps=None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None, torch.Tensor]:
+        timesteps: torch.FloatTensor | None = None,
+    # ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    ):
+        """
+        Generate noise predictions and training targets for FLUX diffusion model training.
+        
+        This function performs the forward diffusion process by adding noise to latents,
+        then uses the model to predict the noise. It supports both standard training and
+        reward-based methods (SRPO) with Direct-Align recovery.
+        
+        Args:
+            args: Training configuration namespace
+            accelerator: HuggingFace Accelerator for distributed training
+            noise_scheduler: Diffusion noise scheduler (FLUX flow matching)
+            latents: Clean input latents [batch_size, channels, height, width]
+            batch: Training batch containing:
+                - captions: Text captions for conditioning
+                - custom_attributes: Optional attributes (e.g., diff_output_preservation)
+            text_encoder_conds: Tuple of (l_pooled, t5_out, txt_ids, t5_attn_mask)
+            unet: The FLUX diffusion transformer model
+            network: LoRA or other parameter-efficient fine-tuning network
+            weight_dtype: Data type for mixed precision training
+            train_unet: Whether the UNet is in training mode
+            is_train: Whether this is a training step (vs. validation)
+            timesteps: Optional pre-defined timesteps for sampling
+        
+        Returns:
+            tuple containing:
+                - model_pred (FloatTensor): Model's velocity prediction [B, C, H, W]
+                - noisy_model_input (FloatTensor): Noisy latents at timestep t [B, C, H, W]
+                - target (FloatTensor): Training target (noise - latents for flow matching) [B, C, H, W]
+                - sigmas (Tensor): Noise levels for each sample [B]
+                - timesteps (Tensor): Sampled timesteps [B]
+                - weighting (Tensor | None): Loss weighting factors [B]
+                - noise (Tensor): Original sampled noise [B, C, H, W]
+        """
         # Sample noise that we'll add to the latents
-        noise = torch.randn_like(latents)
+        noise: torch.FloatTensor = torch.randn_like(latents)
         bsz = latents.shape[0]
 
         # Get CDC parameters if enabled
@@ -358,6 +392,21 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
             gamma_b_dataset=gamma_b_dataset, image_keys=image_keys
         )
+        # SRPO: Store the predefined noise before any transformations
+        if self.po.is_reward_based():
+            epsilon_gt = noise.clone()  # Store the ground truth noise
+        else:
+            epsilon_gt = None
+
+        # For SRPO, extract alpha_t and sigma_t from the sigmas
+        if self.po.is_reward_based():
+            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
+            # So: alpha_t = (1 - σ), sigma_t = σ
+            alpha_t = 1.0 - sigmas  # Weight on clean latents
+            sigma_t = sigmas        # Weight on noise
+        else:
+            alpha_t = None
+            sigma_t = None
 
         if timesteps is None:
             timesteps = rand_timesteps
@@ -458,7 +507,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
 
         # flow matching loss: this is different from SD3
-        target = noise - latents
+        target: torch.FloatTensor = noise - latents
 
         # differential output preservation
         if "custom_attributes" in batch:
@@ -494,6 +543,37 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     sigmas[diff_output_pr_indices] if sigmas is not None else None,
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
+
+        if self.po.is_reward_based() and epsilon_gt is not None:
+            # Extract schedule parameters from sigmas
+            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
+            alpha_t = 1.0 - sigmas  # Weight on clean latents (1 - σ)
+            sigma_t = sigmas        # Weight on noise (σ)
+            
+            # Get delta_sigma from args (default 0.025)
+            delta_sigma = getattr(args, 'srpo_delta_sigma', 0.025)
+            
+            # Direct-Align: Single-step recovery for FLUX flow matching
+            # x_0 = (x_t - Δσ * v_θ - (σ - Δσ) * ε_gt) / (1 - σ)
+            with torch.no_grad():
+                latents_recovered = (
+                    noisy_model_input
+                    - delta_sigma * model_pred  # Δσ * velocity prediction
+                    - (sigma_t - delta_sigma) * epsilon_gt  # (σ - Δσ) * predefined noise
+                ) / alpha_t
+                
+                # Clamp to reasonable range to prevent extreme values
+                latents_recovered = torch.clamp(latents_recovered, -10, 10)
+            
+            # Store in batch for SRPO loss function
+            batch["srpo_inputs"] = {
+                "latents_recovered": latents_recovered,
+                "timesteps": timesteps,
+                "sigma_t": sigma_t,
+                "captions": batch["captions"],
+                "model_pred": model_pred,
+                "target": target,
+            }
 
         return model_pred, noisy_model_input, target, sigmas, timesteps, weighting, noise
 

@@ -318,7 +318,10 @@ class NetworkTrainer:
         train_unet: bool,
         is_train=True,
         timesteps=None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None, torch.Tensor]:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        """
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise
+        """
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, rand_timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
@@ -591,39 +594,65 @@ class NetworkTrainer:
             loss = apply_masked_loss(loss, batch)
 
         if self.po.is_po():
-            if self.po.is_reference():
-                accelerator.unwrap_model(network).set_multiplier(0.0)
-                ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, ref_weighting, ref_noise = (
-                    self.get_noise_pred_and_target(
-                        args,
-                        accelerator,
-                        noise_scheduler,
-                        latents,
-                        batch,
-                        text_encoder_conds,
-                        unet,
-                        network,
-                        weight_dtype,
-                        train_unet,
-                        is_train=False,
-                        timesteps=timesteps,
-                    )
-                )
-
-                # reset network multipliers
-                accelerator.unwrap_model(network).set_multiplier(1.0)
-
-                ref_loss = train_util.conditional_loss(ref_noise_pred.float(), ref_target.float(), args.loss_type, "none", huber_c)
-
-                if weighting is not None:
-                    ref_loss = ref_loss * weighting
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    ref_loss = apply_masked_loss(ref_loss, batch)
-                loss, metrics_po = self.po(loss, ref_loss)
+            if self.po.is_reward_based():
+                # SRPO: Reward-based optimization
+                
+                # Need to decode to pixels for CLIP reward
+                # Move VAE to device temporarily
+                vae_device = vae.device
+                if vae_device != accelerator.device:
+                    vae.to(accelerator.device)
+                
+                # Prepare reward inputs
+                reward_inputs = {
+                    "vae": vae,
+                    "captions": batch["captions"],
+                    "reward_model": self.clip_reward_model,  # Initialize in __init__
+                    **batch['srpo_inputs']
+                }
+                
+                # SRPO loss
+                loss, metrics_po = self.po(noise_pred, reward_inputs=reward_inputs)
+                
+                # Move VAE back if needed
+                if vae_device != accelerator.device:
+                    vae.to(vae_device)
+                
+                metrics.update(metrics_po)
             else:
-                loss, metrics_po = self.po(loss)
+                if self.po.is_reference():
+                    accelerator.unwrap_model(network).set_multiplier(0.0)
+                    ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, ref_weighting = (
+                        self.get_noise_pred_and_target(
+                            args,
+                            accelerator,
+                            noise_scheduler,
+                            latents,
+                            batch,
+                            text_encoder_conds,
+                            unet,
+                            network,
+                            weight_dtype,
+                            train_unet,
+                            is_train=False,
+                            timesteps=timesteps,
+                        )
+                    )
 
-            metrics.update(metrics_po)
+                    # reset network multipliers
+                    accelerator.unwrap_model(network).set_multiplier(1.0)
+
+                    ref_loss = train_util.conditional_loss(ref_noise_pred.float(), ref_target.float(), args.loss_type, "none", huber_c)
+
+                    if weighting is not None:
+                        ref_loss = ref_loss * weighting
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        ref_loss = apply_masked_loss(ref_loss, batch)
+                    loss, metrics_po = self.po(loss, ref_loss)
+                else:
+                    loss, metrics_po = self.po(loss)
+
+                metrics.update(metrics_po)
         else:
             loss = loss.mean([1, 2, 3])
 
@@ -1281,6 +1310,12 @@ class NetworkTrainer:
             "ss_ddo_beta": args.ddo_beta,
             "ss_ddo_alpha": args.ddo_alpha,
             "ss_dpo_beta": args.beta_dpo,
+            "ss_srpo_beta": args.srpo_beta,
+            "ss_srpo_positive_prompt": args.srpo_positive_prompt,
+            "ss_srpo_negative_prompt": args.srpo_negative_prompt,
+            "ss_srpo_use_inversion":   args.srpo_use_inversion,
+            "ss_srpo_reward_model":    args.srpo_reward_model,
+            "ss_srpo_delta_sigma":     args.srpo_delta_sigma,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1532,6 +1567,17 @@ class NetworkTrainer:
 
         if self.po.is_po():
             logger.info(f"Preference optimization activated: {self.po.algo}")
+
+        # Initialize reward model for reward-based PO methods (e.g., SRPO)
+        if self.po.is_reward_based():
+            reward_model_name = getattr(args, 'srpo_reward_model', 'clip')
+            logger.info(f"Initializing reward model: {reward_model_name} (will be kept on CPU until needed)")
+            self.clip_reward_model = self._init_clip_reward_model(reward_model_name)
+            # Keep on CPU initially - will be moved to GPU when computing rewards
+            self.clip_reward_model.to("cpu")
+            self.clip_reward_model.accelerator = accelerator
+        else:
+            self.clip_reward_model = None
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1998,6 +2044,77 @@ class NetworkTrainer:
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
             logger.info("model saved.")
+
+    def _init_clip_reward_model(self, model_name: str):
+        """Initialize CLIP-based reward model"""
+        from transformers import CLIPModel, CLIPProcessor
+        import torch.nn.functional as F
+        
+        class CLIPRewardModel:
+            def __init__(self, model_name_or_path="openai/clip-vit-large-patch14"):
+                self.model = CLIPModel.from_pretrained(model_name_or_path)
+                self.processor = CLIPProcessor.from_pretrained(model_name_or_path)
+                self.model.eval()
+                self.accelerator = None  # Will be set after initialization
+
+            def to(self, device):
+                """Move model to device"""
+                self.model.to(device)
+                return self
+
+            def __call__(self, images, prompts):
+                """
+                Args:
+                    images: [B, 3, H, W] tensor in [0, 1]
+                    prompts: List of strings
+                Returns:
+                    rewards: [B] similarity scores
+                """
+                # Move to compute device if currently on CPU
+                original_device = next(self.model.parameters()).device
+                should_offload = original_device.type == "cpu"
+
+                if should_offload and self.accelerator is not None:
+                    self.model.to(self.accelerator.device)
+
+                inputs = self.processor(
+                    text=prompts,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,  # Truncate to leave room for start/end tokens
+                    max_length=75,  # 77 total - 2 special tokens = 75 content tokens
+                    do_rescale=False  # Images already in [0,1] range
+                ).to(self.model.device)
+
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+
+                # Cosine similarity as reward
+                image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+                text_embeds = F.normalize(outputs.text_embeds, dim=-1)
+
+                similarity = (image_embeds * text_embeds).sum(dim=-1)
+
+                # Offload back to CPU after computation
+                if should_offload:
+                    self.model.to("cpu")
+                    # Clear CUDA cache to free memory
+                    torch.cuda.empty_cache()
+
+                return similarity
+        
+        # You can swap this out for HPSv2, PickScore, etc.
+        if model_name == "clip":
+            return CLIPRewardModel("openai/clip-vit-large-patch14")
+        elif model_name == "hpsv2":
+            # TODO: Implement HPSv2 wrapper
+            raise NotImplementedError("HPSv2 not yet implemented")
+        elif model_name == "pickscore":
+            # TODO: Implement PickScore wrapper
+            raise NotImplementedError("PickScore not yet implemented")
+        else:
+            raise ValueError(f"Unknown reward model: {model_name}")
 
 def parse_dict(input_str):
     """Convert string input into a dictionary."""
