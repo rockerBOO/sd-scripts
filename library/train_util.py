@@ -76,6 +76,8 @@ import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging, resize_image, validate_interpolation_fn
 
+import pillow_avif
+
 setup_logging()
 import logging
 
@@ -101,7 +103,7 @@ STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
 
 # region dataset
 
-IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP", ".avif", ".AVIF"]
 
 try:
     import pillow_avif
