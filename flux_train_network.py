@@ -340,7 +340,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         accelerator: Accelerator,
         noise_scheduler,
         latents: torch.FloatTensor,
-        batch: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor | dict],
         text_encoder_conds,
         unet,
         network,
@@ -353,10 +353,27 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
-        # get noisy model input and timesteps
-        noisy_model_input, rand_timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timestep(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+        # SRPO: Store the predefined noise before any transformations
+        if self.po.is_reward_based():
+            epsilon_gt = noise.clone()  # Store the ground truth noise (key SRPO innovation!)
+        else:
+            epsilon_gt = None
+    
+
+        # Get noisy model input and timesteps
+        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
         )
+
+        # For SRPO, extract alpha_t and sigma_t from the sigmas
+        if self.po.is_reward_based():
+            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
+            # So: alpha_t = (1 - σ), sigma_t = σ
+            alpha_t = 1.0 - sigmas  # Weight on clean latents
+            sigma_t = sigmas        # Weight on noise
+        else:
+            alpha_t = None
+            sigma_t = None
 
         if timesteps is None:
             timesteps = rand_timesteps
@@ -456,7 +473,39 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        return model_pred, noisy_model_input, target, sigmas, timesteps, weighting
+        # ============================================
+        # SRPO: Perform Direct-Align recovery HERE
+        # ============================================
+        if self.po.is_reward_based():
+            # Extract schedule parameters from sigmas
+            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
+            alpha_t = 1.0 - sigmas  # Weight on clean latents (1 - σ)
+            sigma_t = sigmas        # Weight on noise (σ)
+            
+            # Get delta_sigma from args (default 0.025)
+            delta_sigma = getattr(args, 'srpo_delta_sigma', 0.025)
+            
+            # Direct-Align: Single-step recovery for FLUX flow matching
+            # x_0 = (x_t - Δσ * v_θ - (σ - Δσ) * ε_gt) / (1 - σ)
+            with torch.no_grad():
+                latents_recovered = (
+                    noisy_model_input 
+                    - delta_sigma * sigma_t * model_pred  # Δσ * velocity prediction
+                    - (sigma_t - delta_sigma) * epsilon_gt  # (σ - Δσ) * predefined noise
+                ) / alpha_t
+                
+                # Clamp to reasonable range to prevent extreme values
+                latents_recovered = torch.clamp(latents_recovered, -10, 10)
+            
+            # Store in batch for SRPO loss function
+            batch["srpo_inputs"] = {
+                "latents_recovered": latents_recovered,  # Already recovered! Just decode.
+                "timesteps": timesteps,
+                "sigma_t": sigma_t,
+                "captions": batch["captions"],
+            }
+
+        return model_pred, noisy_model_input, target, sigmas, timesteps, weighting, noise
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
         return loss
