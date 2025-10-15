@@ -265,9 +265,9 @@ class NetworkTrainer:
         train_unet: bool,
         is_train=True,
         timesteps=None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.IntTensor, torch.Tensor | None]:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         """
-        noise_pred, noisy_latents, target, sigmas, timesteps, None
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise
         """
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
@@ -454,7 +454,7 @@ class NetworkTrainer:
 
         # sample noise, call unet, get target
 
-        noise_pred, noisy_latents, target, sigmas, timesteps, weighting = self.get_noise_pred_and_target(
+        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, _ = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
@@ -489,14 +489,10 @@ class NetworkTrainer:
                 
                 # Prepare reward inputs
                 reward_inputs = {
-                    "noisy_latents": batch["srpo_inputs"]["noisy_latents"],
-                    "epsilon_gt": batch["srpo_inputs"]["epsilon_gt"],
-                    "timesteps": batch["srpo_inputs"]["timesteps"],
-                    "alpha_t": batch["srpo_inputs"]["alpha_t"],
-                    "sigma_t": batch["srpo_inputs"]["sigma_t"],
                     "vae": vae,
                     "captions": batch["captions"],
                     "reward_model": self.clip_reward_model,  # Initialize in __init__
+                    **batch['srpo_inputs']
                 }
                 
                 # SRPO loss
@@ -1144,6 +1140,12 @@ class NetworkTrainer:
             "ss_ddo_beta": args.ddo_beta,
             "ss_ddo_alpha": args.ddo_alpha,
             "ss_dpo_beta": args.beta_dpo,
+            "ss_srpo_beta": args.srpo_beta,
+            "ss_srpo_positive_prompt": args.srpo_positive_prompt,
+            "ss_srpo_negative_prompt": args.srpo_negative_prompt,
+            "ss_srpo_use_inversion":   args.srpo_use_inversion,
+            "ss_srpo_reward_model":    args.srpo_reward_model,
+            "ss_srpo_delta_sigma":     args.srpo_delta_sigma,
         }
 
         self.update_metadata(metadata, args)  # architecture specific metadata
@@ -1368,6 +1370,17 @@ class NetworkTrainer:
 
         if self.po.is_po():
             logger.info(f"Preference optimization activated: {self.po.algo}")
+
+        # Initialize reward model for reward-based PO methods (e.g., SRPO)
+        if self.po.is_reward_based():
+            reward_model_name = getattr(args, 'srpo_reward_model', 'clip')
+            logger.info(f"Initializing reward model: {reward_model_name} (will be kept on CPU until needed)")
+            self.clip_reward_model = self._init_clip_reward_model(reward_model_name)
+            # Keep on CPU initially - will be moved to GPU when computing rewards
+            self.clip_reward_model.to("cpu")
+            self.clip_reward_model.accelerator = accelerator
+        else:
+            self.clip_reward_model = None
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1828,11 +1841,13 @@ class NetworkTrainer:
                 self.model = CLIPModel.from_pretrained(model_name_or_path)
                 self.processor = CLIPProcessor.from_pretrained(model_name_or_path)
                 self.model.eval()
-            
+                self.accelerator = None  # Will be set after initialization
+
             def to(self, device):
+                """Move model to device"""
                 self.model.to(device)
                 return self
-            
+
             def __call__(self, images, prompts):
                 """
                 Args:
@@ -1841,21 +1856,38 @@ class NetworkTrainer:
                 Returns:
                     rewards: [B] similarity scores
                 """
+                # Move to compute device if currently on CPU
+                original_device = next(self.model.parameters()).device
+                should_offload = original_device.type == "cpu"
+
+                if should_offload and self.accelerator is not None:
+                    self.model.to(self.accelerator.device)
+
                 inputs = self.processor(
                     text=prompts,
                     images=images,
                     return_tensors="pt",
-                    padding=True
+                    padding=True,
+                    truncation=True,  # Truncate to leave room for start/end tokens
+                    max_length=75,  # 77 total - 2 special tokens = 75 content tokens
+                    do_rescale=False  # Images already in [0,1] range
                 ).to(self.model.device)
-                
+
                 with torch.no_grad():
                     outputs = self.model(**inputs)
-                
+
                 # Cosine similarity as reward
                 image_embeds = F.normalize(outputs.image_embeds, dim=-1)
                 text_embeds = F.normalize(outputs.text_embeds, dim=-1)
-                
+
                 similarity = (image_embeds * text_embeds).sum(dim=-1)
+
+                # Offload back to CPU after computation
+                if should_offload:
+                    self.model.to("cpu")
+                    # Clear CUDA cache to free memory
+                    torch.cuda.empty_cache()
+
                 return similarity
         
         # You can swap this out for HPSv2, PickScore, etc.

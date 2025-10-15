@@ -3,8 +3,25 @@ Integration tests for SRPO with training pipeline
 """
 import pytest
 import torch
-from unittest.mock import Mock, MagicMock, patch
+import torch.nn as nn
+from unittest.mock import Mock 
 from library.custom_train_functions import PreferenceOptimization, srpo_loss
+
+@pytest.fixture
+def mock_vae():
+    """Mock VAE decoder that behaves like a real one to dtype queries."""
+    vae = Mock()
+    vae.scaling_factor = 0.3611
+
+    dummy = nn.Parameter(torch.empty(1, dtype=torch.float32))
+    vae.parameters = lambda: iter([dummy])
+
+    def decode_fn(latents):
+        # return a tensor-like object (not a Mock) so .clamp, .to etc work
+        return torch.randn(latents.shape[0], 3, 512, 512)
+
+    vae.decode = Mock(side_effect=decode_fn)
+    return vae
 
 
 class TestSRPOPreferenceOptimizationIntegration:
@@ -41,7 +58,7 @@ class TestSRPOPreferenceOptimizationIntegration:
         assert po.args["beta"] == 2.5
         assert po.args["positive_prompt"] == "High quality photo"
         assert po.args["negative_prompt"] == "Low quality render"
-        assert po.args["use_inversion"] == False
+        assert po.args["use_inversion"] is False
     
     def test_is_po_returns_true(self, srpo_args):
         """Test that is_po() returns True for SRPO"""
@@ -58,14 +75,9 @@ class TestSRPOPreferenceOptimizationIntegration:
         po = PreferenceOptimization(srpo_args)
         assert po.is_reference() is False
     
-    def test_call_with_reward_inputs(self, srpo_args):
+    def test_call_with_reward_inputs(self, srpo_args, mock_vae):
         """Test calling PreferenceOptimization with reward_inputs"""
         po = PreferenceOptimization(srpo_args)
-        
-        # Mock reward inputs
-        mock_vae = Mock()
-        mock_vae.scaling_factor = 0.3611
-        mock_vae.decode = Mock(return_value=Mock(sample=torch.randn(2, 3, 512, 512)))
         
         mock_reward_model = Mock(return_value=torch.randn(2))
         

@@ -1,6 +1,7 @@
 """
 Tests for SRPO (Semantic Relative Preference Optimization) loss function
 """
+import torch.nn as nn
 import pytest
 import torch
 from unittest.mock import Mock
@@ -9,16 +10,17 @@ from library.custom_train_functions import srpo_loss
 
 @pytest.fixture
 def mock_vae():
-    """Mock VAE decoder"""
+    """Mock VAE decoder that behaves like a real one to dtype queries."""
     vae = Mock()
     vae.scaling_factor = 0.3611
-    
+
+    dummy = nn.Parameter(torch.empty(1, dtype=torch.float32))
+    vae.parameters = lambda: iter([dummy])
+
     def decode_fn(latents):
-        # Simulate VAE decode: return images with same spatial dims
-        result = Mock()
-        result.sample = torch.randn(latents.shape[0], 3, 512, 512)
-        return result
-    
+        # return a tensor-like object (not a Mock) so .clamp, .to etc work
+        return torch.randn(latents.shape[0], 3, 512, 512)
+
     vae.decode = Mock(side_effect=decode_fn)
     return vae
 
@@ -231,46 +233,45 @@ class TestSRPOTimestepDiscount:
         # With higher beta, discount should be more aggressive
         assert metrics_high["loss/srpo_discount_mean"] < metrics_low["loss/srpo_discount_mean"]
     
-    def test_high_sigma_reduces_discount(self, mock_vae, mock_clip_reward_model):
-        """Test that high sigma (late timesteps) reduces discount"""
-        # High sigma case
-        high_sigma_inputs = {
+    def test_beta_and_sigma_reduce_discount(self, mock_vae, mock_clip_reward_model):
+        """
+        Discount must decrease when either σ OR β increases.
+        We test both effects in one go:
+          1. same σ, different β  →  larger β gives smaller discount
+          2. same β, different σ  →  larger σ gives smaller discount
+        """
+        base_inputs = {
             "latents_recovered": torch.randn(4, 16, 64, 64),
-            "sigma_t": torch.ones(4, 1, 1, 1) * 0.9,  # High sigma
             "captions": ["test"] * 4,
             "vae": mock_vae,
             "reward_model": mock_clip_reward_model,
         }
-        
-        # Low sigma case
-        low_sigma_inputs = {
-            "latents_recovered": torch.randn(4, 16, 64, 64),
-            "sigma_t": torch.ones(4, 1, 1, 1) * 0.1,  # Low sigma
-            "captions": ["test"] * 4,
-            "vae": mock_vae,
-            "reward_model": mock_clip_reward_model,
-        }
-        
-        loss_high, metrics_high = srpo_loss(reward_inputs=high_sigma_inputs, beta=3.0)
-        loss_low, metrics_low = srpo_loss(reward_inputs=low_sigma_inputs, beta=3.0)
-        
-        # High sigma should have lower discount
+
+        inputs = {**base_inputs, "sigma_t": torch.tensor([0.45, 0.50, 0.52, 0.48]).view(4, 1, 1, 1)}
+        _, metrics_weak = srpo_loss(reward_inputs=inputs, beta=0.5)
+        _, metrics_strong = srpo_loss(reward_inputs=inputs, beta=5.0)
+        assert metrics_strong["loss/srpo_discount_mean"] < metrics_weak["loss/srpo_discount_mean"]
+
+        high_sigma_inputs = {**base_inputs, "sigma_t": torch.tensor([0.84, 0.88, 0.92, 0.95]).view(4, 1, 1, 1)}
+        low_sigma_inputs = {**base_inputs, "sigma_t": torch.tensor([0.05, 0.10, 0.08, 0.12]).view(4, 1, 1, 1)}
+        _, metrics_high = srpo_loss(reward_inputs=high_sigma_inputs, beta=3.0)
+        _, metrics_low = srpo_loss(reward_inputs=low_sigma_inputs, beta=3.0)
         assert metrics_high["loss/srpo_discount_mean"] < metrics_low["loss/srpo_discount_mean"]
-    
-    def test_discount_formula(self, basic_reward_inputs):
-        """Test that discount follows exp(-beta * sigma) formula"""
-        beta = 2.5
-        sigma_t = basic_reward_inputs["sigma_t"]
-        
-        loss, metrics = srpo_loss(
-            reward_inputs=basic_reward_inputs,
-            beta=beta,
-        )
-        
-        # Manually compute expected discount
-        expected_discount = torch.exp(-beta * sigma_t.squeeze()).mean().item()
-        
-        assert abs(metrics["loss/srpo_discount_mean"] - expected_discount) < 1e-5
+
+        def test_discount_formula(self, basic_reward_inputs):
+            """Test that discount follows exp(-beta * sigma) formula"""
+            beta = 2.5
+            sigma_t = basic_reward_inputs["sigma_t"]
+            
+            loss, metrics = srpo_loss(
+                reward_inputs=basic_reward_inputs,
+                beta=beta,
+            )
+            
+            # Manually compute expected discount
+            expected_discount = torch.exp(-beta * sigma_t.squeeze()).mean().item()
+            
+            assert abs(metrics["loss/srpo_discount_mean"] - expected_discount) < 1e-5
 
 
 class TestSRPOInversionRegularization:
@@ -558,10 +559,8 @@ class TestSRPOImageNormalization:
         """Test that extreme values are clamped"""
         # Mock VAE to return extreme values
         def extreme_decode(latents):
-            result = Mock()
             # Return values outside [-1, 1] before normalization
-            result.sample = torch.randn(latents.shape[0], 3, 512, 512) * 5
-            return result
+            return torch.randn(latents.shape[0], 3, 512, 512) * 5
         
         basic_reward_inputs["vae"].decode = Mock(side_effect=extreme_decode)
         
