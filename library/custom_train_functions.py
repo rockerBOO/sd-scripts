@@ -1054,14 +1054,10 @@ def srpo_loss(
     positive_prompt: str = "Realistic photo",
     negative_prompt: str = "CG Render",
     use_inversion: bool = False,
-    **kwargs,  # Catch unused args from PreferenceOptimization
+    vae_batch_size: int = 1,    
+    **kwargs,
 ) -> tuple[torch.Tensor, dict[str, int | float]]:
     """
-    SRPO loss for FLUX (Flow Matching)
-
-    This version receives already-recovered latents from Direct-Align,
-    so it only needs to decode and compute rewards.
-
     Args:
         reward_inputs: Dictionary containing:
             - latents_recovered: Clean latents from Direct-Align recovery
@@ -1086,6 +1082,10 @@ def srpo_loss(
     target = reward_inputs.get("target")
     model_pred = reward_inputs.get("model_pred")
 
+    # Validate srpo_reward_vae_batch_size
+    if vae_batch_size < 1:
+        raise ValueError("srpo_reward_vae_batch_size must be positive")
+
     # Decode latents to pixels for CLIP reward
     with torch.no_grad():
         # FLUX uses 0.3611 scale factor (different from SD's 0.18215)
@@ -1095,12 +1095,13 @@ def srpo_loss(
         vae_dtype = next(vae.parameters()).dtype
         latents_recovered = latents_recovered.to(dtype=vae_dtype)
 
-        # Decode in smaller batches if needed to save memory
+        # Decode in batches to save VRAM during training
+        # Note: This is separate from vae_batch_size used during pre-processing
         batch_size = latents_recovered.shape[0]
-        if batch_size > 4:
+        if batch_size > vae_batch_size:
             images_list = []
-            for i in range(0, batch_size, 4):
-                batch_latents = latents_recovered[i : i + 4]
+            for i in range(0, batch_size, vae_batch_size):
+                batch_latents = latents_recovered[i : i + vae_batch_size]
                 batch_images = vae.decode(batch_latents / vae_scale_factor)
                 images_list.append(batch_images)
             images_recovered = torch.cat(images_list, dim=0)
@@ -1129,8 +1130,6 @@ def srpo_loss(
         exponent = -beta * sigma_t_squeezed
         exponent = exponent - exponent.max()  # now in (−∞,0]
         discount = torch.exp(exponent)  # now in (0,1] and always finite
-
-        discount = torch.exp(exponent)
         discounted_reward = discount * reward
 
     # Loss: Use reward to weight the prediction loss

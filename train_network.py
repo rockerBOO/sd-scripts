@@ -17,6 +17,7 @@ from tqdm import tqdm
 import torch
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.reward_model import CLIPRewardModel
 
 init_ipex()
 
@@ -1352,10 +1353,8 @@ class NetworkTrainer:
         # Initialize reward model for reward-based PO methods (e.g., SRPO)
         if self.po.is_reward_based():
             reward_model_name = getattr(args, 'srpo_reward_model', 'clip')
-            logger.info(f"Initializing reward model: {reward_model_name} (will be kept on CPU until needed)")
-            self.clip_reward_model = self._init_clip_reward_model(reward_model_name)
-            # Keep on CPU initially - will be moved to GPU when computing rewards
-            self.clip_reward_model.to("cpu")
+            logger.info(f"Initializing reward model: {reward_model_name} (on CPU)")
+            self.clip_reward_model = self._init_reward_model(reward_model_name)
             self.clip_reward_model.accelerator = accelerator
         else:
             self.clip_reward_model = None
@@ -1805,65 +1804,12 @@ class NetworkTrainer:
 
             logger.info("model saved.")
 
-    def _init_clip_reward_model(self, model_name: str):
-        """Initialize CLIP-based reward model"""
-        from transformers import CLIPModel, CLIPProcessor
-        import torch.nn.functional as F
-        
-        class CLIPRewardModel:
-            def __init__(self, model_name_or_path="openai/clip-vit-large-patch14"):
-                self.model = CLIPModel.from_pretrained(model_name_or_path)
-                self.processor = CLIPProcessor.from_pretrained(model_name_or_path)
-                self.model.eval()
-                self.accelerator = None  # Will be set after initialization
+    def _init_reward_model(self, model_name: str):
+        """Initialize reward model with configurable precision
 
-            def to(self, device):
-                """Move model to device"""
-                self.model.to(device)
-                return self
-
-            def __call__(self, images, prompts):
-                """
-                Args:
-                    images: [B, 3, H, W] tensor in [0, 1]
-                    prompts: List of strings
-                Returns:
-                    rewards: [B] similarity scores
-                """
-                # Move to compute device if currently on CPU
-                original_device = next(self.model.parameters()).device
-                should_offload = original_device.type == "cpu"
-
-                if should_offload and self.accelerator is not None:
-                    self.model.to(self.accelerator.device)
-
-                inputs = self.processor(
-                    text=prompts,
-                    images=images,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,  # Truncate to leave room for start/end tokens
-                    max_length=75,  # 77 total - 2 special tokens = 75 content tokens
-                    do_rescale=False  # Images already in [0,1] range
-                ).to(self.model.device)
-
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
-
-                # Cosine similarity as reward
-                image_embeds = F.normalize(outputs.image_embeds, dim=-1)
-                text_embeds = F.normalize(outputs.text_embeds, dim=-1)
-
-                similarity = (image_embeds * text_embeds).sum(dim=-1)
-
-                # Offload back to CPU after computation
-                if should_offload:
-                    self.model.to("cpu")
-                    # Clear CUDA cache to free memory
-                    torch.cuda.empty_cache()
-
-                return similarity
-        
+        Args:
+            model_name: Name of reward model (e.g., "clip", "hpsv2")
+        """
         # You can swap this out for HPSv2, PickScore, etc.
         if model_name == "clip":
             return CLIPRewardModel("openai/clip-vit-large-patch14")
