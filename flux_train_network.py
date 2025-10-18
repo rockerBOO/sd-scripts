@@ -383,14 +383,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         bsz = latents.shape[0]
 
         # Get CDC parameters if enabled
-        gamma_b_dataset = self.gamma_b_dataset if (self.gamma_b_dataset is not None and "image_keys" in batch) else None
-        image_keys = batch.get("image_keys") if gamma_b_dataset is not None else None
+        gamma_b_dataset = self.gamma_b_dataset if (self.gamma_b_dataset is not None and "latents_npz" in batch) else None
+        latents_npz_paths = batch.get("latents_npz") if gamma_b_dataset is not None else None
 
         # Get noisy model input and timesteps
         # If CDC is enabled, this will transform the noise with geometry-aware covariance
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
-            gamma_b_dataset=gamma_b_dataset, image_keys=image_keys
+            gamma_b_dataset=gamma_b_dataset, latents_npz_paths=latents_npz_paths
         )
         # SRPO: Store the predefined noise before any transformations
         if self.po.is_reward_based():
