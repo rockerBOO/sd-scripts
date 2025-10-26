@@ -5662,7 +5662,7 @@ def prepare_accelerator(args: argparse.Namespace):
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=args.srpo_num_pairs or args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=log_with,
         project_dir=logging_dir,
@@ -5733,6 +5733,7 @@ def _load_target_model(args: argparse.Namespace, weight_dtype, device="cpu", une
     # VAEを読み込む
     if args.vae is not None:
         vae = model_util.load_vae(args.vae, weight_dtype)
+        vae = vae.eval()
         logger.info("additional VAE loaded")
 
     return text_encoder, vae, unet, load_stable_diffusion_format
@@ -6238,8 +6239,23 @@ def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: tor
 
 
 def get_noise_noisy_latents_and_timesteps(
-    args, noise_scheduler, latents: torch.FloatTensor
+    args, noise_scheduler, latents: torch.FloatTensor,
+    timestep_pair: tuple[int, int, int] | None = None,
+    is_inversion: bool | None = None,
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
+    """
+    Sample noise and create noisy latents.
+    
+    Args:
+        args: Training arguments
+        noise_scheduler: The noise scheduler
+        latents: Clean latents
+        timestep_pair: Optional (t_base, t_start, k) for SRPO
+        is_inversion: Optional bool for SRPO branch selection
+        
+    Returns:
+        (noise, noisy_latents, timesteps)
+    """
     # Sample noise that we'll add to the latents
     noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
@@ -6256,10 +6272,27 @@ def get_noise_noisy_latents_and_timesteps(
     # Sample a random timestep for each image
     b_size = latents.shape[0]
 
-    min_timestep = 0 if args.min_timestep is None else args.min_timestep
-    max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+    # ==== SRPO MODE: Use provided timestep pair ====
+    if timestep_pair is not None and is_inversion is not None:
+        t_base, t_start, k = timestep_pair
+        
+        # Select which timestep to use based on branch
+        if is_inversion:
+            # Inversion: start from t_base (lower noise)
+            timestep_index = t_base
+        else:
+            # Denoise: start from t_start (higher noise)
+            timestep_index = t_start
+        
+        # Create timesteps tensor (same timestep for whole batch)
+        timesteps = torch.full((b_size,), timestep_index, device=latents.device, dtype=torch.long)
+    
+    # ==== NORMAL MODE: Random timestep sampling ====
+    else:
+        min_timestep = 0 if args.min_timestep is None else args.min_timestep
+        max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
+        timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+    
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)

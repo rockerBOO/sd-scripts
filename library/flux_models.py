@@ -354,8 +354,26 @@ class AutoEncoder(nn.Module):
         z = z / self.scale_factor + self.shift_factor
         return self.decoder(z)
 
+    # def forward(self, x: Tensor) -> Tensor:
+    #     return self.decode(self.encode(x))
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        self.use_gradient_checkpointing = True
+    
     def forward(self, x: Tensor) -> Tensor:
-        return self.decode(self.encode(x))
+        # Wrap decoder in gradient checkpoint if enabled
+        if hasattr(self, 'use_gradient_checkpointing') and self.use_gradient_checkpointing:
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            return torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.decoder),
+                x,
+                use_reentrant=False
+            )
+        else:
+            return self.decoder(self.encode(x))
 
 
 # endregion

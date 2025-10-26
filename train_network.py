@@ -8,7 +8,9 @@ import sys
 import random
 import time
 import json
+import contextlib
 from multiprocessing import Value
+from accelerate.accelerator import AcceleratedOptimizer
 import numpy as np
 import toml
 
@@ -17,7 +19,9 @@ from tqdm import tqdm
 import torch
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
-from library.reward_model import CLIPRewardModel
+import library.sai_model_spec as sai_model_spec
+from library.reward_model import CLIPRewardModel, HPSRewardModel
+from library.longclip.reward_model import LongCLIPRewardModel
 
 init_ipex()
 
@@ -262,6 +266,8 @@ class NetworkTrainer:
         train_unet: bool,
         is_train=True,
         timesteps=None,
+        timestep_index: int | None = None
+
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         """
         noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise
@@ -365,6 +371,62 @@ class NetworkTrainer:
 
     # endregion
 
+    def _sample_srpo_timestep_pair(self, args, noise_scheduler):
+        """
+        Sample sigma schedule and timestep_select for SRPO training.
+
+        Reference logic (SRPO_reference.py lines 520-542):
+        - timestep_select = mid_timestep (sampled once, fixed for both branches)
+        - Each branch calculates its own mid_timestep from timestep_select:
+          * Inversion: mid_timestep = timestep_select (unchanged)
+          * Denoise: mid_timestep = max(timestep_select - k, 1) (shifted back)
+        - Both branches then calculate t_base and t_start from their mid_timestep
+        - Branches train in opposite directions but converge to the same target
+
+        Returns:
+            tuple: (timestep_select, k, srpo_sigma_schedule) where:
+                - timestep_select: The selected midpoint (0-99) - fixed for both branches
+                - k: Number of steps between positions
+                - srpo_sigma_schedule: The sigma schedule (length 100)
+        """
+        # Use SRPO-specific timestep_length for discount indexing
+        timestep_length = getattr(args, 'srpo_timestep_length', 100)
+        groundtruth_ratio = getattr(args, 'groundtruth_ratio', 0.9)
+
+        # Sample random mid-point - this is timestep_select in the reference
+        timestep_select = random.randint(5, timestep_length - 6)
+
+        # Calculate k (number of steps)
+        k = int((1 - groundtruth_ratio) * timestep_length) + 1
+        k = min(min(timestep_length - timestep_select, k), timestep_select)
+
+        # Create sigma schedule spanning the training range
+        from library import flux_train_utils
+
+        # Generate full sigma schedule
+        full_schedule = flux_train_utils.generate_sigma_schedule(
+            sampling_method=getattr(args, 'timestep_sampling', 'sigma'),
+            num_steps=getattr(args, 'timestep_length', 1000),
+            device='cpu',
+            args=args,
+            h=64,  # dummy value
+            w=64,  # dummy value
+        )
+
+        # Get training range (like reference SRPO: train_timestep=[5, 25])
+        num_timesteps_full = len(full_schedule)
+        reference_schedule_length = 51  # Reference uses vis_sampling_step=50
+        train_timestep_indices = getattr(args, 'srpo_train_timestep', [5, 25])
+        srpo_train_start = int(train_timestep_indices[0] * (num_timesteps_full / reference_schedule_length))
+        srpo_train_end = int(train_timestep_indices[1] * (num_timesteps_full / reference_schedule_length))
+
+        # Interpolate timestep_length sigma values between the training range
+        start_sigma = full_schedule[srpo_train_start]
+        end_sigma = full_schedule[srpo_train_end]
+        srpo_sigma_schedule = torch.linspace(start_sigma, end_sigma, timestep_length)
+
+        return timestep_select, k, srpo_sigma_schedule
+
     def process_batch(
         self,
         batch,
@@ -375,7 +437,7 @@ class NetworkTrainer:
         noise_scheduler,
         vae_dtype,
         weight_dtype,
-        accelerator,
+        accelerator: Accelerator,
         args,
         text_encoding_strategy: strategy_base.TextEncodingStrategy,
         tokenize_strategy: strategy_base.TokenizeStrategy,
@@ -383,7 +445,9 @@ class NetworkTrainer:
         train_text_encoder=True,
         train_unet=True,
         multipliers=1.0,
-    ) -> tuple[torch.Tensor, dict[str, float | int]]:
+        optimizer: torch.optim.Optimizer | None=None,
+        lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None=None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, float | int]]:
         """
         Process a batch for the network
         """
@@ -449,58 +513,212 @@ class NetworkTrainer:
                     if encoded_text_encoder_conds[i] is not None:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
 
-        # sample noise, call unet, get target
+        if not self.po.is_reward_based():
+            # sample noise, call unet, get target
+            noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise = self.get_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+            )
 
-        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, _ = self.get_noise_pred_and_target(
-            args,
-            accelerator,
-            noise_scheduler,
-            latents,
-            batch,
-            text_encoder_conds,
-            unet,
-            network,
-            weight_dtype,
-            train_unet,
-            is_train=is_train,
-        )
+
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
 
         losses: dict[str, torch.Tensor] = {}
 
-        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
-        if weighting is not None:
-            loss = loss * weighting
-        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-            loss = apply_masked_loss(loss, batch)
+        if args.wavelet_loss:
+            def maybe_denoise_latents(denoise_latents: bool, noisy_latents, sigma, noise_pred, noise):
+                sigmas = sigma.view(-1, 1, 1, 1).expand(noise_pred.size(0), -1, -1, -1)
+                if denoise_latents:
+                    if self.is_flow_matching:
+                        # denoise latents to use for wavelet loss
+                        wavelet_predicted = (noisy_latents - sigmas * noise_pred) / (1.0 - sigmas)
+                        wavelet_target = (noisy_latents - sigmas * noise) / (1.0 - sigmas)
+
+                    else:
+                        # Get alpha values from scheduler
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_latents.device)
+                        alpha_t = alphas_cumprod[timesteps].reshape(-1, 1, 1, 1)
+                        sqrt_alpha_t = torch.sqrt(alpha_t)
+                        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
+                        
+                        # Predict x0 (clean latents) from noise prediction
+                        wavelet_predicted = (noisy_latents - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
+                        wavelet_target = (noisy_latents - sqrt_one_minus_alpha_t * noise) / sqrt_alpha_t
+    
+                    return wavelet_predicted, wavelet_target
+                else:
+                    return  noise_pred, target
+
+
+            def wavelet_loss_fn(args):
+                loss_type = args.wavelet_loss_type if args.wavelet_loss_type is not None else args.loss_type
+                def loss_fn(input: torch.Tensor, target: torch.Tensor, reduction: str = "mean"):
+                    return train_util.conditional_loss(input, target, loss_type, reduction, huber_c)
+
+                return loss_fn
+
+            self.wavelet_loss.set_loss_fn(wavelet_loss_fn(args))
+
+            wavelet_predicted, wavelet_target = maybe_denoise_latents(args.wavelet_loss_rectified_flow, noisy_latents, sigmas, noise_pred, noise)
+
+            wav_losses, metrics_wavelet = self.wavelet_loss(wavelet_predicted.float(), wavelet_target.float(), timesteps)
+            metrics_wavelet = {f"wavelet_loss/{k}": v for k, v in metrics_wavelet.items()}
+            metrics.update(metrics_wavelet)
+
+            current_losses = []
+            for i, wav_loss in enumerate(wav_losses):
+                # Downsample loss to wavelet size
+                downsampled_loss = torch.nn.functional.adaptive_avg_pool2d(loss, wav_loss.shape[-2:])
+                
+                # Combine with wavelet loss
+                combined_loss = downsampled_loss + args.wavelet_loss_alpha * wav_loss
+                
+                # Upsample back to original latent size
+                upsampled_loss = torch.nn.functional.interpolate(
+                    combined_loss, 
+                    size=loss.shape[-2:],  # Original latent size
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                
+                current_losses.append(upsampled_loss)
+
+            # Now combine all levels at original latent resolution
+            loss = torch.stack(current_losses).mean(dim=0)  # Average across levels
 
         if self.po.is_po():
             if self.po.is_reward_based():
                 # SRPO: Reward-based optimization
-                
+                assert optimizer is not None
+                assert lr_scheduler is not None
+
                 # Need to decode to pixels for CLIP reward
                 # Move VAE to device temporarily
                 vae_device = vae.device
                 if vae_device != accelerator.device:
-                    vae.to(accelerator.device)
-                
-                # Prepare reward inputs
-                reward_inputs = {
-                    "vae": vae,
-                    "captions": batch["captions"],
-                    "reward_model": self.clip_reward_model,  # Initialize in __init__
-                    **batch['srpo_inputs']
-                }
-                
-                # SRPO loss
-                loss, metrics_po = self.po(noise_pred, reward_inputs=reward_inputs)
-                
+                    vae = vae.to(accelerator.device, dtype=torch.float16)
+
+                vae.enable_gradient_checkpointing()
+
+                # Sample SRPO parameters ONCE for both branches (reference line 526)
+                # Both branches share same timestep_select, k, and sigma schedule
+                timestep_select, k, srpo_sigma_schedule = self._sample_srpo_timestep_pair(args, noise_scheduler)
+                timestep_length = getattr(args, 'srpo_timestep_length', 100)
+
+                for pair_idx in range(args.srpo_num_pairs):
+                    print(f"Pair: {pair_idx}")
+                    # preprocess batch for each model
+                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
+                    with accelerator.accumulate(), maybe_sample_params(optimizer.optimizer):
+                        is_inversion = pair_idx % 2 == 1
+
+                        # Calculate branch-specific mid_timestep (reference lines 536-539)
+                        if is_inversion:
+                            mid_timestep = timestep_select  # Inversion: unchanged
+                        else:
+                            mid_timestep = max(timestep_select - k, 1)  # Denoise: shifted back
+
+                        # Calculate positions (reference lines 540-542)
+                        start = min(mid_timestep + k, timestep_length)
+                        t_base = timestep_length - mid_timestep
+                        t_start = timestep_length - start
+
+                        # Get sigma values from shared schedule (reference lines 546-553)
+                        if is_inversion:
+                            sigma_value = srpo_sigma_schedule[t_start].item()  # Inversion uses t_start
+                            discount_index = mid_timestep  # For discount lookup
+                        else:
+                            sigma_value = srpo_sigma_schedule[t_base].item()  # Denoise uses t_base
+                            discount_index = mid_timestep  # For discount lookup
+
+                        # sample noise, call unet, get target
+                        noise_pred, noisy_latents, target, sigmas, timesteps, weighting, noise = self.get_noise_pred_and_target(
+                            args,
+                            accelerator,
+                            noise_scheduler,
+                            latents,
+                            batch,
+                            text_encoder_conds,
+                            unet,
+                            network,
+                            weight_dtype,
+                            train_unet,
+                            is_train=is_train,
+                            timestep_index=sigma_value,  # Pass sigma value for SRPO
+                        )
+
+                        losses: dict[str, torch.Tensor] = {}
+
+                        huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, latents, noise_scheduler)
+                        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                        
+                        # Prepare reward inputs
+                        reward_inputs = {
+                            "vae": vae,
+                            "captions": batch["captions"],
+                            "reward_model": self.reward_model,
+                            "is_inversion": is_inversion,
+                            "timestep_index": discount_index,  # Pass discount index (0-99) for discount lookup
+                            "sigma_value": sigma_value,  # Pass sigma value (0.0-1.0) for logging
+                            **batch['srpo_inputs']
+                        }
+
+                        # SRPO loss
+                        loss, metrics_po = self.po(noise_pred, reward_inputs=reward_inputs)
+
+                        loss = self.post_process_loss(loss, args, timesteps, noise_scheduler, latents)
+
+                        loss = loss.mean([1, 2, 3])
+
+                        accelerator.backward(loss)
+
+                        if accelerator.sync_gradients:
+                            for name, param in network.named_parameters():
+                                if "lora_up" in name:
+                                    if param.requires_grad:
+                                        print(f"{name}: {torch.norm(param)}")
+                                        break
+
+                            if args.max_grad_norm != 0.0:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                            if hasattr(network, "update_grad_norms"):
+                                network.update_grad_norms()
+                            if hasattr(network, "update_norms"):
+                                network.update_norms()
+                            if args.gradient_noise_scale and hasattr(network, "accumulate_grad"):
+                                network.accumulate_grad()
+                            if hasattr(network, "update_gradient_ema"):
+                                network.update_gradient_ema()
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    
+                    metrics.update({f"{k}_{pair_idx}": v for k, v in metrics_po.items()})
+
                 # Move VAE back if needed
                 if vae_device != accelerator.device:
-                    vae.to(vae_device)
-                
-                metrics.update(metrics_po)
+                    vae.to(vae_device, dtype=torch.float16)
+
+                return loss.mean(), losses, metrics
             else:
+                if weighting is not None:
+                    loss = loss * weighting
+                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    loss = apply_masked_loss(loss, batch)
+
                 if self.po.is_reference():
                     accelerator.unwrap_model(network).set_multiplier(0.0)
                     ref_noise_pred, ref_noisy_latents, ref_target, ref_sigmas, ref_timesteps, ref_weighting = (
@@ -1354,10 +1572,15 @@ class NetworkTrainer:
         if self.po.is_reward_based():
             reward_model_name = getattr(args, 'srpo_reward_model', 'clip')
             logger.info(f"Initializing reward model: {reward_model_name} (on CPU)")
-            self.clip_reward_model = self._init_reward_model(reward_model_name)
-            self.clip_reward_model.accelerator = accelerator
+            self.reward_model = self._init_reward_model(reward_model_name, accelerator=accelerator, args=args)
+            self.reward_model = accelerator.prepare(self.reward_model)
+            if hasattr(self.reward_model.model, "gradient_checkpointing_enable"):
+                self.reward_model.model.gradient_checkpointing_enable()
+
+            if hasattr(self.reward_model.model, "set_grad_checkpointing"):
+                self.reward_model.model.set_grad_checkpointing()
         else:
-            self.clip_reward_model = None
+            self.reward_model = None
 
         del train_dataset_group
         if val_dataset_group is not None:
@@ -1493,12 +1716,11 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
-                with accelerator.accumulate(training_model):
+                with contextlib.nullcontext() if args.srpo_beta is not None else accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
-
                     loss, losses, metrics = self.process_batch(
                         batch,
                         text_encoders,
@@ -1515,9 +1737,13 @@ class NetworkTrainer:
                         is_train=True,
                         train_text_encoder=train_text_encoder,
                         train_unet=train_unet,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
                     )
 
-                    accelerator.backward(loss)
+                    # Handling the backward inside the batch
+                    if args.srpo_beta is None:
+                        accelerator.backward(loss)
 
                     if args.norm_gradient:
                         normalize_gradients(network)
@@ -1535,9 +1761,10 @@ class NetworkTrainer:
                         if hasattr(network, "update_norms"):
                             network.update_norms()
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    if args.srpo_beta is None:
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
                 max_mean_logs = {}
                 if args.scale_weight_norms:
@@ -1804,7 +2031,7 @@ class NetworkTrainer:
 
             logger.info("model saved.")
 
-    def _init_reward_model(self, model_name: str):
+    def _init_reward_model(self, model_name: str, accelerator: Accelerator, args):
         """Initialize reward model with configurable precision
 
         Args:
@@ -1812,10 +2039,11 @@ class NetworkTrainer:
         """
         # You can swap this out for HPSv2, PickScore, etc.
         if model_name == "clip":
-            return CLIPRewardModel("openai/clip-vit-large-patch14")
+            return LongCLIPRewardModel("openai/clip-vit-base-patch32", accelerator)
         elif model_name == "hpsv2":
-            # TODO: Implement HPSv2 wrapper
-            raise NotImplementedError("HPSv2 not yet implemented")
+            model =  HPSRewardModel(args.hpsv2_model, accelerator)
+
+            return model
         elif model_name == "pickscore":
             # TODO: Implement PickScore wrapper
             raise NotImplementedError("PickScore not yet implemented")

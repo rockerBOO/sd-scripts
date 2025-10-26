@@ -78,22 +78,29 @@ class TestSRPOPreferenceOptimizationIntegration:
     def test_call_with_reward_inputs(self, srpo_args, mock_vae):
         """Test calling PreferenceOptimization with reward_inputs"""
         po = PreferenceOptimization(srpo_args)
-        
-        mock_reward_model = Mock(return_value=torch.randn(2))
-        
+
+        # Create a proper mock CLIPRewardModel with SRP_cfg method
+        from unittest.mock import MagicMock
+        from library.reward_model import CLIPRewardModel
+        mock_reward_model = MagicMock(spec=CLIPRewardModel)
+        mock_reward_model.SRP_cfg = Mock(return_value=torch.randn(2))
+
         reward_inputs = {
             "latents_recovered": torch.randn(2, 16, 64, 64),
             "sigma_t": torch.rand(2, 1, 1, 1),
             "captions": ["test1", "test2"],
             "vae": mock_vae,
             "reward_model": mock_reward_model,
+            "target": torch.randn(2, 16, 64, 64),
+            "model_pred": torch.randn(2, 16, 64, 64),
         }
-        
+
         loss, metrics = po(reward_inputs=reward_inputs)
-        
+
         assert isinstance(loss, torch.Tensor)
         assert isinstance(metrics, dict)
-        assert loss.shape == torch.Size([2])
+        # Loss shape should be (B, C, H, W) = (2, 16, 64, 64)
+        assert loss.shape == torch.Size([2, 16, 64, 64])
     
     def test_call_requires_reward_inputs(self, srpo_args):
         """Test that calling without reward_inputs raises error"""
