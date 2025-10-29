@@ -63,9 +63,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             args.cache_text_encoder_outputs = True
 
         if args.cache_text_encoder_outputs:
-            assert (
-                train_dataset_group.is_text_encoder_output_cacheable()
-            ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
+            assert train_dataset_group.is_text_encoder_output_cacheable(), (
+                "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used / Text Encoderの出力をキャッシュするときはcaption_dropout_rate, shuffle_caption, token_warmup_step, caption_tag_dropout_rateは使えません"
+            )
 
         # prepare CLIP-L/T5XXL training flags
         self.train_clip_l = not args.network_train_unet_only and self.use_clip_l
@@ -74,9 +74,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         if args.max_token_length is not None:
             logger.warning("max_token_length is not used in Flux training / max_token_lengthはFluxのトレーニングでは使用されません")
 
-        assert (
-            args.blocks_to_swap is None or args.blocks_to_swap == 0
-        ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
+        assert (args.blocks_to_swap is None or args.blocks_to_swap == 0) or not args.cpu_offload_checkpointing, (
+            "blocks_to_swap is not supported with cpu_offload_checkpointing / blocks_to_swapはcpu_offload_checkpointingと併用できません"
+        )
 
         # deprecated split_mode option
         if args.split_mode:
@@ -323,15 +323,17 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         train_unet: bool,
         is_train=True,
         timesteps: torch.FloatTensor | None = None,
-    # ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        timestep_index: int | None = None,
+        is_inverse=False,
+        # ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     ):
         """
         Generate noise predictions and training targets for FLUX diffusion model training.
-        
+
         This function performs the forward diffusion process by adding noise to latents,
         then uses the model to predict the noise. It supports both standard training and
         reward-based methods (SRPO) with Direct-Align recovery.
-        
+
         Args:
             args: Training configuration namespace
             accelerator: HuggingFace Accelerator for distributed training
@@ -347,7 +349,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             train_unet: Whether the UNet is in training mode
             is_train: Whether this is a training step (vs. validation)
             timesteps: Optional pre-defined timesteps for sampling
-        
+
         Returns:
             tuple containing:
                 - model_pred (FloatTensor): Model's velocity prediction [B, C, H, W]
@@ -362,26 +364,52 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise: torch.FloatTensor = torch.randn_like(latents)
         bsz = latents.shape[0]
 
-        # SRPO: Store the predefined noise before any transformations
         if self.po.is_reward_based():
-            epsilon_gt = noise.clone()  # Store the ground truth noise
-        else:
-            epsilon_gt = None
-    
-        # Get noisy model input and timesteps
-        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timestep(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
-        )
+            num_inference_steps = 100
+            timestep_length = 100
+            vis_sampling_step = 50
+            groundtruth_ratio = 0.9
 
-        # For SRPO, extract alpha_t and sigma_t from the sigmas
-        if self.po.is_reward_based():
-            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
-            # So: alpha_t = (1 - σ), sigma_t = σ
-            alpha_t = 1.0 - sigmas  # Weight on clean latents
-            sigma_t = sigmas        # Weight on noise
+            assert timestep_index is not None, "timestep_index must be set"
+            sigma_schedule = torch.linspace(1, 0, vis_sampling_step + 1)
+            # Need sampling distribution
+            sigmas_l = torch.linspace(
+                sigma_schedule[args.srpo_train_timestep[0]], sigma_schedule[args.srpo_train_timestep[1]], num_inference_steps
+            ).to(latents.device)
+
+            k = int((1 - groundtruth_ratio) * timestep_length) + 1
+            k = min(min(timestep_length - timestep_index, k), timestep_index)
+
+            start = min(timestep_index + k, num_inference_steps)
+            t_base = int(num_inference_steps - timestep_index)
+            t_start = int(num_inference_steps - start)
+
+            ## Direct-Align step1 inject noise
+            ## ===============================
+            if is_inverse:
+                sigmas = sigmas_l[t_base]
+                sigmas_t = sigmas_l[t_start]
+                delta_sigma = sigmas - sigmas_l[t_start]
+            else:
+                sigmas = sigmas_l[t_start]
+                sigmas_t = sigmas_l[t_base]
+                delta_sigma = sigmas - sigmas_l[t_base]
+
+            bsz, _, h, w = latents.shape
+            mu = flux_train_utils.get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            sigmas = flux_train_utils.time_shift(mu, 1.0, sigmas)
+
+            timestep_value = int(sigmas * 1000)
+            timesteps = torch.full([latents.shape[0]], timestep_value, device=latents.device, dtype=torch.long)
+
+            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
+
         else:
-            alpha_t = None
-            sigma_t = None
+            # Get noisy model input and timesteps
+            # If CDC is enabled, this will transform the noise with geometry-aware covariance
+            noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timestep(
+                args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, timestep_index=timestep_index
+            )
 
         if timesteps is None:
             timesteps = rand_timesteps
@@ -489,32 +517,16 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
 
-        if self.po.is_reward_based() and epsilon_gt is not None:
-            # Extract schedule parameters from sigmas
-            # In FLUX flow matching: x_t = (1 - σ) * x_0 + σ * ε
-            alpha_t = 1.0 - sigmas  # Weight on clean latents (1 - σ)
-            sigma_t = sigmas        # Weight on noise (σ)
-            
-            # Get delta_sigma from args (default 0.025)
-            delta_sigma = getattr(args, 'srpo_delta_sigma', 0.025)
-            
+        if self.po.is_reward_based():
             # Direct-Align: Single-step recovery for FLUX flow matching
             # x_0 = (x_t - Δσ * v_θ - (σ - Δσ) * ε_gt) / (1 - σ)
-            with torch.no_grad():
-                latents_recovered = (
-                    noisy_model_input
-                    - delta_sigma * model_pred  # Δσ * velocity prediction
-                    - (sigma_t - delta_sigma) * epsilon_gt  # (σ - Δσ) * predefined noise
-                ) / alpha_t
-                
-                # Clamp to reasonable range to prevent extreme values
-                latents_recovered = torch.clamp(latents_recovered, -10, 10)
-            
+            latents_recovered = (noisy_model_input - delta_sigma * model_pred - (sigmas_t - delta_sigma) * noise) / (1 - sigmas_t)
+
             # Store in batch for SRPO loss function
             batch["srpo_inputs"] = {
                 "latents_recovered": latents_recovered,
                 "timesteps": timesteps,
-                "sigma_t": sigma_t,
+                "sigma_t": sigmas_t,
                 "captions": batch["captions"],
                 "model_pred": model_pred,
                 "target": target,

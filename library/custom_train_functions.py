@@ -10,8 +10,13 @@ import argparse
 import random
 import re
 from torch.types import Number
-from typing import List, Optional, Union, Callable
-from .utils import setup_logging
+from typing import List, Optional, Union, Protocol
+
+from library.reward_model import CLIPRewardModel, HPSRewardModel
+from .utils import save_latent_as_img, setup_logging
+from library import train_util
+from accelerate import Accelerator
+
 
 setup_logging()
 import logging
@@ -237,6 +242,17 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="Reward model for SRPO",
     )
     parser.add_argument("--srpo_delta_sigma", type=float, default=0.025, help="Delta sigma parameter for Direct-Align recovery")
+    parser.add_argument("--srpo_num_pairs", type=int, default=None, help="Number of inverse pairs to sample.")
+    parser.add_argument("--srpo_reward_scale", type=float, default=1.0, help="Scaling factor for SRPO reward (default: 1.0, ref uses /20)")
+    parser.add_argument("--srpo_timestep_length", type=int, default=100, help="Length of timestep schedule for discount (default: 100)")
+    parser.add_argument("--srpo_train_timestep", type=int, nargs=2, default=[5, 25], help="Training timestep range as indices into reference schedule (default: [5, 25] for ~10%%-50%% noise)")
+    parser.add_argument("--srpo_discount_denoise_start", type=float, default=0.1, help="Discount at start of denoising schedule (default: 0.1)")
+    parser.add_argument("--srpo_discount_denoise_end", type=float, default=0.25, help="Discount at end of denoising schedule (default: 0.25)")
+    parser.add_argument("--srpo_discount_inversion_start", type=float, default=0.3, help="Discount at start of inversion schedule (default: 0.3)")
+    parser.add_argument("--srpo_discount_inversion_end", type=float, default=0.01, help="Discount at end of inversion schedule (default: 0.01)")
+    parser.add_argument("--srpo_use_refl_loss", action="store_true", help="Use ReFL-style thresholded loss: F.relu(-reward + 0.7) instead of -discounted_reward + noise_penalty")
+    parser.add_argument("--srpo_srp_k", type=float, default=0.1, help="K parameter for SRP formula: (1+k)*pos - neg (default: 0.1, higher values = stronger contrast)")
+    parser.add_argument("--hpsv2_model", type=str, help="HPS v2.1 modal location")
 
 
 re_attention = re.compile(
@@ -657,6 +673,14 @@ class PreferenceOptimization:
                 "use_inversion": getattr(args, "srpo_use_inversion", False),
                 "reward_model": getattr(args, "srpo_reward_model", "clip"),
                 "delta_sigma": getattr(args, "srpo_delta_sigma", 0.025),
+                "reward_scale": getattr(args, "srpo_reward_scale", 1.0),
+                "timestep_length": getattr(args, "srpo_timestep_length", 100),
+                "discount_denoise_start": getattr(args, "srpo_discount_denoise_start", 0.1),
+                "discount_denoise_end": getattr(args, "srpo_discount_denoise_end", 0.25),
+                "discount_inversion_start": getattr(args, "srpo_discount_inversion_start", 0.3),
+                "discount_inversion_end": getattr(args, "srpo_discount_inversion_end", 0.01),
+                "use_refl_loss": getattr(args, "srpo_use_refl_loss", False),
+                "srp_k": getattr(args, "srpo_srp_k", 0.1),
             }
 
     def is_po(self):
@@ -1050,11 +1074,17 @@ def simpo_loss(
 
 def srpo_loss(
     reward_inputs: dict,
-    beta: float = 1.0,
     positive_prompt: str = "Realistic photo",
     negative_prompt: str = "CG Render",
-    use_inversion: bool = False,
-    vae_batch_size: int = 1,    
+    vae_batch_size: int = 1,
+    accelerator: Accelerator | None = None,
+    reward_scale: float = 1.0,
+    timestep_length: int = 100,
+    discount_denoise_start: float = 0.1,
+    discount_denoise_end: float = 0.25,
+    discount_inversion_start: float = 0.3,
+    discount_inversion_end: float = 0.01,
+    use_refl_loss: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, dict[str, int | float]]:
     """
@@ -1076,87 +1106,132 @@ def srpo_loss(
     sigma_t = reward_inputs["sigma_t"]
     captions = reward_inputs["captions"]
     vae = reward_inputs["vae"]
-    clip_reward_model = reward_inputs["reward_model"]
+    reward_model = reward_inputs["reward_model"]
 
-    # Get target for computing loss with gradients
-    target = reward_inputs.get("target")
-    model_pred = reward_inputs.get("model_pred")
+    # Get discount info from reward_inputs (needed for prompt swapping logic)
+    is_inversion = reward_inputs.get("is_inversion", False)
+    timestep_index = reward_inputs.get("timestep_index", 0)  # Discount index (0-99)
+    sigma_value = reward_inputs.get("sigma_value", timestep_index / 100.0)  # Sigma value (0.0-1.0)
+
+    discount = torch.linspace(discount_denoise_start, discount_denoise_end, timestep_length)
+    discount_inversion = torch.linspace(discount_inversion_start, discount_inversion_end, timestep_length)
+
+    assert latents_recovered.requires_grad, "latents_recovered must have gradients enabled!"
 
     # Validate srpo_reward_vae_batch_size
     if vae_batch_size < 1:
         raise ValueError("srpo_reward_vae_batch_size must be positive")
 
-    # Decode latents to pixels for CLIP reward
-    with torch.no_grad():
-        # FLUX uses 0.3611 scale factor (different from SD's 0.18215)
-        vae_scale_factor = getattr(vae, "scaling_factor", 0.3611)
+    # Flux VAE scales and shifts in decode
+    # # Decode latents to pixels for CLIP reward
+    # vae_scale_factor = getattr(vae, "scaling_factor", 0.3611)
+    # vae_shift = getattr(vae, "shift", 0.1159)
 
-        # Get VAE dtype and convert latents to match
-        vae_dtype = next(vae.parameters()).dtype
-        latents_recovered = latents_recovered.to(dtype=vae_dtype)
+    # Get VAE dtype and convert latents to match
+    vae_dtype = next(vae.parameters()).dtype
+    latents_recovered = latents_recovered.to(dtype=vae_dtype)
 
-        # Decode in batches to save VRAM during training
-        # Note: This is separate from vae_batch_size used during pre-processing
-        batch_size = latents_recovered.shape[0]
-        if batch_size > vae_batch_size:
-            images_list = []
-            for i in range(0, batch_size, vae_batch_size):
-                batch_latents = latents_recovered[i : i + vae_batch_size]
-                batch_images = vae.decode(batch_latents / vae_scale_factor)
-                images_list.append(batch_images)
-            images_recovered = torch.cat(images_list, dim=0)
-        else:
-            images_recovered = vae.decode(latents_recovered / vae_scale_factor)
+    # Decode in batches to save VRAM during training
+    # Note: This is separate from vae_batch_size used during pre-processing
+    batch_size = latents_recovered.shape[0]
+    if batch_size > vae_batch_size:
+        images_list = []
+        for i in range(0, batch_size, vae_batch_size):
+            batch_latents = latents_recovered[i : i + vae_batch_size]
+            if accelerator is not None:
+                with accelerator.autocast():
+                    batch_images = vae.decode(batch_latents)
+            else:
+                batch_images = vae.decode(batch_latents)
+            images_list.append(batch_images)
+        images_recovered = torch.cat(images_list, dim=0)
+    else:
+        images_recovered = vae.decode(latents_recovered)
 
-        # Normalize to [0, 1] for CLIP and convert to float32 (CLIP doesn't support bfloat16)
-        images_recovered = (images_recovered + 1) / 2
-        images_recovered = torch.clamp(images_recovered, 0, 1).to(dtype=torch.float32)
+    images_recovered = (images_recovered.float() / 2 + 0.5).clamp(0,1)
+
+    if False:
+        from PIL import Image
+        for i, image in enumerate(images_recovered):
+            # Convert to numpy array with values in range [0, 255]
+            image = (image * 255).detach().cpu().numpy().astype(np.uint8)
+            
+            # Rearrange dimensions from [channels, height, width] to [height, width, channels]
+            image = image.transpose(1, 2, 0)
+            
+            # Take the first image if you have a batch
+            pil_image = Image.fromarray(image)
+            
+            # Save the image
+            pil_image.save(f"srpo_sample_{i}.png")
+
 
     # Semantic Relative Preference: Augment prompts
     positive_prompts = [f"{positive_prompt}. {caption}" for caption in captions]
     negative_prompts = [f"{negative_prompt}. {caption}" for caption in captions]
 
-    # Compute rewards with CLIP
-    with torch.no_grad():
-        reward_positive = clip_reward_model(images_recovered, positive_prompts)
-        reward_negative = clip_reward_model(images_recovered, negative_prompts)
 
-        # Semantic-Relative reward: r = r_positive - r_negative
-        reward = reward_positive - reward_negative
-
-        # Timestep discount to prevent reward hacking at late timesteps
-        # Debug sigma_t before computing discount
-        sigma_t_squeezed = sigma_t.squeeze()
-        exponent = -beta * sigma_t_squeezed
-        exponent = exponent - exponent.max()  # now in (−∞,0]
-        discount = torch.exp(exponent)  # now in (0,1] and always finite
-        discounted_reward = discount * reward
-
-    # Loss: Use reward to weight the prediction loss
-    # Negative reward means we minimize loss (good), positive reward means we maximize loss (bad)
-    if model_pred is not None and target is not None:
-        # MSE loss between prediction and target
-        mse_loss = F.mse_loss(model_pred, target, reduction="none").mean(dim=[1, 2, 3])
-        # Weight by -discounted_reward: high reward -> negative weight -> gradient goes opposite direction
-        loss = mse_loss * (-discounted_reward.detach())
+    # IMPORTANT: Reference SRPO swaps prompts for denoise branch (inversion==0)
+    # This implements inversion-based regularization from the paper
+    # Inversion branch: maximize (1+k)*pos - neg (normal)
+    # Denoise branch: maximize (1+k)*neg - pos (inverted, acts as regularizer)
+    if is_inversion:
+        if hasattr(reward_model, "SRP_cfg"):
+            reward, pos_similarity, neg_similarity = reward_model.SRP_cfg(
+                positive_prompts, negative_prompts, images_recovered, k=discount[timestep_index]
+            )
+        else:
+            raise NotImplementedError("SRP_cfg not implemented for this reward model")
     else:
-        # Fallback: just use reward directly (though this has no gradients)
-        loss = -discounted_reward
+        # Denoise branch: SWAP prompts (negative becomes "positive", positive becomes "negative")
+        # This inverts the reward signal for regularization
+        if hasattr(reward_model, "SRP_cfg"):
+            reward, pos_similarity, neg_similarity = reward_model.SRP_cfg(
+                negative_prompts, positive_prompts, images_recovered, k=discount_inversion[timestep_index]
+            )
+        else:
+            raise NotImplementedError("SRP_cfg not implemented for this reward model")
 
-    # Optional: Inversion-based regularization
-    if use_inversion:
-        # Penalize late timesteps (high sigma) to prevent reward hacking
-        late_timestep_mask = (sigma_t.squeeze() > 0.7).float()
-        loss = loss * (1 - 0.5 * late_timestep_mask)
+    # Apply reward scaling
+    if reward_scale != 1.0:
+        reward = reward / reward_scale
+
+    # Choose loss formulation based on use_refl_loss flag
+    if use_refl_loss:
+        # ReFL-style thresholded loss (borrowed from ReFL paper, used in reference SRPO)
+        # Reference implementation line 622-623:
+        # loss = F.relu(-outputs+0.7)/gradient_accumulation_steps
+        # This sets a "good enough" threshold - rewards above 0.7 have zero loss
+        # loss = F.relu(-discounted_reward + 0.7)
+        loss = F.leaky_relu(-reward + 0.7)
+    else:
+        # SRPO paper formulation: Pure reward-based optimization
+        # Paper Equations 12-13: Gradient ascent on reward (= gradient descent on -reward)
+        # Reference SRPO uses pure reward without noise penalty
+        loss = -reward
+
+    # Expand to match model_pred shape (B, C, H, W) for consistency with training loop
+    loss = loss.view(-1, 1, 1, 1)
+
+    with torch.no_grad():
+        # Calculate similarity gap (key metric: positive - negative)
+        similarity_gap = pos_similarity - neg_similarity
 
     metrics = {
-        "loss/srpo_reward_positive": reward_positive.mean().item(),
-        "loss/srpo_reward_negative": reward_negative.mean().item(),
-        "loss/srpo_reward_relative": reward.mean().item(),
-        "loss/srpo_reward_discounted": discounted_reward.mean().item(),
-        "loss/srpo_discount_mean": discount.mean().item(),
+        "loss/srpo_reward": reward.mean().detach().item(),
+        "loss/srpo_reward_min": reward.min().detach().item(),
+        "loss/srpo_reward_max": reward.max().detach().item(),
+        "loss/srpo_discount_mean": discount.mean().item() if discount.numel() > 1 else discount.item(),
         "loss/srpo_sigma_mean": sigma_t.mean().item(),
-        "loss/srpo_final_loss": loss.mean().item(),
+        "loss/srpo_discount_index": float(timestep_index),  # Discount index (0-99)
+        "loss/srpo_sigma_value": float(sigma_value),  # Sigma value (0.0-1.0)
+        "loss/srpo_timestep_value": int(sigma_value * 1000),  # Display timestep (sigma * 1000 for reference)
+        "loss/srpo_is_inversion": float(is_inversion),
+        "loss/srpo_final_loss": loss.mean().detach().item(),
+        "loss/srpo_clip_pos_similarity": pos_similarity.mean().detach().item(),
+        "loss/srpo_clip_neg_similarity": neg_similarity.mean().detach().item(),
+        "loss/srpo_clip_similarity_gap": similarity_gap.mean().detach().item(),
+        "vram/vae_batch_size": vae_batch_size,
     }
 
     return loss, metrics

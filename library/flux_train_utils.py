@@ -420,15 +420,6 @@ def denoise(
 
 
 # region train
-def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32) -> torch.FloatTensor:
-    sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
-    schedule_timesteps = noise_scheduler.timesteps.to(device)
-    timesteps = timesteps.to(device)
-    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-    sigma = sigmas[step_indices].flatten()
-    return sigma
-
 
 def compute_density_for_timestep_sampling(
     weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
@@ -469,41 +460,28 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas) -> torch.Tenso
 
 
 def get_noisy_model_input_and_timestep(
-    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
+    args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype, timestep_index=None
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
     """
     Returns:
-        tuple[
-            noisy_model_input: noisy at sigma applied to latent
-            timesteps: timesteps between 1.0 and 1000.0
-            sigmas: sigmas between 0.0 and 1.0
-        ]
+        Tuple of (noisy_input, timestep, sigma)
     """
     bsz, _, h, w = latents.shape
-    assert bsz > 0, "Batch size not large enough"
-    num_timesteps: int = noise_scheduler.config.num_train_timesteps
-    if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
-        # Simple random sigma-based noise sampling
-        if args.timestep_sampling == "sigmoid":
-            # https://github.com/XLabs-AI/x-flux/tree/main
-            sigma = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
-        else:
-            sigma = torch.rand((bsz,), device=device)
-
-        timestep = sigma * num_timesteps
-    elif args.timestep_sampling == "shift":
-        shift = args.discrete_flow_shift
-        sigma = torch.randn(bsz, device=device)
-        sigma = sigma * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigma = sigma.sigmoid()
-        sigma = (sigma * shift) / (1 + (shift - 1) * sigma)
-        timestep = sigma * num_timesteps
-    elif args.timestep_sampling == "flux_shift":
-        sigma = torch.randn(bsz, device=device)
-        sigma = sigma * args.sigmoid_scale  # larger scale for more uniform sampling
-        sigma = sigma.sigmoid()
-        mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
-        sigma = time_shift(mu, 1.0, sigma)
+    assert bsz > 0, "Batch size must be positive"
+    
+    # ===== Get sigma values =====
+    if timestep_index is not None:
+        # SRPO mode: timestep_index is already a sigma value (0.0-1.0)
+        # Just use it directly, don't try to convert or look up in scheduler
+        sigma = torch.tensor([timestep_index], device=device, dtype=torch.float32).expand(bsz)
+    else:
+        # Random sampling mode
+        sigma = sample_sigma(
+            args, bsz, h, w, device, noise_scheduler
+        )
+    
+    # ===== Convert sigma to timestep =====
+    if args.timestep_sampling == "flux_shift":
         timestep = noise_scheduler._sigma_to_t(sigma)
     else:
         # Sample a random timestep for each image
@@ -525,17 +503,139 @@ def get_noisy_model_input_and_timestep(
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
     if args.ip_noise_gamma:
-        assert isinstance(args.ip_noise_gamma, float)
+        # IP-noise augmentation: add extra random component
         xi = torch.randn_like(latents, device=latents.device, dtype=dtype)
         if args.ip_noise_gamma_random_strength:
-            ip_noise_gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
+            gamma = torch.rand(1, device=latents.device, dtype=dtype) * args.ip_noise_gamma
         else:
-            ip_noise_gamma = args.ip_noise_gamma
-        noisy_model_input = (1.0 - sigma) * latents + sigma * (noise + ip_noise_gamma * xi)
+            gamma = args.ip_noise_gamma
+        
+        noisy_model_input = (1.0 - sigma) * latents + sigma * (noise + gamma * xi)
     else:
+        # Standard forward diffusion
         noisy_model_input = (1.0 - sigma) * latents + sigma * noise
-
+    
     return noisy_model_input.to(dtype), timestep.to(dtype), sigma
+
+
+def sample_sigma(
+    args: argparse.Namespace | dict,
+    batch_size: int,
+    h: int,
+    w: int,
+    device: torch.device,
+    noise_scheduler
+) -> torch.Tensor:
+    """
+    Sample sigma values according to the configured sampling strategy.
+    
+    Sampling methods:
+    - uniform: Uniform random in [0, 1]
+    - sigmoid: Normal → sigmoid transformation
+    - shift: Sigmoid with discrete flow shift
+    - flux_shift: Shift with image-size-dependent scaling
+    - other: Density-based sampling using scheduler
+    """
+    method = getattr(args, "timestep_sampling", "uniform")
+    
+    if method == "uniform":
+        return torch.rand((batch_size,), device=device)
+    
+    elif method in ["sigmoid", "shift", "flux_shift"]:
+        # All these methods start with sigmoid transformation
+        z = torch.randn(batch_size, device=device) * getattr(args, "sigmoid_scale", 1.0)
+        sigma = torch.sigmoid(z)
+        
+        if method == "sigmoid":
+            return sigma
+        elif method == "shift":
+            shift = getattr(args, "discrete_flow_shift", 1.0)
+            return (sigma * shift) / (1 + (shift - 1) * sigma)
+        else:  # flux_shift
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            return time_shift(mu, 1.0, sigma)
+    
+    else:
+        # Density-based sampling
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme=getattr(args, 'weighting_scheme', 'uniform'),
+            batch_size=batch_size,
+            logit_mean=getattr(args, 'logit_mean', 0.5),
+            logit_std=getattr(args, 'logit_std', 0.1),
+            mode_scale=getattr(args, 'mode_scale', 1.0),
+        )
+        
+        # Convert density to sigma using scheduler
+        if hasattr(noise_scheduler, 'timesteps'):
+            num_timesteps = noise_scheduler.config.num_train_timesteps
+            indices = (u * num_timesteps).long().clamp(max=num_timesteps - 1)
+            timesteps = noise_scheduler.timesteps[indices].to(device)
+            return get_sigmas(noise_scheduler, timesteps, device).squeeze()
+        else:
+            # Fallback if scheduler doesn't support density sampling
+            return torch.rand((batch_size,), device=device)
+
+
+def generate_sigma_schedule(
+    sampling_method: str,
+    num_steps: int,
+    device: torch.device,
+    args: argparse.Namespace | dict,
+    h: int | None = None,
+    w: int | None = None,
+) -> torch.Tensor:
+    """
+    Generate a deterministic sigma schedule for a given number of steps.
+    
+    This creates a fixed schedule that maps step indices to sigma values,
+    used for converting timestep indices to sigmas deterministically.
+    
+    Returns:
+        Tensor of shape (num_steps,) with sigma values from ~1 to ~0
+    """
+    # Create uniform steps from 0 to 1
+    u = torch.linspace(0, 1, num_steps, device=device)
+    
+    if sampling_method == "uniform":
+        return 1.0 - u  # Linear decay: 1 → 0
+    
+    elif sampling_method in ["sigmoid", "shift", "flux_shift"]:
+        # Transform uniform to normal-like distribution for sigmoid
+        z = (u - 0.5) * 6  # Maps [0,1] to approximately [-3, 3]
+        sigma = torch.sigmoid(getattr(args, "sigmoid_scale", 1.0) * z)
+        
+        if sampling_method == "sigmoid":
+            return sigma
+        elif sampling_method == "shift":
+            shift = getattr(args, "discrete_flow_shift", 1.0)
+            return (sigma * shift) / (1 + (shift - 1) * sigma)
+        else:  # flux_shift
+            if h is None or w is None:
+                raise ValueError("Image dimensions (h, w) required for flux_shift sampling")
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            return time_shift(mu, 1.0, sigma)
+    
+    else:
+        # Fallback to linear decay for unknown methods
+        return 1.0 - u
+
+
+def get_sigmas(
+    noise_scheduler,
+    timesteps: torch.Tensor,
+    device: torch.device,
+    n_dim: int = 4,
+    dtype: torch.dtype = torch.float32
+) -> torch.FloatTensor:
+    """Extract sigma values for given timesteps from the scheduler."""
+    sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
+    schedule_timesteps = noise_scheduler.timesteps.to(device)
+    timesteps = timesteps.to(device)
+    
+    # Find indices for each timestep
+    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    
+    return sigmas[step_indices].flatten()
 
 
 def apply_model_prediction_type(args, model_pred: torch.FloatTensor, noisy_model_input, sigmas):
