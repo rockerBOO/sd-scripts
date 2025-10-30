@@ -826,7 +826,7 @@ class NetworkTrainer:
             )
 
             if self.cdc_config_hash is None:
-                logger.warning("CDC-FM preprocessing failed (likely missing FAISS). Training will continue without CDC-FM.")
+                logger.warning("CDC-FM preprocessing failed. Training will continue without CDC-FM.")
         else:
             self.cdc_config_hash = None
 
