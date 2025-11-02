@@ -1106,7 +1106,7 @@ class NetworkTrainer:
         else:
             if train_unet:
                 # default implementation is:  unet = accelerator.prepare(unet)
-                unet, network, optimizer = self.prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)  # accelerator does some magic here
+                unet, optimizer = self.prepare_unet_with_accelerator(args, accelerator, unet, optimizer)  # accelerator does some magic here
             else:
                 # move to device because unet is not prepared by accelerator
                 unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
@@ -1122,8 +1122,8 @@ class NetworkTrainer:
             else:
                 pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
 
-            train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                train_dataloader, val_dataloader, lr_scheduler
+            network, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+                network, train_dataloader, val_dataloader, lr_scheduler
             )
             training_model = network
 
