@@ -413,9 +413,9 @@ class NetworkTrainer:
         text_encoder.text_model.embeddings.to(dtype=weight_dtype)
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
-    ) -> torch.nn.Module:
-        return accelerator.prepare(unet)
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ) -> tuple[torch.nn.Module, torch.nn.Module, torch.optim.Optimizer]:
+        return accelerator.prepare(unet, network, optimizer)
 
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
         pass
@@ -1106,7 +1106,7 @@ class NetworkTrainer:
         else:
             if train_unet:
                 # default implementation is:  unet = accelerator.prepare(unet)
-                unet = self.prepare_unet_with_accelerator(args, accelerator, unet)  # accelerator does some magic here
+                unet, network, optimizer = self.prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)  # accelerator does some magic here
             else:
                 # move to device because unet is not prepared by accelerator
                 unet.to(accelerator.device, dtype=unet_weight_dtype if self.cast_unet(args) else None)
@@ -1122,8 +1122,8 @@ class NetworkTrainer:
             else:
                 pass  # if text_encoder is not trained, no need to prepare. and device and dtype are already set
 
-            network, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-                network, optimizer, train_dataloader, val_dataloader, lr_scheduler
+            train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+                train_dataloader, val_dataloader, lr_scheduler
             )
             training_model = network
 

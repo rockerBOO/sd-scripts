@@ -466,18 +466,18 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
-    ) -> torch.nn.Module:
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ):
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            return super().prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)
 
         # if we doesn't swap blocks, we can move the model to device
         mmdit: sd3_models.MMDiT = unet
-        mmdit = accelerator.prepare(mmdit, device_placement=[not self.is_swapping_blocks])
+        mmdit, network, optimizer = accelerator.prepare(mmdit, network, optimizer, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(mmdit).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(mmdit).prepare_block_swap_before_forward()
 
-        return mmdit
+        return mmdit, network, optimizer
 
 
 def setup_parser() -> argparse.ArgumentParser:

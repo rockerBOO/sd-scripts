@@ -346,19 +346,19 @@ class LuminaNetworkTrainer(train_network.NetworkTrainer):
         text_encoder.embed_tokens.to(dtype=weight_dtype)
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
-    ) -> torch.nn.Module:
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ):
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            return super().prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)
 
         # if we doesn't swap blocks, we can move the model to device
         nextdit = unet
         assert isinstance(nextdit, lumina_models.NextDiT)
-        nextdit = accelerator.prepare(nextdit, device_placement=[not self.is_swapping_blocks])
+        nextdit, network, optimizer = accelerator.prepare(nextdit, network, optimizer, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(nextdit).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(nextdit).prepare_block_swap_before_forward()
 
-        return nextdit
+        return nextdit, network, optimizer
 
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         if self.is_swapping_blocks:

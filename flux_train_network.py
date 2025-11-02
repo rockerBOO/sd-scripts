@@ -671,18 +671,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
-    ) -> torch.nn.Module:
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ):
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            return super().prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)
 
         # if we doesn't swap blocks, we can move the model to device
         flux: flux_models.Flux = unet
-        flux = accelerator.prepare(flux, device_placement=[not self.is_swapping_blocks])
+        flux, network, optimizer = accelerator.prepare(flux, network, optimizer, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(flux).prepare_block_swap_before_forward()
 
-        return flux
+        return flux, network, optimizer
 
 
 def setup_parser() -> argparse.ArgumentParser:

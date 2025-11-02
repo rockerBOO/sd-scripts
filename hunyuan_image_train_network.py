@@ -617,18 +617,18 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
-    ) -> torch.nn.Module:
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ):
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            return super().prepare_unet_with_accelerator(args, accelerator, unet, network, optimizer)
 
         # if we doesn't swap blocks, we can move the model to device
         model: hunyuan_image_models.HYImageDiffusionTransformer = unet
-        model = accelerator.prepare(model, device_placement=[not self.is_swapping_blocks])
+        model, network, optimizer = accelerator.prepare(model, network, optimizer, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(model).prepare_block_swap_before_forward()
 
-        return model
+        return model, network, optimizer
 
 
 def setup_parser() -> argparse.ArgumentParser:
