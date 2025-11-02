@@ -473,11 +473,11 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
         # if we doesn't swap blocks, we can move the model to device
         mmdit: sd3_models.MMDiT = unet
-        mmdit, network, optimizer = accelerator.prepare(mmdit, network, optimizer, device_placement=[not self.is_swapping_blocks])
+        mmdit, network, optimizer = accelerator.prepare(mmdit, optimizer, device_placement=[not self.is_swapping_blocks])
         accelerator.unwrap_model(mmdit).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
         accelerator.unwrap_model(mmdit).prepare_block_swap_before_forward()
 
-        return mmdit, network, optimizer
+        return mmdit, optimizer
 
 
 def setup_parser() -> argparse.ArgumentParser:

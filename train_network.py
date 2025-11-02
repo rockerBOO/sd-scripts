@@ -413,9 +413,9 @@ class NetworkTrainer:
         text_encoder.text_model.embeddings.to(dtype=weight_dtype)
 
     def prepare_unet_with_accelerator(
-        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, network: torch.nn.Module, optimizer: torch.optim.Optimizer
-    ) -> tuple[torch.nn.Module, torch.nn.Module, torch.optim.Optimizer]:
-        return accelerator.prepare(unet, network, optimizer)
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
+        return accelerator.prepare(unet, optimizer)
 
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train: bool = True):
         pass
