@@ -348,16 +348,6 @@ def load_safetensors_with_fp8_optimization(
                 value = value.to(target_device)
                 state_dict[key] = value
 
-<<<<<<< Updated upstream
-                # Move to calculation device
-                if calc_device is not None:
-                    value = value.to(calc_device)
-
-                original_dtype = value.dtype
-                quantized_weight, scale_tensor = quantize_weight(
-                    key, value, fp8_dtype, max_value, min_value, quantization_mode, block_size
-                )
-=======
             # Create batches for target keys
             if fp8_quantize_batch_size is None or fp8_quantize_batch_size == 0:
                 # Process all target keys at once (original behavior)
@@ -432,7 +422,6 @@ def load_safetensors_with_fp8_optimization(
                     fp8_key = key  # Maintain original key
                     scale_key = key.replace(".weight", ".scale_weight")
                     assert fp8_key != scale_key, "FP8 key and scale key must be different"
->>>>>>> Stashed changes
 
                     if not move_to_device:
                         # Move FP8 result back to CPU to free GPU memory for next layer
