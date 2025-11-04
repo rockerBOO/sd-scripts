@@ -106,6 +106,7 @@ def load_flow_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[Dict[str, torch.Tensor]] = None,
     lora_multipliers: Optional[list[float]] = None,
+    fp8_quantize_batch_size: Optional[int] = None,
 ) -> Tuple[bool, flux_models.Flux]:
     device = torch.device(device)  # device for calculation, typically "cuda"
     loading_device = torch.device(loading_device)
@@ -156,6 +157,7 @@ def load_flow_model(
         dit_weight_dtype=dit_weight_dtype,
         target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
         exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
+        fp8_quantize_batch_size=fp8_quantize_batch_size,
     )
 
     # if the key has annoying prefix, remove it

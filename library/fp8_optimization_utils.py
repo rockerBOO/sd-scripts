@@ -57,9 +57,10 @@ return max_value
 """
 
 
-def quantize_fp8(tensor, scale, fp8_dtype, max_value, min_value):
+def quantize_fp8(tensor, scale, fp8_dtype, max_value, min_value, can_modify_inplace=False):
     """
     Quantize a tensor to FP8 format using PyTorch's native FP8 dtype support.
+    Memory-efficient version using in-place operations where possible.
 
     Args:
         tensor (torch.Tensor): Tensor to quantize
@@ -67,19 +68,26 @@ def quantize_fp8(tensor, scale, fp8_dtype, max_value, min_value):
         fp8_dtype (torch.dtype): Target FP8 dtype (torch.float8_e4m3fn or torch.float8_e5m2)
         max_value (float): Maximum representable value in FP8
         min_value (float): Minimum representable value in FP8
+        can_modify_inplace (bool): If True, modifies input tensor in-place to save memory
 
     Returns:
         torch.Tensor: Quantized tensor in FP8 format
     """
-    tensor = tensor.to(torch.float32)  # ensure tensor is in float32 for division
+    # If we can't modify in-place, clone first
+    if not can_modify_inplace:
+        tensor = tensor.clone()
 
-    # Create scaled tensor
-    tensor = torch.div(tensor, scale).nan_to_num_(0.0)  # handle NaN values, equivalent to nonzero_mask in previous function
+    # Convert to float32 for division (in-place if already a copy)
+    tensor = tensor.to(torch.float32)
 
-    # Clamp tensor to range
-    tensor = tensor.clamp_(min=min_value, max=max_value)
+    # Use in-place operations
+    tensor.div_(scale)
+    tensor.nan_to_num_(0.0)  # handle NaN values in-place
 
-    # Convert to FP8 dtype
+    # Clamp tensor to range (in-place)
+    tensor.clamp_(min=min_value, max=max_value)
+
+    # Convert to FP8 dtype (creates new tensor)
     tensor = tensor.to(fp8_dtype)
 
     return tensor
@@ -95,6 +103,7 @@ def optimize_state_dict_with_fp8(
     move_to_device: bool = False,
     quantization_mode: str = "block",
     block_size: Optional[int] = 64,
+    fp8_quantize_batch_size: Optional[int] = None,
 ):
     """
     Optimize Linear layer weights in a model's state dict to FP8 format. The state dict is modified in-place.
@@ -126,7 +135,7 @@ def optimize_state_dict_with_fp8(
     # Create optimized state dict
     optimized_count = 0
 
-    # Enumerate tarket keys
+    # Enumerate target keys
     target_state_dict_keys = []
     for key in state_dict.keys():
         # Check if it's a weight key and matches target patterns
@@ -137,37 +146,60 @@ def optimize_state_dict_with_fp8(
         if is_target and isinstance(state_dict[key], torch.Tensor):
             target_state_dict_keys.append(key)
 
-    # Process each key
-    for key in tqdm(target_state_dict_keys):
-        value = state_dict[key]
+    # Create batches for target keys
+    if fp8_quantize_batch_size is None or fp8_quantize_batch_size == 0:
+        # Process all keys at once (original behavior)
+        batches = [target_state_dict_keys]
+    else:
+        # Split into batches
+        batches = [
+            target_state_dict_keys[i:i + fp8_quantize_batch_size]
+            for i in range(0, len(target_state_dict_keys), fp8_quantize_batch_size)
+        ]
 
-        # Save original device and dtype
-        original_device = value.device
-        original_dtype = value.dtype
+    # Process each batch
+    for batch_idx, batch_keys in enumerate(batches):
+        batch_desc = f"Quantizing batch {batch_idx+1}/{len(batches)}"
+        for key in tqdm(batch_keys, desc=batch_desc, leave=False):
+            value = state_dict[key]
 
-        # Move to calculation device
-        if calc_device is not None:
-            value = value.to(calc_device)
+            # Save original device and dtype
+            original_device = value.device
+            original_dtype = value.dtype
 
-        quantized_weight, scale_tensor = quantize_weight(key, value, fp8_dtype, max_value, min_value, quantization_mode, block_size)
+            # Move to calculation device and track if we created a new tensor
+            moved_to_different_device = False
+            if calc_device is not None and str(calc_device) != str(original_device):
+                value = value.to(calc_device)
+                moved_to_different_device = True
 
-        # Add to state dict using original key for weight and new key for scale
-        fp8_key = key  # Maintain original key
-        scale_key = key.replace(".weight", ".scale_weight")
+            # can_modify_inplace=True only if we moved to different device (created new tensor)
+            quantized_weight, scale_tensor = quantize_weight(
+                key, value, fp8_dtype, max_value, min_value, quantization_mode, block_size, can_modify_inplace=moved_to_different_device
+            )
 
-        if not move_to_device:
-            quantized_weight = quantized_weight.to(original_device)
+            # Add to state dict using original key for weight and new key for scale
+            fp8_key = key  # Maintain original key
+            scale_key = key.replace(".weight", ".scale_weight")
 
-        # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
-        scale_tensor = scale_tensor.to(dtype=original_dtype, device=quantized_weight.device)
+            if not move_to_device:
+                quantized_weight = quantized_weight.to(original_device)
 
-        state_dict[fp8_key] = quantized_weight
-        state_dict[scale_key] = scale_tensor
+            # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
+            scale_tensor = scale_tensor.to(dtype=original_dtype, device=quantized_weight.device)
 
-        optimized_count += 1
+            state_dict[fp8_key] = quantized_weight
+            state_dict[scale_key] = scale_tensor
 
-        if calc_device is not None:  # optimized_count % 10 == 0 and
-            # free memory on calculation device
+            # Explicitly delete moved tensor to free memory immediately
+            # Note: value may point to same object as state_dict[key] before assignment,
+            # but after assignment to fp8_key, we can safely delete the reference
+            del value
+
+            optimized_count += 1
+
+        # Clean up GPU memory after each batch
+        if calc_device is not None and len(batch_keys) > 0:
             clean_memory_on_device(calc_device)
 
     logger.info(f"Number of optimized Linear layers: {optimized_count}")
@@ -182,6 +214,7 @@ def quantize_weight(
     min_value: float,
     quantization_mode: str = "block",
     block_size: int = 64,
+    can_modify_inplace: bool = False,
 ):
     original_shape = tensor.shape
 
@@ -225,7 +258,8 @@ def quantize_weight(
     scale = scale.to(torch.float32)  # ensure scale is in float32 for division
 
     # Quantize weight to FP8 (scale can be scalar or [out,1], broadcasting works)
-    quantized_weight = quantize_fp8(tensor, scale, fp8_dtype, max_value, min_value)
+    # can_modify_inplace=True saves memory by not cloning the tensor
+    quantized_weight = quantize_fp8(tensor, scale, fp8_dtype, max_value, min_value, can_modify_inplace=can_modify_inplace)
 
     # If block-wise, restore original shape
     if quantization_mode == "block":
@@ -245,6 +279,7 @@ def load_safetensors_with_fp8_optimization(
     weight_hook=None,
     quantization_mode: str = "block",
     block_size: Optional[int] = 64,
+    fp8_quantize_batch_size: Optional[int] = None,
 ) -> dict:
     """
     Load weight tensors from safetensors files and merge LoRA weights into the state dict with explicit FP8 optimization.
@@ -284,28 +319,36 @@ def load_safetensors_with_fp8_optimization(
 
     # Create optimized state dict
     optimized_count = 0
+    state_dict = {}
 
     # Process each file
-    state_dict = {}
     for model_file in model_files:
         with MemoryEfficientSafeOpen(model_file) as f:
             keys = f.keys()
-            for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
-                value = f.get_tensor(key)
 
-                # Save original device
-                original_device = value.device  # usually cpu
+            # Collect target keys that need FP8 quantization for this file
+            target_keys_in_file = []
+            non_target_keys = []
+
+            for key in keys:
+                if is_target_key(key):
+                    target_keys_in_file.append(key)
+                else:
+                    non_target_keys.append(key)
+
+            # Process non-target keys first (these don't need batching)
+            for key in tqdm(non_target_keys, desc=f"Loading non-FP8 keys from {os.path.basename(model_file)}", unit="key", leave=False):
+                value = f.get_tensor(key)
+                original_device = value.device
 
                 if weight_hook is not None:
-                    # Apply weight hook if provided
                     value = weight_hook(key, value, keep_on_calc_device=(calc_device is not None))
 
-                if not is_target_key(key):
-                    target_device = calc_device if (calc_device is not None and move_to_device) else original_device
-                    value = value.to(target_device)
-                    state_dict[key] = value
-                    continue
+                target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                value = value.to(target_device)
+                state_dict[key] = value
 
+<<<<<<< Updated upstream
                 # Move to calculation device
                 if calc_device is not None:
                     value = value.to(calc_device)
@@ -314,25 +357,105 @@ def load_safetensors_with_fp8_optimization(
                 quantized_weight, scale_tensor = quantize_weight(
                     key, value, fp8_dtype, max_value, min_value, quantization_mode, block_size
                 )
+=======
+            # Create batches for target keys
+            if fp8_quantize_batch_size is None or fp8_quantize_batch_size == 0:
+                # Process all target keys at once (original behavior)
+                batches = [target_keys_in_file]
+            else:
+                # Split into batches
+                batches = [
+                    target_keys_in_file[i:i + fp8_quantize_batch_size]
+                    for i in range(0, len(target_keys_in_file), fp8_quantize_batch_size)
+                ]
 
-                # Add to state dict using original key for weight and new key for scale
-                fp8_key = key  # Maintain original key
-                scale_key = key.replace(".weight", ".scale_weight")
-                assert fp8_key != scale_key, "FP8 key and scale key must be different"
+            # Process each batch
+            for batch_idx, batch_keys in enumerate(batches):
+                batch_desc = f"Quantizing batch {batch_idx+1}/{len(batches)} from {os.path.basename(model_file)}"
+                for key in tqdm(batch_keys, desc=batch_desc, unit="key", leave=False):
+                    value = f.get_tensor(key)
 
-                if not move_to_device:
-                    quantized_weight = quantized_weight.to(original_device)
+                    # Save original device
+                    original_device = value.device  # usually cpu
 
-                # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
-                scale_tensor = scale_tensor.to(dtype=original_dtype, device=quantized_weight.device)
+                    if weight_hook is not None:
+                        # Apply weight hook if provided
+                        value = weight_hook(key, value, keep_on_calc_device=(calc_device is not None))
 
-                state_dict[fp8_key] = quantized_weight
-                state_dict[scale_key] = scale_tensor
+                    original_dtype = value.dtype
 
-                optimized_count += 1
+                    if original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                        logger.warning(
+                            f"Skipping FP8 quantization for key {key} as it is already in FP8 format ({original_dtype}). "
+                            "Loading checkpoint as-is without re-quantization."
+                        )
+                        target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                        value = value.to(target_device)
+                        state_dict[key] = value
+                        continue
 
-                if calc_device is not None and optimized_count % 10 == 0:
-                    # free memory on calculation device
+                    # Move to calculation device and track if we created a new tensor
+                    # Check if we have enough GPU memory first
+                    moved_to_different_device = False
+                    quantize_device = value.device  # Default to current device (usually CPU)
+
+                    if calc_device is not None and str(calc_device) != str(value.device):
+                        # Check if target device is CUDA and if we have enough memory
+                        if "cuda" in str(calc_device):
+                            required_memory = value.numel() * value.element_size() * 2  # Estimate: weight + float32 copy
+                            available_memory = torch.cuda.mem_get_info(calc_device)[0]  # Free memory in bytes
+
+                            if available_memory < required_memory * 1.2:  # 20% safety margin
+                                logger.warning(
+                                    f"Insufficient GPU memory for layer {key} ({required_memory/1024**2:.1f} MB needed, "
+                                    f"{available_memory/1024**2:.1f} MB available). Quantizing on CPU instead."
+                                )
+                                quantize_device = value.device  # Keep on CPU
+                            else:
+                                value = value.to(calc_device)
+                                quantize_device = calc_device
+                                moved_to_different_device = True
+                        else:
+                            value = value.to(calc_device)
+                            quantize_device = calc_device
+                            moved_to_different_device = True
+
+                    # can_modify_inplace=True only if we moved to different device (created new tensor)
+                    quantized_weight, scale_tensor = quantize_weight(
+                        key, value, fp8_dtype, max_value, min_value, quantization_mode, block_size, can_modify_inplace=moved_to_different_device
+                    )
+
+                    # Explicitly delete original tensor to free GPU memory immediately
+                    del value
+
+                    # Add to state dict using original key for weight and new key for scale
+                    fp8_key = key  # Maintain original key
+                    scale_key = key.replace(".weight", ".scale_weight")
+                    assert fp8_key != scale_key, "FP8 key and scale key must be different"
+>>>>>>> Stashed changes
+
+                    if not move_to_device:
+                        # Move FP8 result back to CPU to free GPU memory for next layer
+                        quantized_weight = quantized_weight.to(original_device)
+                        scale_tensor_device = original_device
+                    else:
+                        scale_tensor_device = quantized_weight.device
+
+                    # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
+                    scale_tensor = scale_tensor.to(dtype=original_dtype, device=scale_tensor_device)
+
+                    state_dict[fp8_key] = quantized_weight
+                    state_dict[scale_key] = scale_tensor
+
+                    # Clean up GPU memory after each layer if quantizing on GPU but moving results to CPU
+                    # This prevents memory buildup when processing layers incrementally
+                    if calc_device is not None and not move_to_device:
+                        clean_memory_on_device(calc_device)
+
+                    optimized_count += 1
+
+                # Clean up GPU memory after batch
+                if calc_device is not None and len(batch_keys) > 0:
                     clean_memory_on_device(calc_device)
 
     logger.info(f"Number of optimized Linear layers: {optimized_count}")
