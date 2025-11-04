@@ -348,18 +348,6 @@ def load_safetensors_with_fp8_optimization(
                 value = value.to(target_device)
                 state_dict[key] = value
 
-                original_dtype = value.dtype
-
-                if original_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
-                    logger.warning(
-                        f"Skipping FP8 quantization for key {key} as it is already in FP8 format ({original_dtype}). "
-                        "Loading checkpoint as-is without re-quantization."
-                    )
-                    target_device = calc_device if (calc_device is not None and move_to_device) else original_device
-                    value = value.to(target_device)
-                    state_dict[key] = value
-                    continue
-
             # Create batches for target keys
             if fp8_quantize_batch_size is None or fp8_quantize_batch_size == 0:
                 # Process all target keys at once (original behavior)
