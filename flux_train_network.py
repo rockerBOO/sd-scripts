@@ -113,11 +113,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         # if the file is fp8 and we are using fp8_base, we can load it as is (fp8)
         loading_dtype = None if args.fp8_base or args.fp8_scaled else weight_dtype
-        loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
+        # Force CPU loading if load_on_cpu is set or if swapping blocks
+        loading_device = "cpu" if (self.is_swapping_blocks or args.load_on_cpu) else accelerator.device
 
         # load with quantization if needed
         _, model = flux_utils.load_flow_model(
-            accelerator.device, args.pretrained_model_name_or_path, loading_dtype, loading_device, self.model_type, args.fp8_scaled
+            accelerator.device,
+            args.pretrained_model_name_or_path,
+            loading_dtype,
+            loading_device,
+            self.model_type,
+            args.fp8_scaled,
+            fp8_quantize_batch_size=args.fp8_quantize_batch_size,
         )
 
         if args.fp8_base and not args.fp8_scaled:
@@ -691,6 +698,21 @@ def setup_parser() -> argparse.ArgumentParser:
     flux_train_utils.add_flux_train_arguments(parser)
 
     parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
+    parser.add_argument(
+        "--fp8_quantize_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for FP8 quantization to reduce VRAM usage. None or 0 means quantize all layers at once (default), "
+        "1 means incremental (one layer at a time), N means process N layers per batch. Only affects FP8 quantization during model loading."
+        " / FP8量子化のバッチサイズでVRAM使用量を削減。Noneまたは0は全レイヤーを一度に量子化（デフォルト）、"
+        "1はインクリメンタル（1レイヤーずつ）、Nは1バッチでNレイヤーを処理。モデル読み込み時のFP8量子化にのみ影響。",
+    )
+    parser.add_argument(
+        "--load_on_cpu",
+        action="store_true",
+        help="Load model on CPU during FP8 quantization, then move to GPU for training. Reduces VRAM usage during model loading at the cost of slower startup."
+        " / FP8量子化中はモデルをCPUに読み込み、トレーニング時にGPUに移動。起動は遅くなるが、モデル読み込み時のVRAM使用量を削減。",
+    )
     parser.add_argument(
         "--split_mode",
         action="store_true",
