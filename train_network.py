@@ -1168,7 +1168,7 @@ class NetworkTrainer:
             else None,
             "ss_wavelet_loss_ll_level_threshold": args.wavelet_loss_ll_level_threshold,
             "ss_wavelet_loss_rectified_flow": args.wavelet_loss_rectified_flow,
-            "ss_wavelet_loss_energy_ratio": args.wavelet_loss_energy_ratio,
+            "ss_wavelet_loss_energy_ratio": args.wavelet_loss_energy_loss_ratio,
             "ss_wavelet_loss_energy_scale_factor": args.wavelet_loss_energy_scale_factor,
         }
 
