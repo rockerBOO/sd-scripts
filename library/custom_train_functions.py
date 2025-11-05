@@ -233,6 +233,7 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
     parser.add_argument(
         "--wavelet_loss_rectified_flow", type=bool, default=True, help="Use rectified flow to estimate clean latents before wavelet loss"
     )
+    parser.add_argument("--wavelet_pixel", action="store_true", help="Run wavelet loss in pixel space after decoding the latents")
     import ast
     import json
 
