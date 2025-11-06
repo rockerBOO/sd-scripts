@@ -444,6 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=target_width)
     parser.add_argument("--height", type=int, default=target_height)
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--bypass_flux_guidance", action="store_true")
     args = parser.parse_args()
 
     seed = args.seed
