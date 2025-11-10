@@ -19,7 +19,7 @@ from transformers import CLIPTextModel
 from safetensors.torch import load_file
 
 from library import device_utils
-from library.device_utils import clean_memory_on_device, init_ipex, get_preferred_device
+from library.device_utils import init_ipex, get_preferred_device
 from library.safetensors_utils import MemoryEfficientSafeOpen
 from networks import oft_flux
 
@@ -446,18 +446,30 @@ def generate_images_batch(
         x = x.float()
         x = einops.rearrange(x, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=packed_latent_height, w=packed_latent_width, ph=2, pw=2)
 
-        # Decode (only load AE on first batch)
+        # Decode in smaller batches to avoid VAE OOM
         if batch_idx == 0:
             ae = ae.to(device)
         
-        with torch.no_grad():
-            if is_fp8(ae_dtype):
-                with accelerator.autocast():
-                    x = ae.decode(x)
-            else:
-                with torch.autocast(device_type=device.type, dtype=ae_dtype):
-                    x = ae.decode(x)
-
+        # Split into VAE-sized batches for decoding
+        vae_batch_size = args.vae_batch_size if hasattr(args, 'vae_batch_size') and args.vae_batch_size else current_batch_size
+        decoded_images = []
+        
+        for vae_batch_start in range(0, current_batch_size, vae_batch_size):
+            vae_batch_end = min(vae_batch_start + vae_batch_size, current_batch_size)
+            x_batch = x[vae_batch_start:vae_batch_end]
+            
+            with torch.no_grad():
+                if is_fp8(ae_dtype):
+                    with accelerator.autocast():
+                        decoded_batch = ae.decode(x_batch)
+                else:
+                    with torch.autocast(device_type=device.type, dtype=ae_dtype):
+                        decoded_batch = ae.decode(x_batch)
+            
+            decoded_images.append(decoded_batch)
+        
+        # Concatenate all decoded batches
+        x = torch.cat(decoded_images, dim=0)
         x = x.clamp(-1, 1)
         x = x.permute(0, 2, 3, 1)
         
@@ -470,8 +482,6 @@ def generate_images_batch(
         
         # Update batch progress bar
         batch_pbar.update(1)
-
-        clean_memory_on_device(device)
 
     # Close batch progress bar
     batch_pbar.close()
@@ -767,6 +777,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1, help="Number of images to generate per batch")
     parser.add_argument("--n_batches", type=int, default=1, help="Number of batches to generate (total images = batch_size * n_batches)")
     parser.add_argument("--start_seed", type=int, default=None, help="Starting seed for batch generation (increments for each image)")
+    parser.add_argument("--vae_batch_size", type=int, default=None, help="Batch size for VAE decoding to reduce VRAM usage (default: same as batch_size)")
     
     args = parser.parse_args()
 
@@ -980,11 +991,13 @@ if __name__ == "__main__":
         cfg_scale = args.cfg_scale
         batch_size = args.batch_size
         n_batches = args.n_batches
+        vae_batch_size = args.vae_batch_size
 
         while True:
             print(
                 "Enter prompt (empty to exit). Options: --w <width> --h <height> --s <steps> --d <seed> --g <guidance> --m <multipliers for LoRA>"
                 " --n <negative prompt>, `-` for empty negative prompt --c <cfg_scale> --b <batch_size> --nb <n_batches> --ss <start_seed>"
+                " --vb <vae_batch_size>"
             )
             prompt = input()
             if prompt == "":
@@ -1028,6 +1041,8 @@ if __name__ == "__main__":
                         batch_size = int(opt[1:].strip())
                     elif opt.startswith("nb"):
                         n_batches = int(opt[2:].strip())
+                    elif opt.startswith("vb"):
+                        vae_batch_size = int(opt[2:].strip())
                 except ValueError as e:
                     logger.error(f"Invalid option: {opt}, {e}")
 
