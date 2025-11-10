@@ -6,6 +6,8 @@ import math
 import os
 import random
 from typing import Callable, List, Optional
+from queue import Queue
+from threading import Thread
 import einops
 import numpy as np
 
@@ -17,7 +19,7 @@ from transformers import CLIPTextModel
 from safetensors.torch import load_file
 
 from library import device_utils
-from library.device_utils import init_ipex, get_preferred_device
+from library.device_utils import clean_memory_on_device, init_ipex, get_preferred_device
 from library.safetensors_utils import MemoryEfficientSafeOpen
 from networks import oft_flux
 
@@ -80,6 +82,7 @@ def denoise(
     neg_vec: Optional[torch.Tensor] = None,
     neg_t5_attn_mask: Optional[torch.Tensor] = None,
     cfg_scale: Optional[float] = None,
+    progress_desc: str = "Denoising",
 ):
     # prepare classifier free guidance
     logger.info(f"guidance: {guidance}, cfg_scale: {cfg_scale}")
@@ -105,7 +108,7 @@ def denoise(
         b_vec = vec
         b_t5_attn_mask = t5_attn_mask
 
-    for t_curr, t_prev in zip(tqdm(timesteps[:-1]), timesteps[1:]):
+    for t_curr, t_prev in zip(tqdm(timesteps[:-1], desc=progress_desc, unit="step"), timesteps[1:]):
         t_vec = torch.full((b_img_ids.shape[0],), t_curr, dtype=img.dtype, device=img.device)
 
         # classifier free guidance
@@ -158,6 +161,7 @@ def do_sample(
     neg_t5_out: Optional[torch.Tensor] = None,
     neg_t5_attn_mask: Optional[torch.Tensor] = None,
     cfg_scale: Optional[float] = None,
+    progress_desc: str = "Denoising",
 ):
     logger.info(f"num_steps: {num_steps}")
     timesteps = get_schedule(num_steps, img.shape[1], shift=not is_schnell)
@@ -183,6 +187,7 @@ def do_sample(
                 neg_l_pooled,
                 neg_t5_attn_mask,
                 cfg_scale,
+                progress_desc,
             )
     else:
         with torch.autocast(device_type=device.type, dtype=flux_dtype), torch.no_grad():
@@ -200,9 +205,24 @@ def do_sample(
                 neg_l_pooled,
                 neg_t5_attn_mask,
                 cfg_scale,
+                progress_desc,
             )
 
     return x
+
+
+def image_saver_thread(save_queue: Queue, output_dir: str, timestamp: str, save_pbar: tqdm):
+    """Background thread that saves images as they become available"""
+    while True:
+        item = save_queue.get()
+        if item is None:  # Sentinel value to stop the thread
+            break
+        
+        img, seed, idx = item
+        output_path = os.path.join(output_dir, f"{timestamp}_seed{seed}_{idx:04d}.png")
+        img.save(output_path)
+        save_pbar.update(1)
+        save_queue.task_done()
 
 
 def generate_images_batch(
@@ -223,17 +243,35 @@ def generate_images_batch(
     """Generate multiple images in batches with different seeds"""
     
     total_images = len(seeds)
-    logger.info(f"Generating {total_images} images in batches of {batch_size}")
+    num_batches = (total_images + batch_size - 1) // batch_size
+    logger.info(f"Generating {total_images} images in {num_batches} batches of up to {batch_size}")
+    
+    # Setup output directory and timestamp
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Setup threaded image saving
+    save_queue = Queue(maxsize=10)  # Limit queue size to avoid memory issues
+    save_pbar = tqdm(total=total_images, desc="Saving images", unit="img", position=1)
+    
+    saver_thread = Thread(target=image_saver_thread, args=(save_queue, output_dir, timestamp, save_pbar))
+    saver_thread.daemon = True
+    saver_thread.start()
     
     all_images = []
+    image_counter = 0
     
-    # Process in batches
+    # Process in batches with progress bar
+    batch_pbar = tqdm(total=num_batches, desc="Overall Progress", unit="batch", position=0)
+    
     for batch_idx in range(0, total_images, batch_size):
         batch_end = min(batch_idx + batch_size, total_images)
         batch_seeds = seeds[batch_idx:batch_end]
         current_batch_size = len(batch_seeds)
+        batch_num = batch_idx // batch_size + 1
         
-        logger.info(f"Processing batch {batch_idx // batch_size + 1}/{(total_images + batch_size - 1) // batch_size} with {current_batch_size} images")
+        batch_pbar.set_description(f"Batch {batch_num}/{num_batches} (seeds: {batch_seeds[0]}-{batch_seeds[-1]})")
         
         # Make noise for current batch with different seeds
         packed_latent_height, packed_latent_width = math.ceil(image_height / 16), math.ceil(image_width / 16)
@@ -336,24 +374,41 @@ def generate_images_batch(
             if torch.isnan(t5_out).any():
                 raise ValueError("NaN in t5_out")
 
-            if args.offload:
-                if clip_l is not None:
-                    clip_l = clip_l.cpu()
-                t5xxl = t5xxl.cpu()
+            # Move embeddings to CPU for caching and free text encoder memory
+            logger.info("Caching embeddings to CPU memory and unloading text encoders...")
+            if l_pooled is not None:
+                l_pooled = l_pooled.cpu()
+            t5_out = t5_out.cpu()
+            txt_ids = txt_ids.cpu()
+            if t5_attn_mask is not None:
+                t5_attn_mask = t5_attn_mask.cpu()
+            
+            if neg_l_pooled is not None:
+                neg_l_pooled = neg_l_pooled.cpu()
+            if neg_t5_out is not None:
+                neg_t5_out = neg_t5_out.cpu()
+            if neg_t5_attn_mask is not None:
+                neg_t5_attn_mask = neg_t5_attn_mask.cpu()
+            
+            # Unload text encoders to free GPU memory
+            if clip_l is not None:
+                clip_l = clip_l.cpu()
+            t5xxl = t5xxl.cpu()
             device_utils.clean_memory()
+            
+            logger.info("Text encoders unloaded, embeddings cached in CPU memory")
 
-        # Expand embeddings to batch size
-        batch_l_pooled = l_pooled.repeat(current_batch_size, 1) if l_pooled is not None else None
-        batch_t5_out = t5_out.repeat(current_batch_size, 1, 1)
-        batch_txt_ids = txt_ids.repeat(current_batch_size, 1, 1)
-        batch_t5_attn_mask = t5_attn_mask.repeat(current_batch_size, 1) if t5_attn_mask is not None else None
+        # Expand embeddings to batch size and move to device
+        batch_l_pooled = l_pooled.repeat(current_batch_size, 1).to(device) if l_pooled is not None else None
+        batch_t5_out = t5_out.repeat(current_batch_size, 1, 1).to(device)
+        batch_txt_ids = txt_ids.repeat(current_batch_size, 1, 1).to(device)
+        batch_t5_attn_mask = t5_attn_mask.repeat(current_batch_size, 1).to(device) if t5_attn_mask is not None else None
         
-        batch_neg_l_pooled = neg_l_pooled.repeat(current_batch_size, 1) if neg_l_pooled is not None else None
-        batch_neg_t5_out = neg_t5_out.repeat(current_batch_size, 1, 1) if neg_t5_out is not None else None
-        batch_neg_t5_attn_mask = neg_t5_attn_mask.repeat(current_batch_size, 1) if neg_t5_attn_mask is not None else None
+        batch_neg_l_pooled = neg_l_pooled.repeat(current_batch_size, 1).to(device) if neg_l_pooled is not None else None
+        batch_neg_t5_out = neg_t5_out.repeat(current_batch_size, 1, 1).to(device) if neg_t5_out is not None else None
+        batch_neg_t5_attn_mask = neg_t5_attn_mask.repeat(current_batch_size, 1).to(device) if neg_t5_attn_mask is not None else None
 
         # Generate images
-        logger.info(f"Generating images for batch with seeds: {batch_seeds}")
         if args.offload and not (args.blocks_to_swap is not None and args.blocks_to_swap > 0):
             model = model.to(device)
         if steps is None:
@@ -363,6 +418,9 @@ def generate_images_batch(
         batch_t5_attn_mask = batch_t5_attn_mask.to(device) if batch_t5_attn_mask is not None else None
         batch_neg_t5_attn_mask = batch_neg_t5_attn_mask.to(device) if batch_neg_t5_attn_mask is not None else None
 
+        # Create progress description for denoising
+        denoise_desc = f"Batch {batch_num}/{num_batches}"
+        
         x = do_sample(
             accelerator,
             model,
@@ -381,6 +439,7 @@ def generate_images_batch(
             batch_neg_t5_out,
             batch_neg_t5_attn_mask,
             cfg_scale,
+            denoise_desc,
         )
 
         # Unpack
@@ -388,7 +447,6 @@ def generate_images_batch(
         x = einops.rearrange(x, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=packed_latent_height, w=packed_latent_width, ph=2, pw=2)
 
         # Decode (only load AE on first batch)
-        logger.info("Decoding images...")
         if batch_idx == 0:
             ae = ae.to(device)
         
@@ -403,11 +461,28 @@ def generate_images_batch(
         x = x.clamp(-1, 1)
         x = x.permute(0, 2, 3, 1)
         
-        # Convert to images
+        # Convert to images and queue for saving
         for i in range(current_batch_size):
             img = Image.fromarray((127.5 * (x[i] + 1.0)).float().cpu().numpy().astype(np.uint8))
+            save_queue.put((img, batch_seeds[i], image_counter))
             all_images.append((img, batch_seeds[i]))
+            image_counter += 1
+        
+        # Update batch progress bar
+        batch_pbar.update(1)
 
+        clean_memory_on_device(device)
+
+    # Close batch progress bar
+    batch_pbar.close()
+    
+    # Wait for all images to be saved
+    logger.info("Waiting for all images to be saved...")
+    save_queue.join()  # Wait for queue to be empty
+    save_queue.put(None)  # Signal the saver thread to stop
+    saver_thread.join()  # Wait for thread to finish
+    save_pbar.close()
+    
     # Cleanup
     if args.offload:
         model = model.cpu()
@@ -417,18 +492,10 @@ def generate_images_batch(
     # Restore guidance module
     if args.bypass_flux_guidance:
         restore_flux_guidance(model)
-    
-    # Save images
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    for idx, (img, seed) in enumerate(all_images):
-        output_path = os.path.join(output_dir, f"{timestamp}_seed{seed}_{idx:04d}.png")
-        img.save(output_path)
-        logger.info(f"Saved image {idx + 1}/{len(all_images)} to {output_path}")
 
+    logger.info(f"All {len(all_images)} images saved to {output_dir}")
     return all_images
+
 
 
 def generate_image(
@@ -549,12 +616,29 @@ def generate_image(
     if torch.isnan(t5_out).any():
         raise ValueError("NaN in t5_out")
 
-    if args.offload:
-        if clip_l is not None:
-            clip_l = clip_l.cpu()
-        t5xxl = t5xxl.cpu()
-    # del clip_l, t5xxl
+    # Cache embeddings on CPU and unload text encoders to free GPU memory
+    logger.info("Caching embeddings to CPU memory and unloading text encoders...")
+    if l_pooled is not None:
+        l_pooled = l_pooled.cpu()
+    t5_out = t5_out.cpu()
+    txt_ids = txt_ids.cpu()
+    if t5_attn_mask is not None:
+        t5_attn_mask = t5_attn_mask.cpu()
+    
+    if neg_l_pooled is not None:
+        neg_l_pooled = neg_l_pooled.cpu()
+    if neg_t5_out is not None:
+        neg_t5_out = neg_t5_out.cpu()
+    if neg_t5_attn_mask is not None:
+        neg_t5_attn_mask = neg_t5_attn_mask.cpu()
+    
+    # Always unload text encoders after encoding
+    if clip_l is not None:
+        clip_l = clip_l.cpu()
+    t5xxl = t5xxl.cpu()
     device_utils.clean_memory()
+    
+    logger.info("Text encoders unloaded, embeddings cached in CPU memory")
 
     # generate image
     logger.info("Generating image...")
@@ -563,8 +647,14 @@ def generate_image(
     if steps is None:
         steps = 4 if is_schnell else 50
 
+    # Move embeddings from CPU cache to device
     img_ids = img_ids.to(device)
-    t5_attn_mask = t5_attn_mask.to(device) if args.apply_t5_attn_mask else None
+    l_pooled = l_pooled.to(device) if l_pooled is not None else None
+    t5_out = t5_out.to(device)
+    txt_ids = txt_ids.to(device)
+    t5_attn_mask = t5_attn_mask.to(device) if t5_attn_mask is not None and args.apply_t5_attn_mask else None
+    neg_l_pooled = neg_l_pooled.to(device) if neg_l_pooled is not None else None
+    neg_t5_out = neg_t5_out.to(device) if neg_t5_out is not None else None
     neg_t5_attn_mask = neg_t5_attn_mask.to(device) if neg_t5_attn_mask is not None and args.apply_t5_attn_mask else None
 
     x = do_sample(
@@ -585,6 +675,7 @@ def generate_image(
         neg_t5_out,
         neg_t5_attn_mask,
         cfg_scale,
+        "Generating",
     )
     if args.offload:
         model = model.cpu()
