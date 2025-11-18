@@ -31,6 +31,7 @@ class CLIPRewardModel(nn.Module):
         inputs = self.processor(
             text=prompts,
             images=images,
+            do_rescale=False,
             return_tensors="pt",
             padding=True,
             truncation=True,
